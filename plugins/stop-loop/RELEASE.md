@@ -1,8 +1,8 @@
 # 플러그인 판
 
-- 판: 0.1.0
-- 정본 커밋: 0bb7adb85258ba3309c6f1ff349ad44124cdd5ac
-- 만든 날짜: 2026-10-03
+- 판: 0.2.0
+- 정본 커밋: 890f73868a336fb8ca8f77ee3c623465121fae49
+- 만든 날짜: 2026-10-04
 
 ## 담은 것
 
@@ -14,7 +14,11 @@
 - `agents/loop-verifier-review.md`
 - `agents/loop-verifier-scope.md`
 - `agents/loop-worker.md`
+- `scripts/backlog.py`
+- `scripts/board.py`
+- `scripts/dispatch.py`
 - `scripts/doctor.py`
+- `scripts/endreport.py`
 - `scripts/ledger.py`
 - `scripts/report_workflow.py`
 - `scripts/runner.py`
@@ -22,6 +26,8 @@
 - `setup/CLAUDE-새프로젝트.md`
 - `setup/_템플릿.md`
 - `setup/standard.md`
+- `skills/board/SKILL.md`
+- `skills/dispatch/SKILL.md`
 - `skills/loop/SKILL.md`
 - `skills/report/SKILL.md`
 - `skills/scenario/SKILL.md`

@@ -16,6 +16,7 @@ BEGIN, END = "<!-- hq:standard:begin", "<!-- hq:standard:end -->"
 CONFIG = {"checks": [{"cmd": "python3 -m pytest -q"}], "handoff": "local"}
 MARKETPLACE_REPO = "dawn-island/stop-loop"      # 2026-10-02 사람 확정 — 공개 저장소 주소
 PLUGIN_ID = "stop-loop@stop-loop"
+PROJECTS_JSON = os.path.expanduser("~/.stop-loop/projects.json")   # bin/dispatch.py 의 값과 같아야 한다 — test_setup_project 가 지킨다
 USAGE = "사용법: python3 setup_project.py [<프로젝트 뿌리>]"
 
 
@@ -105,6 +106,28 @@ def plan(proj, root):
     return writes, copies
 
 
+def register(proj):
+    """목록 파일에 이 프로젝트를 더할 새 내용(없으면 None — 이미 있다). 아무것도 쓰지 않는다."""
+    data = {"projects": []}
+    if os.path.exists(PROJECTS_JSON):
+        try:
+            data = json.loads(_read(PROJECTS_JSON))
+            if not isinstance(data.get("projects"), list):
+                raise ValueError("projects 배열이 없다")
+            for p in data["projects"]:
+                p["name"], p["path"]
+        except (ValueError, OSError, AttributeError, KeyError, TypeError) as e:
+            raise SetupError("읽을 수 없다: %s (%s)" % (PROJECTS_JSON, e))
+    name = os.path.basename(proj)
+    for p in data["projects"]:
+        if os.path.abspath(os.path.expanduser(p["path"])) == proj:
+            return None
+        if p["name"] == name:
+            raise SetupError("같은 이름 %s 의 다른 경로가 이미 등록돼 있다: %s" % (name, p["path"]))
+    data["projects"].append({"name": name, "path": proj})
+    return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+
+
 def main(argv, plugin_root=None):
     if len(argv) > 1:
         print(USAGE, file=sys.stderr)
@@ -115,6 +138,7 @@ def main(argv, plugin_root=None):
         if not os.path.isdir(proj):
             raise SetupError("폴더가 아니다: %s" % proj)
         writes, copies = plan(proj, root)
+        listed = register(proj)
     except SetupError as e:
         print("실패: %s" % e, file=sys.stderr)
         return 1
@@ -123,9 +147,15 @@ def main(argv, plugin_root=None):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8", newline="") as fh:
             fh.write(content)
+    if listed is not None:
+        os.makedirs(os.path.dirname(PROJECTS_JSON), exist_ok=True)
+        with open(PROJECTS_JSON, "w", encoding="utf-8", newline="") as fh:
+            fh.write(listed)
     for rel, _, created in writes:
         print("%s %s" % ("생성" if created else "갱신", rel))
-    if not writes:
+    if listed is not None:
+        print("등록 ~/.stop-loop/projects.json (%s)" % os.path.basename(proj))
+    if not writes and listed is None:
         print("바꾼 파일 없음")
     for line in copies:
         print(line)
