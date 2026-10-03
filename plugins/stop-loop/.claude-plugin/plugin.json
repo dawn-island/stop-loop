@@ -1,0 +1,8 @@
+{
+  "name": "stop-loop",
+  "version": "0.1.0",
+  "description": "STOP-LOOP — 작업목록 카드 하나를 열세 단계로 돌리는 러너와 에이전트",
+  "author": {
+    "name": "stop-loop"
+  }
+}

@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "STOP-LOOP 판정 파일 (NN-verdict.json)",
+  "description": "게이트 스테이지(02·06·08·09)가 쓰는 유일한 기계 판독 근거. 사람이 읽는 문서는 따로 있다 — 한 파일이 두 독자를 섬기면 문서를 잘 쓸수록 기계가 헷갈린다.",
+  "type": "object",
+  "required": ["verdict", "findings"],
+  "additionalProperties": false,
+  "properties": {
+    "verdict": {
+      "enum": ["통과", "반려"],
+      "description": "반려는 둘 다일 때만이다 — 정상 운영에서 일어날 법하고, 뒤의 안전장치가 못 잡는다(기록 32)."
+    },
+    "findings": {
+      "type": "array",
+      "description": "통과면 빈 배열이다. 선택 사항은 넣지 않는다 — 러너가 이 배열로 회차를 세고 재발을 대조한다.",
+      "items": {
+        "type": "object",
+        "required": ["severity", "kind", "where", "what"],
+        "additionalProperties": false,
+        "properties": {
+          "severity": {
+            "enum": ["critical", "major", "minor"],
+            "description": "정확성과 명시된 요구사항에 영향을 주는 것만 여기 온다."
+          },
+          "kind": {
+            "type": "string",
+            "description": "갈래. 스테이지가 쓰는 말로: 사실불일치 · 누락 · 초과 · 완결 · 일관 · 최소 · 시안 · 동작불일치 · 회귀",
+            "minLength": 1
+          },
+          "where": {
+            "type": "string",
+            "description": "문제가 사는 자리. 파일:줄 또는 문서의 절·식별자(FN-03, DoD-2). 회차마다 같은 문자열로 적는다 — 러너가 이 값으로 같은 지적인지 가른다.",
+            "minLength": 1
+          },
+          "what": {
+            "type": "string",
+            "description": "무엇이 문제인가 한 줄.",
+            "minLength": 1
+          },
+          "replay": {
+            "type": "object",
+            "description": "선택. 이 지적을 세션 없이 명령만으로 다시 확인할 수 있는 형태(ISSUE-qa-recheck-replay-2026-09-28). 없으면 다시 돌릴 형태가 없는 지적으로 본다.",
+            "additionalProperties": false,
+            "properties": {
+              "repro": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["cmd", "rc"],
+                "properties": {
+                  "cmd": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "재현 명령. 프로젝트 폴더에서 돈다."
+                  },
+                  "rc": {
+                    "type": "integer",
+                    "description": "기대하는 종료 코드."
+                  }
+                }
+              },
+              "mutants": {
+                "type": "array",
+                "description": "그 자리를 지키는 변이. 생략하거나 비울 수 있다.",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["file", "from", "to", "test"],
+                  "properties": {
+                    "file": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "저장소 기준 경로. git 이 추적하는 파일이어야 한다."
+                    },
+                    "from": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "원문 문자열. 파일에 정확히 한 번 나와야 한다."
+                    },
+                    "to": {
+                      "type": "string",
+                      "description": "바꿀 문자열."
+                    },
+                    "test": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "이 변이를 잡아야 하는 시험 명령. 실패(종료 코드 0 아님)가 기대값이다."
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
