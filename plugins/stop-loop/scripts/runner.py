@@ -93,6 +93,10 @@ LIVE_MAX = 200
 # `call()` 인자로 넘기지 않는 이유는 인자를 늘리면 가짜 `call` 을 끼우는 시험들이
 # 깨지기 때문이다 — `_live_path` 와 같은 이유, 같은 방식이다.
 _events_path = None
+# `commit_stage` 가 커밋 직전에 상태를 저장하도록 `main()` 이 정하는 `(statef, state)` (ISSUE-metrics-match-total).
+# 이력의 state.json 이 커밋 시점의 판이어야 소각 직전 커밋의 단계별 비용 합이 러너 합계와 맞는다.
+# 인자를 늘리면 `commit_stage` 를 부르는 아홉 곳과 가짜로 바꿔 끼우는 시험이 깨져 전역으로 둔다.
+_save_ctx = None
 # 판 지킴·계정 지킴이 `main()` 에서 정한 값을 `commit_stage`·`gh` 에 넘기는 전역 — `_events_path` 와
 # 같은 이유(인자를 늘리면 그 함수를 가짜로 바꿔 끼우는 시험이 깨진다). `main()` 머리에서 되돌린다.
 _plugin_ver = None
@@ -285,7 +289,7 @@ RETRO_EXTRA = """
   git log --grep='Loop-Issue: {issue}' --format='%s'
 
 그리고 **지난 실행들**의 지적을 모아본다 — 이것이 3번의 유일한 근거다:
-  python3 {hq}/bin/ledger.py {project}
+  python3 {bindir}/ledger.py {project}
 
 회고문에 아래 항목을 쓴다(절 목록의 정본은 산출물 틀이다):
   1. 한 일 — 이슈가 무엇을 요구했고 무엇이 나갔는가.
@@ -400,9 +404,11 @@ def machine_checks(project, models_cfg):
     """
     checks = models_cfg.get("_checks") or []
     failed = []
+    # 명령이 「누구의 검사인가」를 알게 한다 — 프로젝트가 카드마다 DB 를 나누는 근거.
+    env = dict(os.environ, STOP_LOOP_CARD=models_cfg["_card"]) if models_cfg.get("_card") else None
     for c in checks:
         cwd = os.path.join(project, c.get("cwd", "")) if c.get("cwd") else project
-        r = subprocess.run(c["cmd"], shell=True, cwd=cwd,
+        r = subprocess.run(c["cmd"], shell=True, cwd=cwd, env=env,
                            capture_output=True, text=True)
         if r.returncode != 0:
             tail = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()[-6:]
@@ -428,16 +434,15 @@ def classify_failures(project, base_sha, failed, models_cfg):
             out["error"] = ((add.stderr.strip().splitlines() or add.stdout.strip().splitlines()
                              or ["git worktree add 실패"])[-1])
             return out
-        # 카드 작업 폴더가 받는 준비물 링크를 기준 가지 판에도 잇는다 — 없으면 도구를 못 찾아
-        # 카드 탓 실패가 「기준 가지에서도 실패」로 갈린다. 임시 폴더라 gitignore 확인은 필요 없다.
-        for name in CARRY:
-            src = os.path.join(project, name)
-            if os.path.exists(src) and not os.path.lexists(os.path.join(base_wd, name)):
-                os.symlink(os.path.realpath(src), os.path.join(base_wd, name))
+        # 카드 작업 폴더가 받는 준비물 링크를 기준 가지 판에도 같은 규칙으로 잇는다 — 없으면 도구를 못 찾아
+        # 카드 탓 실패가 「기준 가지에서도 실패」로 갈린다. 규칙을 한 곳(carry_in)에 둔다.
+        carry_in(project, base_wd)
         cmds = {x["cmd"] for x in failed}
         print("       기준 가지 판에서 실패한 검사 %d개를 다시 돈다" % len(cmds), flush=True)
+        # 카드 값을 그대로 주면 카드 DB 위에서 기준 가지를 돌린다 — 판마다 다른 임시 폴더 이름을 준다.
         _, still = machine_checks(base_wd, {"_checks": [c for c in models_cfg.get("_checks") or []
-                                                        if c["cmd"] in cmds]})
+                                                        if c["cmd"] in cmds],
+                                            "_card": os.path.basename(holder)})
         also = {x["cmd"] for x in still}
         out["base"] = [x for x in failed if x["cmd"] in also]
         out["card"] = [x for x in failed if x["cmd"] not in also]
@@ -485,7 +490,8 @@ def tdd_evidence(project, wd, base=None, hints=None):
 
     `base` 는 07 이 이 실행에서 처음 시작될 때의 HEAD 커밋 아이디다 — 그 뒤
     커밋만 07 이 만든 것으로 본다. 이어받아도 바뀌지 않으므로 시간 초과 전
-    세션의 시험 커밋이 인정된다. 없으면 전체 이력을 본다.
+    세션의 시험 커밋이 인정된다. 없으면 HEAD 의 첫 부모 줄기 전체를 본다 —
+    작업 가지에 main 을 합쳐 들어온 다른 가지의 커밋은 세지 않는다.
     """
     problems = []
     words = hints or ("test", "spec")
@@ -512,7 +518,8 @@ def tdd_evidence(project, wd, base=None, hints=None):
                     seen.append(cur)
         return seen
 
-    order = subprocess.run(["git", "log", "--format=%H", "--reverse"],
+    # 첫 부모 줄기만 센다 — 작업 가지에 main 을 합치면 들어오는 남의 카드 커밋이 빠진다
+    order = subprocess.run(["git", "log", "--first-parent", "--format=%H", "--reverse"],
                            cwd=project, capture_output=True, text=True).stdout.split()
     if base and base not in order:
         # 전체 이력으로 넓히면 다른 이슈의 시험 커밋이 인정될 수 있다
@@ -1009,6 +1016,8 @@ def commit_stage(project, wd, num, issue_id, attempt, agent, model,
     `--format='%(trailers:key=Loop-Stage,valueonly)'` 로 기계가 읽는다.
     제목은 저장소 이력 형식과 충돌하지 않도록 트레일러와 분리한다.
     """
+    if _save_ctx and os.path.isdir(os.path.dirname(_save_ctx[0])):
+        save_state(*_save_ctx)        # 커밋에 담기는 state.json 이 이 순간까지의 cost·metrics 를 담게
     if subprocess.run(["git", "check-ignore", "-q", ".workflow"],
                       cwd=project).returncode == 0:
         print("       ! .workflow 가 gitignore 대상이다 — 산출물이 이력에 안 남는다")
@@ -1119,10 +1128,18 @@ def resume_state(state, statef):
     # 스테이지별 측정도 같은 이유로 잇는다 — 안 이으면 이어받은 실행의 요약에서 앞
     # 세션 측정이 사라져 비용 누계와 어긋난다. 이 기능 이전의 상태 파일엔 없다.
     state["metrics"] = prev.get("metrics") or {}
+    # 세션 도중 러너가 죽었으면 「진행 중」 표시가 남는다 — 끊긴 회차로 바꾸고 그 비용은 셀 수 없다고 적는다.
+    for m in state["metrics"].values():
+        if isinstance(m, dict) and m.pop("inFlight", None):
+            m["cut"] = m.get("cut", 0) + 1
+            m["costUnknown"] = True
     # 07 시작 지점도 잇는다 — 이어받은 세션의 게이트가 앞 세션의 시험 커밋을 보게.
     # 옛 상태 파일에는 없다. 그러면 옮기지 않고 07 진입 때 지금 HEAD 를 적는다.
     if prev.get("tddBase"):
         state["tddBase"] = prev["tddBase"]
+    # 검증자 세션 표시도 잇는다 — 안 이으면 이어받기 앞 검사가 표시를 못 본다.
+    if prev.get("verifierTree"):
+        state["verifierTree"] = prev["verifierTree"]
     return bool(state["counters"] or state["rounds"] or state["cost"]
                 or state.get("tddBase"))
 
@@ -1475,7 +1492,7 @@ def delegate_text(num, name, out, issue_path, wd, extra="", models=None):
                 options=os.path.join(SIGNALS_DIR, "%s__options.md" % repo),
                 trend=os.path.join(SIGNALS_DIR, "%s__trend.jsonl" % repo))
         extra = RETRO_EXTRA.format(issue=issue_name,
-                                   hq=os.path.normpath(HQ),
+                                   bindir=os.path.dirname(os.path.abspath(__file__)),
                                    project=os.path.dirname(os.path.dirname(wd)),
                                    signals=signals) + extra
     if num == "08":
@@ -1658,6 +1675,20 @@ def session_tree(pid):
             result.append(rows[p])
         stack.extend(children.get(p, []))
     return result
+
+
+def busy_after_result(pid, ended):
+    """`result` 가 success 로 온 뒤에도 세션 아래 자손이 살아 있으면 참.
+
+    그 밖에는 모두 거짓이다 — result 없음·success 아님·자손 없음·세션 없음·`ps` 실패.
+    예외는 밖으로 내지 않는다. 판정을 못 하면 지금처럼 침묵으로 끊는 쪽이다.
+    """
+    if ended != "success":
+        return False
+    try:
+        return len(session_tree(pid)) >= 2   # 첫 줄은 세션 자신
+    except Exception:   # noqa: BLE001 — ps 실패·5초 초과를 삼킨다
+        return False
 
 
 _SECRET_OPT_RE = re.compile(
@@ -2033,7 +2064,9 @@ def call(agent, prompt, cwd, config_dir, num=None, models=None):
     while proc.poll() is None:
         time.sleep(2)
         quiet = time.monotonic() - last[0]
-        if quiet > silence:
+        # 잠든 사이 세션이 스스로 끝났으면 끊지 않는다 — poll 은 판정 **뒤에** 본다
+        # (판정 도중 끝난 세션의 한 줄짜리 목록이 거짓을 내는 경우까지 걸러진다).
+        if quiet > silence and not busy_after_result(proc.pid, ended[0]) and proc.poll() is None:
             clues = hang_clues(proc.pid, ended[0])
             proc.kill(); t.join(timeout=5)
             return "timeout", clues + "".join(tail), "출력이 %d초 끊겼다" % quiet, cost[0]
@@ -2087,6 +2120,11 @@ def tree_outside_run(project):
             continue
         (created if l.startswith("??") else modified).add(l)
     return modified, created
+
+
+def leftover_verifier_edits(project, mark):
+    """검증자 세션 표시(`verifierTree`) 의 세션 전 트리에 없던 추적 파일 수정 줄. 정렬해 돌려준다."""
+    return sorted(tree_outside_run(project)[0] - set(mark.get("before") or []))
 
 
 def verdict_path(wd, num):
@@ -2357,23 +2395,28 @@ def replay_failed_block(results, machine_failed):
 
 # 워크트리가 이어받지 못하는 것 — 추적되지 않는 파일이라 새 폴더에는 없다.
 # 없으면 08 품질 확인이 도구를 못 찾아 실패한다. 링크로 때운다.
-# ponytail: 셋 고정. 이걸로 모자란 프로젝트가 나오면 그때 2층 설정으로 뺀다.
-CARRY = ["node_modules", ".env", ".env.local"]
+# `.env` 류는 비밀 값이라 잇지 않는다 — 필요한 카드에서 사람이 복사한다.
+# ponytail: 하나 고정. 이걸로 모자란 프로젝트가 나오면 그때 2층 설정으로 뺀다.
+CARRY = ["node_modules"]
 
 
 def carry_in(root, path):
     """추적되지 않는 준비물을 잇는다 — 새 폴더에는 없어서 08 이 도구를 못 찾는다.
 
-    **gitignore 대상만 잇는다.** 아니면 `git add -A` 가 링크를 커밋에 담는다.
+    **작업 폴더 쪽에서 gitignore 대상인 것만 잇는다.** 아니면 `git add -A` 가 링크를 커밋에 담는다
+    (`node_modules/` 규칙은 링크 파일을 무시하지 않는다). pnpm 작업 공간은 checks 가 설치한다.
     """
     for name in CARRY:
         src = os.path.join(root, name)
         if not os.path.exists(src) or os.path.lexists(os.path.join(path, name)):
             continue
-        if subprocess.run(["git", "check-ignore", "-q", name], cwd=root).returncode:
+        if name == "node_modules" and os.path.exists(os.path.join(root, "pnpm-workspace.yaml")):
+            print("       ! node_modules 는 pnpm 작업 공간이라 잇지 않는다 — checks 가 설치한다")
+            continue
+        if subprocess.run(["git", "check-ignore", "-q", name], cwd=path).returncode:
             print("       ! %s 가 gitignore 대상이 아니라 잇지 않는다" % name)
             continue
-        os.symlink(src, os.path.join(path, name))
+        os.symlink(os.path.realpath(src), os.path.join(path, name))
 
 
 # 지식 그래프는 CARRY 처럼 링크로 잇지 않는다 — 워크트리에서 갱신해도
@@ -3344,6 +3387,7 @@ def main(argv):
     # 쓰는 디렉터리를 「치울 후보」로 적지 않는다(08 반려 발견 2).
     discarded = [d for d in discarded if d != wd]
 
+    models["_card"] = issue_id  # 기계 검사 명령이 읽는 STOP_LOOP_CARD
     models["_repo"] = os.path.basename(root)  # 신호 파일 이름 — 워크트리 이름이 아니다
     state = {"issue": issue_id, "state": stoploop.INITIAL, "stages": {},
              "counters": {}, "models": models, "resumed": bool(a.resume)}
@@ -3351,6 +3395,8 @@ def main(argv):
     global _events_path
     _events_path = events
     statef = os.path.join(wd, "state.json")
+    global _save_ctx
+    _save_ctx = (statef, state)       # 앞 main() 의 값을 물려받지 않는다
     if picked or discarded:
         stoploop.append_event(events, {"resume_dir": picked, "discarded": discarded})
     # 앞 실행이 10 수정 도중 끊기면(Ctrl-C·재시작) 병합이 진행 중인 채 남는다.
@@ -3395,6 +3441,26 @@ def main(argv):
                 LIVE_DIR, "%s__%s.log" % (_status_ctx["repo"], issue_id))
         fire(state, "PICK", {"can_pick": True}, events)
         backlog_set(멈춘이유="")               # 시작은 PICK 전이가 찍는다
+        mark = state.get("verifierTree") if a.resume else None
+        if mark:
+            # 검증자 세션이 비정상으로 끝난 뒤 이어받는다 — 그 세션이 고친 추적 파일이 남았으면
+            # 세션을 띄우기 전에 멈춘다. 되돌리지는 않는다(버린 변경은 못 되찾는다).
+            left = leftover_verifier_edits(project, mark)
+            if left:
+                print("  ! 검증자 세션이 남긴 추적 파일 변경이 있다:")
+                for t in left:
+                    print("      %s" % t)
+                print("\n중단 — 되돌린 뒤 --resume 으로 이어받는다(git checkout -- <파일>). "
+                      "사람이 볼 차례다.")
+                state["breaker"] = {
+                    "kind": "dod-miss", "stage": mark.get("stage"),
+                    "detail": "검증자 세션이 남긴 추적 파일 변경: %s"
+                              % ", ".join(t[3:] for t in left)}
+                fire(state, "BREAK", {}, events)
+                save_state(statef, state)
+                return 3
+            state.pop("verifierTree", None)
+            save_state(statef, state)
 
     def session(agent, prompt, cwd, num, stage_tag, fix_of=None):
         """세션을 띄우고 직전·직후 HEAD 를 대조한다 (FN-03).
@@ -3427,9 +3493,16 @@ def main(argv):
         # 수정 세션(fix_of)은 고치는 산출물 단계의 모델로 돈다 — 판정 단계 열쇠를 따르지 않는다.
         # 비용·시간 집계는 판정 단계 칸(num)에 그대로 쌓이고 call() 의 인자 모양은 바뀌지 않는다.
         use = models if not fix_of else dict(models, **{num: models.get(fix_of) or models.get(agent)})
-        status, log, why, spent = call(agent, prompt, cwd, a.config_dir, num, use)
         m = state.setdefault("metrics", {}).setdefault(
             num, dict(runs=0, ms=0, cost=0.0, **{k: 0 for k in TOKEN_KEYS}))
+        m["inFlight"] = True          # 세션 도중 러너가 죽으면 이 표시가 디스크에 남는다 (--resume 이 끊김으로 바꾼다)
+        save_state(statef, state)
+        status, log, why, spent = call(agent, prompt, cwd, a.config_dir, num, use)
+        m.pop("inFlight", None)
+        if status == "timeout":
+            m["cut"] = m.get("cut", 0) + 1
+            if not spent:             # 결과 줄을 못 받아 비용을 셀 수 없었다 — 0 이 아니라 모른다고 남긴다
+                m["costUnknown"] = True
         ms = LAST_RESULT.get("ms")
         m["runs"] += 1
         m["ms"] += int((time.time() - t0) * 1000) if ms is None else ms
@@ -3703,6 +3776,9 @@ def main(argv):
                 print("       · %s" % first_line)
 
             before = tree_outside_run(project) if is_gate else (None, None)
+            if is_gate and num not in prebuilt:    # 검증자 세션 표시 — 비정상으로 끝나면 이어받기가 본다
+                state["verifierTree"] = {"stage": num, "before": sorted(before[0])}
+                save_state(statef, state)
             if num in prebuilt:                # 앞 단계 세션이 이미 썼다 — 세션 없이 검사만 한다
                 lead_num, agent = prebuilt.pop(num)     # 커밋에는 실제로 돈 앞 단계를 적는다
                 stage_model = models.get(lead_num) or models.get(agent)
@@ -3761,6 +3837,8 @@ def main(argv):
                     fire(state, "BREAK", {}, events)
                     save_state(statef, state)
                     return 3
+                if state.pop("verifierTree", None):   # 세션이 정상으로 끝났다 — 표시를 디스크에서도 바로 지운다
+                    save_state(statef, state)
             if not os.path.exists(outp):
                 print("       산출물 없음 — 스테이지 미완료 (%s)" % status)
                 print("       " + readable(log).strip().replace("\n", "\n       "))

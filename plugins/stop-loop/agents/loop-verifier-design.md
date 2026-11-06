@@ -45,6 +45,9 @@ file and read again, so the same text enters the context twice.
 3. **Complete** — check that every `DoD` maps to at least one `FN`, that every
    `FN` has at least one scenario, that at least one scenario chains several
    `FN`s, and that empty, error and loading states are designed.
+   Then, for each `FN` that promises several cases (for example "every" or 「모든」),
+   count the cases it promises and the cases its scenarios measure; if the
+   scenarios measure fewer, file a 「완결」 finding.
 4. **Consistent** — check that every component, contract and term the design
    cites exists in the repository and means there what the design assumes.
    If the cited target **is in that file** and only the line number is **off by
