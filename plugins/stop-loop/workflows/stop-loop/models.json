@@ -1,6 +1,7 @@
 {
   "_": "에이전트별 모델 — 러너 전역 기본값. SPEC-AGENTS 는 모델을 에이전트 정의에 고정하지 않는다(정의는 역할만 담고, 모델은 운영이 정한다). 프로젝트의 stop-loop.config.json 에 models 가 있으면 그것이 이깁니다. 값이 없으면 세션 상속.",
   "_값": "'opus' · 'sonnet' · 'haiku' 같은 별칭이나 'claude-opus-5' 같은 전체 이름. null 이면 세션 상속.",
+  "_effort": "medium",
   "loop-worker": "opus",
   "loop-ux": "opus",
   "loop-verifier-scope": "opus",

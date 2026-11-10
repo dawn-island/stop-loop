@@ -116,6 +116,41 @@ LAST_RESULT = {}
 HANDOFF_MODES = ("pr", "push", "local")
 
 
+DEFAULT_EFFORT = "medium"     # 문서의 기본값(2026-11-11). models.json 의 `_effort` 가 없어도 `--effort` 가 빠지지 않게
+
+
+def _is_stage_value(v):
+    """`{"model": …, "effort": …}` 모양의 단계 값. 열쇠가 단계 번호·에이전트 이름이면 크기 칸이다."""
+    return isinstance(v, dict) and bool(v) and set(v) <= {"model", "effort"}
+
+
+def _parts(v):
+    """설정 값 하나 → (모델, effort). 문자열은 모델만, 단계 값 사전은 문자열인 필드만, 그 밖은 (None, None)."""
+    if isinstance(v, str):
+        return v, None
+    if _is_stage_value(v):
+        m, e = v.get("model"), v.get("effort")
+        return (m if isinstance(m, str) else None), (e if isinstance(e, str) else None)
+    return None, None
+
+
+def effort_of(models, num, agent):
+    """스테이지 열쇠 → 에이전트 열쇠 → 전역 `_effort` → 코드 기본 (모델과 같은 순서)."""
+    models = models or {}
+    eff = models.get("_efforts", {})
+    return eff.get(num) or eff.get(agent) or models.get("_effort") or DEFAULT_EFFORT
+
+
+EFFORT_ORDER = ("low", "medium", "high", "xhigh", "max")
+
+
+def bump_effort(effort):
+    """수정 세션용으로 effort 를 한 단계 올린다. max 와 목록 밖 값은 그대로."""
+    if effort in EFFORT_ORDER[:-1]:
+        return EFFORT_ORDER[EFFORT_ORDER.index(effort) + 1]
+    return effort
+
+
 def load_models(project):
     """에이전트별 모델. 프로젝트 설정이 hq 전역 기본을 이긴다.
 
@@ -136,29 +171,49 @@ def load_models(project):
         except (OSError, ValueError):
             continue
         src = d.get("models", d)              # 프로젝트 설정은 models 키 아래에 둔다
-        models.update({k: v for k, v in src.items()
-                       if not k.startswith("_") and isinstance(v, str)})
+        efforts = models.setdefault("_efforts", {})
+        for k, v in src.items():
+            if k.startswith("_"):
+                if k == "_effort" and isinstance(v, str):
+                    models["_effort"] = v
+                continue
+            mdl, eff = _parts(v)
+            if mdl or eff or isinstance(v, str) or _is_stage_value(v):
+                efforts.pop(k, None)         # 프로젝트가 열쇠를 적으면 전역의 그 열쇠 effort 도 따라오지 않는다
+            if mdl:
+                models[k] = mdl
+            if eff:
+                efforts[k] = eff
+        if not efforts:
+            models.pop("_efforts")
         if path != project_cfg:
             # 크기 칸 — 전역 파일에서만, 값이 사전인 최상위 항목(크기 → 단계·에이전트 열쇠 → 모델).
+            # 단계 값 사전({model, effort})은 크기 칸이 아니다.
             # 프로젝트가 같은 열쇠를 적었으면 그 열쇠는 뺀다(프로젝트가 이긴다).
-            by_size = {}
+            by_size, by_eff = {}, {}
             for size, per in d.items():
-                if size.startswith("_") or not isinstance(per, dict):
+                if size.startswith("_") or not isinstance(per, dict) or _is_stage_value(per):
                     continue
-                keep = {k: v for k, v in per.items() if isinstance(v, str)}
+                keep = {k: _parts(v)[0] for k, v in per.items() if _parts(v)[0]}
+                eff = {k: _parts(v)[1] for k, v in per.items() if _parts(v)[1]}
                 if keep:
                     by_size[size] = keep
+                if eff:
+                    by_eff[size] = eff
             if by_size:
                 models["_bySize"] = by_size
+            if by_eff:
+                models["_bySizeEffort"] = by_eff
         else:
-            proj = {k for k, v in src.items() if isinstance(v, str)}
-            by_size = {}
-            for size, per in models.pop("_bySize", {}).items():
-                kept = {k: v for k, v in per.items() if k not in proj}
-                if kept:
-                    by_size[size] = kept
-            if by_size:
-                models["_bySize"] = by_size
+            proj = {k for k, v in src.items() if isinstance(v, str) or _is_stage_value(v)}
+            for name in ("_bySize", "_bySizeEffort"):
+                by_size = {}
+                for size, per in models.pop(name, {}).items():
+                    kept = {k: v for k, v in per.items() if k not in proj}
+                    if kept:
+                        by_size[size] = kept
+                if by_size:
+                    models[name] = by_size
         if isinstance(d.get("checks"), list):
             models["_checks"] = [c for c in d["checks"] if isinstance(c, dict) and c.get("cmd")]
         if d.get("handoff") in HANDOFF_MODES:
@@ -590,6 +645,31 @@ def size_models(models, size):
     return dict(models.get("_bySize", {}).get(size, {})) if size else {}
 
 
+def size_efforts(models, size):
+    """`size_models` 의 effort 판. 크기가 정확히 일치하는 칸의 열쇠 → effort. 없으면 빈 사전."""
+    return dict(models.get("_bySizeEffort", {}).get(size, {})) if size else {}
+
+
+def fix_models(models, num, fix_of, agent):
+    """수정 세션이 `call` 에 넘길 설정 — 판정 단계(num) 자리에 고치는 산출물 단계(fix_of)의 모델·effort."""
+    if not fix_of:
+        return models
+    use = dict(models, **{num: models.get(fix_of) or models.get(agent)})
+    eff = dict(models.get("_efforts", {}))
+    eff[num] = bump_effort(effort_of(models, fix_of, agent))
+    use["_efforts"] = eff
+    return use
+
+
+def stamp_metrics(m, model, effort):
+    """단계 기록에 마지막 회차의 모델(설정 별칭)·effort 를 남긴다. 회차 목록은 쌓지 않는다."""
+    if model:
+        m["model"] = model
+    else:
+        m.pop("model", None)
+    m["effort"] = effort
+
+
 def backlog_get(key):
     """작업 파일 머리말의 값 하나. 없으면 빈 문자열."""
     if not _backlog_path or not os.path.exists(_backlog_path):
@@ -1009,7 +1089,7 @@ def summary_of(wd, num, outp, fallback):
 
 
 def commit_stage(project, wd, num, issue_id, attempt, agent, model,
-                 outp, verdict=None, findings=None, cost=None, used=None):
+                 outp, verdict=None, findings=None, cost=None, used=None, effort=None):
     """스테이지 커밋. 트레일러로 작업·단계·회차를 추적한다.
 
     `git log --grep='Loop-Issue: <값>'` 이 그 작업의 전 여정을 뽑고,
@@ -1044,6 +1124,8 @@ def commit_stage(project, wd, num, issue_id, attempt, agent, model,
             trailers.append("Loop-Model-Alias: %s" % model)
     elif model:
         trailers.append("Loop-Model: %s" % model)
+    if effort:
+        trailers.append("Loop-Effort: %s" % effort)     # 세션에 실제로 넘긴 값
     if _plugin_ver:
         trailers.append("Loop-Plugin: %s" % _plugin_ver)
     if cost:
@@ -2003,6 +2085,9 @@ def call(agent, prompt, cwd, config_dir, num=None, models=None):
     LAST_RESULT.clear()
     env = dict(os.environ, CLAUDE_CONFIG_DIR=os.path.expanduser(config_dir),
                STOP_LOOP_WORKTREE=os.path.abspath(cwd), STOP_LOOP_STAGE=num or "")
+    # 환경 변수가 `--effort` 보다 앞선다(claude 실행 파일 문자열 "CLAUDE_CODE_EFFORT_LEVEL overrides effort
+    # for this session") — 러너가 정한 값이 이기게 세션 환경에서 지운다.
+    env.pop("CLAUDE_CODE_EFFORT_LEVEL", None)
     if _events_path:
         env["STOP_LOOP_EVENTS"] = _events_path
     cmd = [CLAUDE, "-p", "--output-format", "stream-json", "--verbose",
@@ -2011,6 +2096,7 @@ def call(agent, prompt, cwd, config_dir, num=None, models=None):
     model = models.get(num) or models.get(agent)   # 스테이지가 에이전트를 이긴다
     if model:
         cmd += ["--model", model]
+    cmd += ["--effort", effort_of(models, num, agent)]
     if agent:
         cmd += ["--agent", agent_ref(agent)]
     cmd.append(prompt)
@@ -3434,6 +3520,7 @@ def main(argv):
         global _backlog_path
         _backlog_path = issue
         models.update(size_models(models, backlog_get("크기")))   # 크기 칸 — 단계 모델 고르기 앞에서 한 번
+        models["_efforts"] = dict(models.get("_efforts", {}), **size_efforts(models, backlog_get("크기")))
         _status_ctx = {"repo": os.path.basename(root), "branch": "loop/%s" % issue_id,
                        "worktree": project}
         if LIVE_DIR:
@@ -3492,13 +3579,14 @@ def main(argv):
         t0 = time.time()
         # 수정 세션(fix_of)은 고치는 산출물 단계의 모델로 돈다 — 판정 단계 열쇠를 따르지 않는다.
         # 비용·시간 집계는 판정 단계 칸(num)에 그대로 쌓이고 call() 의 인자 모양은 바뀌지 않는다.
-        use = models if not fix_of else dict(models, **{num: models.get(fix_of) or models.get(agent)})
+        use = fix_models(models, num, fix_of, agent)
         m = state.setdefault("metrics", {}).setdefault(
             num, dict(runs=0, ms=0, cost=0.0, **{k: 0 for k in TOKEN_KEYS}))
         m["inFlight"] = True          # 세션 도중 러너가 죽으면 이 표시가 디스크에 남는다 (--resume 이 끊김으로 바꾼다)
         save_state(statef, state)
         status, log, why, spent = call(agent, prompt, cwd, a.config_dir, num, use)
         m.pop("inFlight", None)
+        stamp_metrics(m, use.get(num) or use.get(agent), effort_of(use, num, agent))
         if status == "timeout":
             m["cut"] = m.get("cut", 0) + 1
             if not spent:             # 결과 줄을 못 받아 비용을 셀 수 없었다 — 0 이 아니라 모른다고 남긴다
@@ -3540,6 +3628,7 @@ def main(argv):
         redo.discard(num)
         mark = None      # 이번 실행의 묶인 세션이 쓴 단계면 "01+03"·"02+06"
         stage_model = models.get(num) or models.get(agent)
+        stage_effort = effort_of(models, num, agent)
 
         why_skip = skip_reason(cond, a.screen or models.get("_screen", False),
                                models.get("_reviewPolicy", "size-m"))
@@ -3582,7 +3671,7 @@ def main(argv):
             if v0 == "반려" and findings0:
                 resume_fix = FIXERS.get(num)
 
-        own_agent, own_model = agent, stage_model
+        own_agent, own_model, own_effort = agent, stage_model, stage_effort
         stage_cost = 0.0
         gate_extra = ""
         if num == "08" and state.get("gateRun"):
@@ -3649,7 +3738,8 @@ def main(argv):
                     return 4
                 commit_stage(project, wd, "10-fix", issue_id, len(state["rounds"]) + 1, "loop-worker",
                              models.get("07") or models.get("loop-worker"), tp,
-                             used=LAST_RESULT.get("model"))
+                             used=LAST_RESULT.get("model"),
+                             effort=bump_effort(effort_of(models, "07", "loop-worker")))
                 oscillated = record_round(state, "10", len(state["rounds"]) + 1, keys, tp)
                 state["counters"]["reviewRounds"] = len(state["rounds"])
                 if oscillated:
@@ -3684,7 +3774,8 @@ def main(argv):
                 save_state(statef, state)
                 return 4
             commit_stage(project, wd, num + "-fix", issue_id, 0, fa,
-                         models.get(target[:2]) or models.get(fa), tp, used=LAST_RESULT.get("model"))
+                         models.get(target[:2]) or models.get(fa), tp, used=LAST_RESULT.get("model"),
+                         effort=bump_effort(effort_of(models, target[:2], fa)))
             # 이어받은 수정은 회차로 세지 않는다 — rounds 에도 기록하지 않는다.
             # 회차는 복원된 값을 그대로 잇는다 (0 으로 돌리지 않는다).
             if merged and num in MERGED:
@@ -3782,10 +3873,11 @@ def main(argv):
             if num in prebuilt:                # 앞 단계 세션이 이미 썼다 — 세션 없이 검사만 한다
                 lead_num, agent = prebuilt.pop(num)     # 커밋에는 실제로 돈 앞 단계를 적는다
                 stage_model = models.get(lead_num) or models.get(agent)
+                stage_effort = effort_of(models, lead_num, agent)
                 mark = "%s+%s" % (lead_num, num)
                 status, log, why, spent = "ok", "", None, 0.0
             else:
-                agent, stage_model = own_agent, own_model   # 반려 뒤 다시 보는 시도는 제 에이전트다
+                agent, stage_model, stage_effort = own_agent, own_model, own_effort   # 반려 뒤 다시 보는 시도는 제 에이전트다
                 mark = None
                 print("  %-4s %-14s %s 기동…" % (num, name, agent), flush=True)
                 if mprompt:
@@ -3891,7 +3983,8 @@ def main(argv):
                         return 4 if ps == "timeout" else 1
                     stoploop.append_event(events, {"stage": "07a", "decisions": len(pending)})
                     commit_stage(project, wd, "07a", issue_id, attempt, "loop-pm",
-                                 models.get("loop-pm"), ap, cost=pspent, used=LAST_RESULT.get("model"))
+                                 models.get("loop-pm"), ap, cost=pspent, used=LAST_RESULT.get("model"),
+                                 effort=effort_of(models, "07a", "loop-pm"))
                     prompt += ("\n\n[PM 답] 07-answers.md 의 답대로 잇는다. "
                                "사람 결정으로 올라간 결정은 구현하지 않는다")
                     os.rename(outp, outp + ".r%d" % attempt)
@@ -3943,7 +4036,7 @@ def main(argv):
                 print("       → %s" % out)
                 committed = commit_stage(project, wd, num, issue_id, attempt, agent,
                                          stage_model, outp,
-                                         cost=stage_cost, used=LAST_RESULT.get("model"))
+                                         cost=stage_cost, used=LAST_RESULT.get("model"), effort=stage_effort)
                 if num == "07" and committed and models.get("_checks"):
                     # 설정에 checks 가 없으면 machine_checks 는 명령 없이 통과한다 —
                     # 안 돌린 시험을 「통과」로 싣지 않는다.
@@ -3990,7 +4083,8 @@ def main(argv):
                 fire(state, "STAGE_DONE", {"artifact_exists": True}, events)
                 commit_stage(project, wd, num, issue_id, attempt, agent,
                              stage_model, outp,
-                             v, findings, cost=stage_cost, used=LAST_RESULT.get("model"))
+                             v, findings, cost=stage_cost, used=LAST_RESULT.get("model"),
+                             effort=stage_effort)
                 break
 
             # 반려인데 지적이 없다 — 넘길 수정 입력이 없다. 회차로 세면
@@ -4027,7 +4121,7 @@ def main(argv):
             fire(state, "GATE_FAIL", {"gate_retry_available": True}, events)
             commit_stage(project, wd, num, issue_id, attempt, agent,
                          stage_model, outp, v, findings,
-                         used=LAST_RESULT.get("model"))
+                         used=LAST_RESULT.get("model"), effort=stage_effort)
             kept = outp + ".r%d" % attempt
             os.rename(outp, kept)                      # 반려 근거를 보존한다
             if os.path.exists(verdict_path(wd, num)):
@@ -4057,7 +4151,8 @@ def main(argv):
                     save_state(statef, state)
                     return 4
                 commit_stage(project, wd, num + "-fix", issue_id, attempt, fa,
-                             models.get(target[:2]) or models.get(fa), tp, used=LAST_RESULT.get("model"))
+                             models.get(target[:2]) or models.get(fa), tp, used=LAST_RESULT.get("model"),
+                         effort=bump_effort(effort_of(models, target[:2], fa)))
                 oscillated = record_round(state, num, attempt, keys, tp)
                 # 참고용 합계 — 실행 전체에서 계속 결정을 받은 새 지적 반려의 수.
                 # 판단에는 더 쓰지 않는다(회차 상한은 round_decision 이 rounds 에서
