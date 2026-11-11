@@ -310,7 +310,75 @@ def end_report_cards(plan_dir, 번호):
     return None
 
 
-def human_turns(cards, scenarios, project):
+def _date(v):
+    """`YYYY-MM-DD` 실재 날짜면 그 글자, 아니면 None. 형식 아닌 값은 조용히 무시한다."""
+    try:
+        return v if dt.datetime.strptime(v, "%Y-%m-%d").strftime("%Y-%m-%d") == v else None
+    except ValueError:
+        return None
+
+
+def _section_empty(path, 제목):
+    """`## <제목>` 절이 없거나 공백·HTML 주석뿐이면 True."""
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    m = re.search(r"^## %s[ \t]*\n(.*?)(?=^## |\Z)" % re.escape(제목), text, re.S | re.M)
+    return not m or not re.sub(r"<!--.*?-->", "", m.group(1), flags=re.S).strip()
+
+
+def read_todo_cards(todo_dir):
+    """`docs/todo/*.md`(밑줄 시작은 틀이라 건너뜀)를 카드 사전 목록으로. 폴더가 없으면 빈 목록."""
+    cards = []
+    for path in sorted(glob.glob(os.path.join(todo_dir, "*.md"))):
+        if os.path.basename(path).startswith("_"):
+            continue
+        try:
+            fm = front_matter(path)
+            empty = _section_empty(path, "답" if fm.get("종류") == "고객 답" else "결과")
+            t = title(path)
+        except (OSError, UnicodeDecodeError):
+            continue            # 읽을 수 없는 파일은 그 카드만 건너뛴다
+        cards.append({"file": os.path.basename(path), "title": t, "종류": fm.get("종류", ""),
+                      "상태": fm.get("상태", ""), "담당": fm.get("담당", ""), "기한": fm.get("기한", ""),
+                      "다음 확인": fm.get("다음 확인", ""), "막는 것": list_value(fm.get("막는 것", "")),
+                      "갱신": fm.get("갱신", ""), "결과 빔": empty})
+    return cards
+
+
+def todo_turns(cards, today, project):
+    """할 일 카드 중 조건에 걸린 것을 「내가 할 일」 항목으로. 걸린 조건은 한 줄에 쉼표로 잇는다."""
+    name = os.path.basename(os.path.abspath(project))
+    out = []
+    for c in cards:
+        기한, 확인 = _date(c["기한"]), _date(c["다음 확인"])
+        why = []
+        if c["종류"] == "직접" and c["상태"] in ("할 일", "진행"):
+            why.append("직접 · %s" % c["상태"])
+        if c["종류"] == "고객 답" and c["상태"] == "기다림" and 확인 and 확인 <= today:
+            why.append("답 확인일 도래")
+        if 기한 and 기한 < today and c["상태"] not in ("끝", "취소"):
+            why.append("기한 지남")
+        if 기한 and 기한 < today and c["결과 빔"]:
+            why.append("결과 빔")
+        if why:
+            out.append({"열쇠": "%s:%s" % (c["종류"], c["file"]), "종류": c["종류"], "프로젝트": name, "시나리오": "",
+                        "제목": c["title"], "기다리는 것": ", ".join(why), "생긴 때": c["갱신"] or _모름,
+                        "열어 볼 곳": "../todo/" + c["file"], "알림": None})
+    return out
+
+
+def todo_warnings(cards, backlog_dir):
+    """`막는 것` 값 중 작업 카드(`docs/backlog/<값>.md`)도 관문 모양(`G7`)도 아닌 것이 있는 카드마다 경고 한 줄."""
+    out = []
+    for c in cards:
+        gone = [v for v in c["막는 것"]
+                if not re.match(r"^[A-Z]\d+$", v) and not os.path.isfile(os.path.join(backlog_dir, v + ".md"))]
+        if gone:
+            out.append("경고: 할 일 카드 %s 의 막는 것 %s 에 맞는 작업 카드가 없다" % (c["file"], ", ".join(gone)))
+    return out
+
+
+def human_turns(cards, scenarios, project, todo=(), today=None):
     """사람이 움직여야 일이 가는 항목. 보류=멈춤, 검토=사람이 병합할 PR, 그리고 완료 선언 대기. 오래된 것이 위."""
     name = os.path.basename(os.path.abspath(project))
     out = []
@@ -335,6 +403,7 @@ def human_turns(cards, scenarios, project):
             때 = max((c["갱신"] for c in mine if c["갱신"]), default=_모름)
             add("완료 선언", sc["번호"], ("%s %s" % (sc["번호"], sc["이름"])).strip(),
                 "끝 보고를 보고 완료를 선언한다(시나리오 상태를 완료로)", 때, "../plan/" + END_REPORT % sc["번호"], sc["번호"])
+    out += todo_turns(todo, today or dt.date.today().isoformat(), project)
     # 생긴 때를 모르는 것은 맨 아래. 날짜 글자는 사전순이 곧 시간순이다.
     return sorted(out, key=lambda t: (t["생긴 때"] == _모름, t["생긴 때"]))
 
@@ -721,7 +790,7 @@ def _알림결과(project, turns):
 def write_once(backlog, project, every=0, turns_out=None):
     cards = read_cards(backlog)
     scenarios = read_scenarios(os.path.join(project, "docs", "plan"))
-    turns = human_turns(cards, scenarios, project)
+    turns = human_turns(cards, scenarios, project, read_todo_cards(os.path.join(project, "docs", "todo")))
     # 알림·저장·기록은 따라가기에서만 — 한 번 찍기는 보이기만 한다. 마지막 한 번(every=0)도 건드리지 않는다.
     turns = sync_turns(project, turns) if every else _알림결과(project, turns)
     out = os.path.join(backlog, "board.html")
@@ -747,6 +816,8 @@ def main(argv):
     print(render_turns_text(turns))
     print(render_text(cards, read_scenarios(os.path.join(project, "docs", "plan"))))
     print("보드: %s" % out)
+    for w in todo_warnings(read_todo_cards(os.path.join(project, "docs", "todo")), backlog):
+        print(w)
     if not every:
         return 0
 

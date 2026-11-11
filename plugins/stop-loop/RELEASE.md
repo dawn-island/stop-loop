@@ -1,8 +1,8 @@
 # 플러그인 판
 
-- 판: 0.4.0
-- 정본 커밋: 313584f2ba8a946ad724ce1cf2fbeaba90f27f0d
-- 만든 날짜: 2026-11-11
+- 판: 0.5.0
+- 정본 커밋: e39db44176f7515f2019455ed1c7e18a5e093cef
+- 만든 날짜: 2026-11-12
 
 ## 담은 것
 
@@ -26,7 +26,10 @@
 - `setup/CLAUDE-새프로젝트.md`
 - `setup/_템플릿.md`
 - `setup/standard.md`
+- `setup/todo/_고객답.md`
+- `setup/todo/_직접.md`
 - `skills/board/SKILL.md`
+- `skills/briefing/SKILL.md`
 - `skills/dispatch/SKILL.md`
 - `skills/loop/SKILL.md`
 - `skills/qa-guide/SKILL.md`
