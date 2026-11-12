@@ -1,7 +1,7 @@
 # 플러그인 판
 
-- 판: 0.5.0
-- 정본 커밋: e39db44176f7515f2019455ed1c7e18a5e093cef
+- 판: 0.6.0
+- 정본 커밋: 33e5ab925f5e9930ad0cbfaf4c34864c5127bcf1
 - 만든 날짜: 2026-11-12
 
 ## 담은 것
@@ -21,6 +21,7 @@
 - `scripts/endreport.py`
 - `scripts/ledger.py`
 - `scripts/report_workflow.py`
+- `scripts/runcost.py`
 - `scripts/runner.py`
 - `scripts/setup_project.py`
 - `setup/CLAUDE-새프로젝트.md`

@@ -454,6 +454,37 @@ FIX_MSG = """[STOP-LOOP {num} 반려 수정]
 """
 
 
+def clean_untracked_links(path):
+    """앞 시도가 남긴, git 이 추적하지 않는 하위 `node_modules` 심볼릭 링크만 지운다. 지운 상대 경로 목록.
+
+    루트의 `node_modules` 는 carry_in 이 만든 것일 수 있어 건드리지 않는다. 링크는 따라가지 않고(링크 파일만
+    지운다), 진짜 폴더·추적되는 링크·`.git`·`node_modules` 안은 들어가지 않는다. git 이 아니면 지우지 않는다.
+    예외를 올리지 않는다.
+    """
+    gone = []
+    for d, dirs, _ in os.walk(path):           # followlinks=False — 링크 폴더는 들어가지 않는다
+        dirs[:] = [x for x in dirs if x != ".git" and not (
+            x == "node_modules" and not os.path.islink(os.path.join(d, x)))]
+        if d == path:
+            continue
+        p = os.path.join(d, "node_modules")
+        if not os.path.islink(p):
+            continue
+        rel = os.path.relpath(p, path)
+        try:
+            ls = subprocess.run(["git", "ls-files", "--error-unmatch", "--", rel], cwd=path,
+                                capture_output=True, text=True)
+            if ls.returncode == 0 or "did not match" not in ls.stderr:
+                continue                         # 추적됨, 또는 git 이 아니라 알 수 없음
+            os.unlink(p)
+        except OSError as e:
+            print("       ! 링크를 지우지 못했다: %s (%s)" % (rel, e), flush=True)
+            continue
+        gone.append(rel)
+        print("       검사 앞 정리 — 앞 시도가 남긴 링크를 지웠다: %s" % rel, flush=True)
+    return gone
+
+
 def machine_checks(project, models_cfg):
     """린트·타입검사·테스트를 먼저 돌린다. (통과 여부, 실패 목록).
 
@@ -468,6 +499,8 @@ def machine_checks(project, models_cfg):
     """
     checks = models_cfg.get("_checks") or []
     failed = []
+    if checks:
+        clean_untracked_links(project)
     # 명령이 「누구의 검사인가」를 알게 한다 — 프로젝트가 카드마다 DB 를 나누는 근거.
     env = dict(os.environ, STOP_LOOP_CARD=models_cfg["_card"]) if models_cfg.get("_card") else None
     for c in checks:
