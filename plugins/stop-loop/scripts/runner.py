@@ -14,6 +14,7 @@
 """
 import argparse
 import datetime as dt
+import fnmatch
 import glob
 import hashlib
 import os
@@ -485,6 +486,25 @@ def clean_untracked_links(path):
     return gone
 
 
+SKIP_NOT_IN_PATHS = "건너뜀 — 바뀐 파일이 paths 에 없다"
+
+
+def _paths_match(files, patterns):
+    """바뀐 파일 가운데 하나라도 항목 하나에 맞으면 True. 항목에 `* ? [` 가 있으면 글롭
+    (`fnmatch` — `*` 가 `/` 도 넘는다), 없으면 경로 앞부분."""
+    return any(fnmatch.fnmatchcase(f, p) if re.search(r"[*?\[]", p) else f.startswith(p)
+               for f in files for p in patterns)
+
+
+def _changed_or_none(project, base):
+    """기준 커밋 뒤 바뀐 파일. 기준이 없거나 저장소에 없으면 None(모름) —
+    `changed_files` 는 git 이 실패해도 빈 목록을 주므로 먼저 실재를 본다."""
+    if not base or subprocess.run(["git", "cat-file", "-e", "%s^{commit}" % base],
+                                  cwd=project, capture_output=True).returncode:
+        return None
+    return changed_files(project, base, "HEAD")
+
+
 def machine_checks(project, models_cfg):
     """린트·타입검사·테스트를 먼저 돌린다. (통과 여부, 실패 목록).
 
@@ -503,7 +523,16 @@ def machine_checks(project, models_cfg):
         clean_untracked_links(project)
     # 명령이 「누구의 검사인가」를 알게 한다 — 프로젝트가 카드마다 DB 를 나누는 근거.
     env = dict(os.environ, STOP_LOOP_CARD=models_cfg["_card"]) if models_cfg.get("_card") else None
+    changed = False                          # False = 아직 안 구함, None = 모름
     for c in checks:
+        pats = c.get("paths")
+        if (isinstance(pats, list) and pats
+                and all(isinstance(p, str) for p in pats)):
+            if changed is False:
+                changed = _changed_or_none(project, models_cfg.get("_base"))
+            if changed is not None and not _paths_match(changed, pats):
+                print("       %s: %s" % (SKIP_NOT_IN_PATHS, c["cmd"]), flush=True)
+                continue
         cwd = os.path.join(project, c.get("cwd", "")) if c.get("cwd") else project
         r = subprocess.run(c["cmd"], shell=True, cwd=cwd, env=env,
                            capture_output=True, text=True)
@@ -606,7 +635,7 @@ def tdd_evidence(project, wd, base=None, hints=None):
             cwd=project, capture_output=True, text=True).stdout
         seen, cur = [], None
         for line in out.splitlines():
-            if len(line) == 40 and " " not in line:
+            if re.fullmatch(r"[0-9a-f]{40}", line):
                 cur = line
             elif line.strip():
                 low = line.lower()
@@ -633,7 +662,8 @@ def tdd_evidence(project, wd, base=None, hints=None):
     t = [c for c in commits(True) if c in new]
     srcs = [c for c in commits(False) if c in new]
     if not t:
-        problems.append("테스트를 건드린 커밋이 없다")
+        problems.append("테스트를 건드린 커밋이 없다 — 시험으로 치는 파일 이름 낱말: %s "
+                        "(바꾸려면 stop-loop.config.json 의 testPaths)" % ", ".join(words))
     elif srcs:
         if min(order.index(c) for c in srcs) < min(order.index(c) for c in t):
             problems.append("구현 커밋이 테스트 커밋보다 앞선다 — 빨강이 먼저가 아니다")
@@ -3367,7 +3397,7 @@ def stage_handoff(project, wd, issue, issue_id, state, models, events, outp, con
     elif result in ("merged", "up-to-date", "no-base"):
         failed = []
         if result != "no-base":
-            ok, failed = machine_checks(project, models)
+            ok, failed = machine_checks(project, dict(models, _base=state.get("tddBase")))
         marks = upload_markers(project, m.get("sha"), branch)
         problems += ["기계 검사 실패: %s (rc=%d)\n         %s"
                      % (x["cmd"], x["rc"], x["tail"].replace("\n", "\n         "))
@@ -3872,7 +3902,8 @@ def main(argv):
                                   "아니다. 사람이 볼 차례다." % num)
                             return 3
                         t0 = time.monotonic()
-                        machine_ok, machine_failed = machine_checks(project, models)
+                        machine_ok, machine_failed = machine_checks(
+                            project, dict(models, _base=state.get("tddBase")))
                         replay_secs = int(time.monotonic() - t0)
                         tree_changed = sorted(tree_outside_run(project)[0] - tree_before)
                         if replay_ok and machine_ok and tree_changed:
@@ -4036,7 +4067,7 @@ def main(argv):
                              if "_testPaths" in models else {})
                     probs = tdd_evidence(project, wd, state.get("tddBase"), **hints)
                     t0 = time.monotonic()
-                    ok, failed = machine_checks(project, models)
+                    ok, failed = machine_checks(project, dict(models, _base=state.get("tddBase")))
                     gate_secs = int(time.monotonic() - t0)
                     if not ok:
                         for x in failed:
