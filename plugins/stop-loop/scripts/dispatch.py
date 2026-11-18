@@ -38,21 +38,27 @@ def list_path():
     return PROJECTS_JSON if runner.PLUGIN else PROJECTS_YAML
 
 
-def load_projects(path=None):
+def load_projects(path=None, devices=None):
     """(이름, 펼친 경로) 를 적힌 순서대로. `.json` 이면 목록 파일의 전부, 아니면 projects.yaml 의
     `workflow` 가 정확히 stop-loop 인 것. `yaml` 은 YAML 을 읽을 때만 가져온다 — 플러그인은 표준 라이브러리만 쓴다.
+    devices 가 사전이면 이름 → 항목의 `기기` 값(문자열이 아니면 빈 값)을 채운다 — 반환 모양은 그대로다.
     읽기 실패는 OSError, 내용 오류는 ValueError, 모양 오류는 KeyError·TypeError."""
     path = path or list_path()
     with open(path, encoding="utf-8") as f:
         if path.endswith(".json"):
-            return [(p["name"], os.path.expanduser(p["path"])) for p in json.load(f)["projects"]]
-        import yaml
-        try:
-            data = yaml.safe_load(f)
-        except yaml.YAMLError as e:
-            raise ValueError(e)
-    return [(p["name"], os.path.expanduser(p["path"]))
-            for p in data["projects"] if p.get("workflow") == "stop-loop"]
+            items = json.load(f)["projects"]
+        else:
+            import yaml
+            try:
+                data = yaml.safe_load(f)
+            except yaml.YAMLError as e:
+                raise ValueError(e)
+            items = [p for p in data["projects"] if p.get("workflow") == "stop-loop"]
+    if devices is not None:
+        for p in items:
+            v = p.get("기기", "")
+            devices[p["name"]] = v.strip() if isinstance(v, str) else ""
+    return [(p["name"], os.path.expanduser(p["path"])) for p in items]
 
 
 def read_cards(project_path):
@@ -72,7 +78,7 @@ def read_cards(project_path):
         except (OSError, UnicodeDecodeError):
             return [], "카드를 읽지 못함: %s" % fname
         cards.append({"file": fname, "path": path, **{k: head.get(k, "")
-                      for k in ("상태", "시나리오", "요소", "선행")}})
+                      for k in ("상태", "시나리오", "요소", "선행", "기기")}})
     return cards, None
 
 
@@ -98,23 +104,37 @@ def _bound(card):
     return card["시나리오"].strip() not in ("", "—", "-")
 
 
-def pick_next(cards, handed, live=frozenset(), held=frozenset(), lists=None):
+OTHER_DEVICE = "다른 기기 카드만 남음"
+
+
+def _other_device(card, device):
+    """이 기기(device)와 다른 기기의 카드인가. device 가 비었거나 카드 `기기` 가 비었거나 `—`·`-` 이면 아니다."""
+    dev = card.get("기기", "").strip()
+    return bool(device) and dev not in ("", "—", "-") and dev != device
+
+
+def pick_next(cards, handed, live=frozenset(), held=frozenset(), lists=None, device=""):
     """(집을 카드 또는 None, 건너뛴 까닭 또는 None).
 
     live = 이번 배차가 넘겨 아직 끝나지 않은 카드 경로. 돌고 있는 카드 = 상태 진행 또는 live.
     held = 승인되지 않은 시나리오 번호 — 그 시나리오의 대기 카드는 집지 않는다(E-2).
     lists = 선행 판정에 쓰는 시나리오별 카드 목록(`_ready`).
+    device = 이 기기 이름. 다른 기기 카드는 집지도, 돌고 있는 카드로 세지도 않는다(상태는 건드리지 않는다). 선행 판정은 전체 카드를 본다.
     묶이지 않은 카드는 혼자 돈다 — 돌고 있으면 아무것도 안 집고, 다른 카드가 돌면 안 집힌다.
     """
-    running = [c for c in cards if c["상태"] == "진행" or c["path"] in live]
+    mine = [c for c in cards if not _other_device(c, device)]
+    running = [c for c in mine if c["상태"] == "진행" or c["path"] in live]
     skip = "진행 카드 있어 건너뜀"
     if any(not _bound(c) for c in running):
         return None, skip
-    ready = [c for c in cards if c["상태"] == "대기" and c["path"] not in handed and _ready(c, cards, lists)
+    ready = [c for c in mine if c["상태"] == "대기" and c["path"] not in handed and _ready(c, cards, lists)
              and c["시나리오"] not in held and (not running or _bound(c))]
     if ready:
         return min(ready, key=lambda c: c["file"]), None
-    return (None, skip) if running else (None, None)
+    if running:
+        return None, skip
+    others = any(_other_device(c, device) and c["상태"] == "대기" and c["path"] not in handed for c in cards)
+    return (None, OTHER_DEVICE) if others else (None, None)
 
 
 def set_scenario_status(plan_dir, no, value):
@@ -349,8 +369,10 @@ def base_fixed(project_path, failed):
     return not split["error"] and not split["base"]
 
 
-def pick_rehandoff(project_path, cards, handed, live):
-    """다시 인계할 카드 또는 None. 상한 도달 카드는 `차례` 를 비워 사람 차례로 올린다. 본 카드는 handed 에 넣는다."""
+def pick_rehandoff(project_path, cards, handed, live, device=""):
+    """다시 인계할 카드 또는 None. 상한 도달 카드는 `차례` 를 비워 사람 차례로 올린다. 본 카드는 handed 에 넣는다.
+    다른 기기 카드는 후보에도 돌고 있는 카드에도 넣지 않는다."""
+    cards = [c for c in cards if not _other_device(c, device)]
     name = os.path.basename(os.path.abspath(project_path))
     cands = rehandoff_candidates(cards)
     keep = []
@@ -394,7 +416,8 @@ def _summary(started, results, skipped):
 def main(argv=None):
     started = dt.datetime.now()
     try:
-        projects = load_projects()
+        devices = {}
+        projects = load_projects(devices=devices)
     except (OSError, ValueError, KeyError, TypeError) as e:
         print("배차를 시작하지 않는다 — 프로젝트 목록을 읽지 못함: %s (%s)" % (list_path(), e))
         return 2
@@ -427,10 +450,11 @@ def main(argv=None):
             cards, why = read_cards(path)
             card = None
             if not why:
-                card, why = pick_next(cards, handed, set(running), held(path), lists(path))
+                card, why = pick_next(cards, handed, set(running), held(path), lists(path),
+                                      device=devices.get(name, ""))
             again = False
-            if card is None and not (why and why not in (None, "진행 카드 있어 건너뜀")):
-                card = pick_rehandoff(path, cards, handed, set(running))
+            if card is None and not (why and why not in (None, "진행 카드 있어 건너뜀", OTHER_DEVICE)):
+                card = pick_rehandoff(path, cards, handed, set(running), device=devices.get(name, ""))
                 again = card is not None
                 if again:
                     why = None
