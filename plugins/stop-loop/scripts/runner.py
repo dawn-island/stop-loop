@@ -758,14 +758,25 @@ def backlog_get(key):
     return ""
 
 
-def skip_reason(cond, screen, policy="size-m"):
+def skip_reason(cond, screen, policy="size-m", wd=None):
     """조건부 스테이지를 건너뛰는 사유. 돌려야 하면 None.
 
     `size-m` 은 카드 머리말의 크기가 정확히 `S` 일 때만 건너뛴다 — 읽지 못하거나
     모르는 값이면 검증하는 쪽이다. `policy`(설정 `reviewPolicy`)가 `always` 면 크기와
-    무관하게 돌고 `never` 면 늘 건너뛴다. 셋 밖의 값은 `size-m` 이다."""
+    무관하게 돌고 `never` 면 늘 건너뛴다. 셋 밖의 값은 `size-m` 이다.
+
+    `screen` 조건은 영역이 켜져 있어도 `wd` 의 01-scope.json `impactAreas["화면"]` 이 `n/a`·`excluded…`
+    면 건너뛴다. 읽지 못하거나 모르는 값이면 돈다."""
     if cond == "screen" and not screen:
         return "화면 영역 꺼짐"
+    if cond == "screen" and wd:
+        try:
+            with open(os.path.join(wd, "01-scope.json"), encoding="utf-8") as fh:
+                v = json.load(fh)["impactAreas"]["화면"]
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+        if isinstance(v, str) and (v == "n/a" or v.startswith("excluded")):
+            return "01 범위가 화면을 해당 없음으로 판정"
     if cond == "scope-m" and backlog_get("크기") == "S":
         # 04 는 크기 S 에서만 건너뛴다 — 09 정책(`policy`)과 무관하다(기록 43).
         return "규모 S — 04 범위 통제는 M 이상에서만 돈다"
@@ -1100,6 +1111,25 @@ def save_state(statef, state):
     write_status(state)
 
 
+def _log_add(state, key, entry):
+    """state[key] 목록에 한 줄을 쌓는다. 손으로 고친 파일이라 목록이 아니면 빈 목록으로 본다."""
+    if not isinstance(state.get(key), list):
+        state[key] = []
+    state[key].append(entry)
+
+
+def record_gate_block(state, stage, kind, text):
+    """관문이 막힐 때마다 `gateBlocks` 에 `{stage, kind, text}` 한 줄 — 첫 줄만, 120자까지."""
+    first = (text.strip().splitlines() or [""])[0]
+    _log_add(state, "gateBlocks", {"stage": stage, "kind": kind, "text": first[:120]})
+
+
+def gate_kind_07(probs):
+    """07 막힌 문장 목록 → 「기계 검사 실패」(그 접두어 문장이 하나라도 있으면) 또는 「시험 증거」."""
+    return ("기계 검사 실패" if any(p.startswith("기계 검사 실패:") for p in probs)
+            else "시험 증거")
+
+
 def fire(state, event, guards, events_path, turn=None):
     """전이표를 통해서만 상태를 바꾼다. (성공 여부, 막은 guard).
 
@@ -1129,6 +1159,9 @@ def fire(state, event, guards, events_path, turn=None):
         if nxt == "blocked":
             b = state.get("breaker") or {}
             extra["멈춘이유"] = b.get("detail") or b.get("kind") or "멈춤"
+            _log_add(state, "stops", {"stage": b.get("stage"), "at": now,
+                                      "kind": b.get("kind") or event,
+                                      "reason": extra["멈춘이유"]})
         if nxt in ("review", "closed"):
             extra["단계"] = ""
             extra["멈춘이유"] = ""
@@ -1294,6 +1327,10 @@ def resume_state(state, statef):
     # 검증자 세션 표시도 잇는다 — 안 이으면 이어받기 앞 검사가 표시를 못 본다.
     if prev.get("verifierTree"):
         state["verifierTree"] = prev["verifierTree"]
+    # 막힘·멈춤·이어받기 기록도 잇는다 — 안 이으면 앞 세션의 까닭이 사라진다. 옛 파일엔 없다.
+    for k in ("gateBlocks", "stops", "resumes"):
+        v = prev.get(k)
+        state[k] = list(v) if isinstance(v, list) else []
     return bool(state["counters"] or state["rounds"] or state["cost"]
                 or state.get("tddBase"))
 
@@ -3448,14 +3485,12 @@ def stage_handoff(project, wd, issue, issue_id, state, models, events, outp, con
                             bool(state.get("resumed")), scenario=scenario)
     human = human_items(wd)
     notes = [line] if line else []
+    # 07 「참고 사항」은 병합과 무관한 메모라 병합을 막지 않는다 — 03a·07a 사람 결정만 센다(시나리오 여부와 무관).
+    counted = [x for x in human if x[0] in ("03a", "07a")]
     if scenario:
-        # 07 「참고 사항」은 병합과 무관한 메모라 병합을 막지 않는다 — 03a·07a 사람 결정만 센다.
-        counted = [x for x in human if x[0] in ("03a", "07a")]
         why, row = irreversible_check(irreversible_items(wd), declared_irreversible())
         reasons = reasons + why
         notes += [row, "반려 이력은 판정에 쓰지 않고 아래 표에 보이기만 한다"]
-    else:
-        counted = human
     if counted:
         reasons = reasons + ["%s: %d건" % (HUMAN_REASON, len(counted))]
     with open(outp, "w", encoding="utf-8") as f:
@@ -3548,7 +3583,9 @@ def main(argv):
     models["_card"] = issue_id  # 기계 검사 명령이 읽는 STOP_LOOP_CARD
     models["_repo"] = os.path.basename(root)  # 신호 파일 이름 — 워크트리 이름이 아니다
     state = {"issue": issue_id, "state": stoploop.INITIAL, "stages": {},
-             "counters": {}, "models": models, "resumed": bool(a.resume)}
+             "counters": {}, "models": models, "resumed": bool(a.resume),
+             # 새 실행은 세 목록이 처음부터 있다 — 칸 없음은 옛 기록의 표시다(runcost 「기록 없음」)
+             "gateBlocks": [], "stops": [], "resumes": []}
     events = os.path.join(wd, "events.jsonl")
     global _events_path
     _events_path = events
@@ -3573,6 +3610,8 @@ def main(argv):
     if a.resume and resume_state(state, statef):
         print("  상태 이어받음 — 회차 %d건, 상한 %s\n"
               % (len(state["rounds"]), state["counters"]))
+    if a.resume:
+        _log_add(state, "resumes", {"at": dt.datetime.now().strftime("%Y-%m-%d %H:%M")})
     global _plugin_ver, _gh_account, _gh_token
     _plugin_ver = _gh_account = _gh_token = None      # 앞 main() 의 값을 물려받지 않는다
     if not a.dry_run:
@@ -3703,7 +3742,7 @@ def main(argv):
         stage_effort = effort_of(models, num, agent)
 
         why_skip = skip_reason(cond, a.screen or models.get("_screen", False),
-                               models.get("_reviewPolicy", "size-m"))
+                               models.get("_reviewPolicy", "size-m"), wd)
         if num == "11" and not why_skip and not a.dry_run:
             why_skip = retro_skip_reason(state, wd)
         if num == "08" and not why_skip and not a.dry_run:
@@ -4016,6 +4055,7 @@ def main(argv):
                 print("       ! 틀의 절이 비었다: %s" % ", ".join(gaps))
                 stoploop.append_event(events, {"stage": num, "gate": "틀",
                                                "problems": gaps})
+                record_gate_block(state, num, "틀 검사", "틀의 절이 비었다: %s" % ", ".join(gaps))
                 if stoploop.on_gate_fail(state["counters"], num) == "break":
                     state["stages"][num] = {"status": "failed", "reason": "틀 미충족"}
                     state["breaker"] = {"kind": "dod-miss", "stage": num,
@@ -4080,6 +4120,10 @@ def main(argv):
                         stoploop.append_event(events, {"stage": "07",
                                                        "gate": "tdd",
                                                        "problems": probs})
+                        kind = gate_kind_07(probs)
+                        record_gate_block(state, "07", kind, next(
+                            (p for p in probs if p.startswith("기계 검사 실패:")), probs[0])
+                            if kind == "기계 검사 실패" else probs[0])
                         if stoploop.on_gate_fail(state["counters"], "07") == "break":
                             state["stages"][num] = {"status": "failed",
                                                     "reason": "TDD 증거 없음"}
