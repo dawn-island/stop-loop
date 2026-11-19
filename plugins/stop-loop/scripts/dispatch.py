@@ -348,7 +348,7 @@ def failed_checks(project_path, card_file):
     except (OSError, UnicodeDecodeError):
         return []
     seen = []
-    for cmd, rc in re.findall(r"^- 기계 검사 실패: (.+) \(rc=(-?\d+)\)\s*$", text, re.M):
+    for cmd, rc in runner.MACHINE_FAIL_RE.findall(text):
         if cmd not in [x["cmd"] for x in seen]:
             seen.append({"cmd": cmd, "rc": int(rc), "tail": ""})
     return seen

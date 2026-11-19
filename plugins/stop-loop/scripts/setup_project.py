@@ -57,7 +57,7 @@ def _agent_name(path):
 def plan(proj, root):
     """(쓸 파일 목록 [(경로, 내용, 새로 만드는가)], 남은 사본 줄). 아무것도 쓰지 않는다."""
     setup = os.path.join(root, "setup")
-    assets = {n: os.path.join(setup, n) for n in ("CLAUDE-새프로젝트.md", "_템플릿.md", "standard.md")}
+    assets = {n: os.path.join(setup, n) for n in ("CLAUDE-새프로젝트.md", "_템플릿.md", "standard.md", "기능맵.md")}
     gone = [p for p in assets.values() if not os.path.isfile(p)]
     if gone:
         raise SetupError("셋팅 자산이 없다(플러그인 안에서 부른 것이 맞는지 본다): %s" % ", ".join(gone))
@@ -76,6 +76,8 @@ def plan(proj, root):
         put("stop-loop.config.json", json.dumps(CONFIG, indent=2, ensure_ascii=False) + "\n", None)
     if not os.path.exists(os.path.join(proj, "docs", "backlog", "_템플릿.md")):
         put("docs/backlog/_템플릿.md", _read(assets["_템플릿.md"]), None)
+    if not os.path.exists(os.path.join(proj, "docs", "기능맵.md")):
+        put("docs/기능맵.md", _read(assets["기능맵.md"]), None)
 
     spath = os.path.join(proj, ".claude", "settings.json")
     old = None

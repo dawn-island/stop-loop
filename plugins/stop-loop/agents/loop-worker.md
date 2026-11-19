@@ -43,14 +43,27 @@ Nothing else is input — not your memory of other issues, not the issue tracker
    **An `excluded` without a reason is an omission, not a decision.**
    When the screen area is on, add `designContract`: reused components, new
    components, and why each new one cannot be a reused one.
-3. Write `01-scope.md`: for each judgement, the evidence path you checked.
-4. Anything you could not verify goes to 03 as a question. Do not guess.
+3. Write `01-scope.md`: for each judgement, the evidence path you checked and its
+   확신 단계 — one of: 말로만 했다 · 줄을 가리켰다 · 나쁜 경우가 닿지 않음을 단계별로 보였다 · 실제 코드를 부르는 명령을 돌렸다 · 돌아가는 앱에서 재현했다.
+   Say where you stopped if you stopped short of what the judgement needs.
+4. Anything you could not verify goes to 03 as a question. Do not guess. A judgement
+   that stays at 말로만 했다 is such a thing: send it to 03.
 5. Find the existing tests that pin what you will change: grep the test files
    for every function name, config key, stage order and output string this
    issue changes. Put each matching test file in `files`, or give it
    `excluded: <reason>`. If you change a shared fake world — a test file that
    other tests import — check the tests that import it too. Record each
    matching test file in the 「파급」 table of `01-scope.md`; do not add a new key.
+6. When `docs/기능맵.md` is among the inputs, read it before you search the
+   source. Take the feature IDs from the card header `기능:` (in the issue text)
+   and follow each one's 「관련 기능」 one step. Use those rows' code and test
+   locations to set the impact range. Write what you read in the
+   「기능맵에서 읽은 것」 section of `01-scope.md` (IDs read, related features
+   followed with their kind, IDs not in the map). A feature linked by `짝:` is a
+   second implementation of the same behaviour: its code location must appear in
+   `impactAreas` as `required` or `excluded: <reason>`. An empty map or an empty
+   `기능:` is written down as such, and you analyse as usual. When the file is
+   not among the inputs, skip this step.
 
 ## 03 clarify
 
@@ -105,6 +118,9 @@ Nothing else is input — not your memory of other issues, not the issue tracker
    entries `### 1.`, `### 2.` inside the file and refer to them as
    「runner/<issue>.md 1번」. Do not move existing entries. Name that file in
    `05-design.md`.
+10. When `docs/기능맵.md` is among the inputs, read it before you design. Start
+   the impact range from the code and test locations of the card's feature IDs
+   (`기능:`) and of their 「관련 기능」. When it is not among the inputs, skip this.
 
 ## 07 implement
 
@@ -128,6 +144,23 @@ Nothing else is input — not your memory of other issues, not the issue tracker
    요구를 놓쳤다 (the design missed a requirement) ·
    구현이 넘쳤다 (the implementation overran the design). Write 「없음」 if
    there is none.
+
+## Fixing a rejection (08 / 09 sent the work back)
+
+Count the rejection verdict files of the same stage, `<num>-verdict.json.r<n>`
+(08 과 09 는 따로 센다; never count `07-changes.md.r*`, those also
+appear on template and PM-answer retries).
+
+- One file = 첫 반려. Fix what was named. Do not add the section below.
+- Two or more = second or later rejection. Before fixing, add the section
+  `## 전제 (같은 단계 두 번째 반려를 받았을 때만)` to `07-changes.md`: state in one
+  sentence the 「전제」 that the earlier fixes all leaned on, then run one 시험 명령
+  whose 출력 would differ if that premise were false, and paste command and 출력.
+  If the command cannot run or prints nothing, write that as it is, treat the
+  premise as neither refuted nor confirmed, and put it under 「정할 것」 (the `## 정할 것` section).
+- If the output refutes the premise, make no 세 번째 수정 that leans on it. Set up a
+  new premise once (새 전제는 한 번만) and test it the same way. If that is refuted
+  too, write it under 「정할 것」 and end the session without that fix.
 
 # Output formats
 

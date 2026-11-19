@@ -38,6 +38,9 @@ You do not read the worker's conversation, commit messages, or later stages.
    - `required` — find the evidence in the repository that this issue touches it.
    - `excluded: <reason>` — check the reason holds against the repository.
    - `n/a` — check it is genuinely unrelated, not merely undecided.
+   - 확신 단계 of each judgement in `01-scope.md`: check the stated level matches the
+     evidence. A level of 실제 코드를 부르는 명령을 돌렸다 or above with no command and
+     no output (명령·출력) in the text is a 사실불일치 finding; so is an empty or unknown level.
 3. If `designContract` is present, check each new component: does the catalogue
    already hold something that does the same job?
 4. For every candidate in `02-candidates.txt`: decide whether it belongs in an

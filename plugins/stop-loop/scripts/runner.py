@@ -114,6 +114,10 @@ LAST_RESULT = {}
 #   pr    가지를 올리고 PR 을 연다. gh 계정이 필요하다
 #   push  가지만 올린다. PR 은 사람이 연다
 #   local 원격을 건드리지 않는다. 올리는 것도 병합도 사람이 한다 — 계정이 필요 없다
+# 10 인계 「기계 검사 실패」 줄의 글자 모양 — 러너가 쓰고 배차(bin/dispatch.py)가 읽는 한 정의.
+MACHINE_FAIL_FMT = "기계 검사 실패: %s (rc=%d)"
+MACHINE_FAIL_RE = re.compile("^- " + re.escape(MACHINE_FAIL_FMT).replace("%s", "(.+)").replace("%d", r"(-?\d+)")
+                             + r"\s*$", re.M)
 HANDOFF_MODES = ("pr", "push", "local")
 
 
@@ -1125,9 +1129,10 @@ def record_gate_block(state, stage, kind, text):
 
 
 def gate_kind_07(probs):
-    """07 막힌 문장 목록 → 「기계 검사 실패」(그 접두어 문장이 하나라도 있으면) 또는 「시험 증거」."""
-    return ("기계 검사 실패" if any(p.startswith("기계 검사 실패:") for p in probs)
-            else "시험 증거")
+    """07 막힌 문장 목록 → 「기계 검사 실패」(그 접두어 문장이 하나라도 있으면) · 「기능맵」(모두 기능맵 문장) · 「시험 증거」."""
+    if any(p.startswith("기계 검사 실패:") for p in probs):
+        return "기계 검사 실패"
+    return "기능맵" if all(p.startswith("기능맵:") for p in probs) else "시험 증거"
 
 
 def fire(state, event, guards, events_path, turn=None):
@@ -1635,6 +1640,25 @@ VERIFIER_INPUTS = {
 # 프로젝트 뿌리(실행 디렉터리의 두 단계 위) 기준 상대 경로.
 QA_GUIDE = "docs/qa-guide.md"
 
+# 기능맵의 자리 — 설정 키가 아니라 고정 경로다(ISSUE-featuremap-a-read-2026-11-19). 파일로 있을 때만 01·05 입력이 된다.
+FEATURE_MAP = "docs/기능맵.md"
+
+# 기능맵이 파일일 때 08·09 가운데 한 곳의 위임문에만 싣는 확인 지시(ISSUE-featuremap-c-review-2026-11-19).
+FEATURE_MAP_REVIEW = """
+기능맵 갱신 확인 — 이 카드가 만들거나 바꾼 기능의 기능맵 줄이 갱신됐는지 본다:
+  - 카드 머리말 `기능:` 의 ID 와, 이 카드에서 바뀐 파일의 앞 10줄 머리 주석 `기능: F-ddd` 의 ID 를 모은다.
+  - 그 ID 의 기능맵 줄에서 이 카드의 변경 때문에 바뀌어야 할 칸(정의·상태·위치·관련 기능·알려진 문제)이
+    이 카드에서 갱신되지 않았으면 지적한다.
+  - 이 카드가 새 기능을 만들었는데 기능맵에 그 줄이 더해지지 않았으면 지적한다.
+  - 기능맵을 직접 고치지 않는다. 판정 파일 findings 로만 낸다(where 는 기능맵 줄이나 바뀐 파일 자리).
+"""
+
+
+def featuremap_review_stage(models):
+    """기능맵 갱신 확인을 싣는 단계 — 09 가 돌면 "09", 안 돌면 "08". 판정은 main 과 같은 skip_reason."""
+    policy = (models or {}).get("_reviewPolicy", "size-m")
+    return "08" if skip_reason("size-m", False, policy) else "09"
+
 
 def delegate_text(num, name, out, issue_path, wd, extra="", models=None):
     inputs = ["  - %s  (이슈 원문)" % issue_path]
@@ -1662,6 +1686,15 @@ def delegate_text(num, name, out, issue_path, wd, extra="", models=None):
         for prev in sorted(os.listdir(wd)):
             if prev.endswith(".md") and prev != os.path.basename(out):
                 inputs.append("  - %s" % os.path.join(wd, prev))
+        if num in ("01", "05"):
+            fmap = os.path.join(os.path.dirname(os.path.dirname(wd)), FEATURE_MAP)
+            if os.path.isfile(fmap):
+                inputs.append("  - %s  (기능맵 — 먼저 읽는다)" % fmap)
+    if num in ("08", "09") and num == featuremap_review_stage(models):
+        fmap = os.path.join(os.path.dirname(os.path.dirname(wd)), FEATURE_MAP)
+        if os.path.isfile(fmap):
+            inputs.append("  - %s  (기능맵 — 갱신을 확인한다)" % fmap)
+            extra = FEATURE_MAP_REVIEW + extra
     if num in ("03a", "07a") and scenario_path():
         inputs.append("  - %s  (이 카드의 시나리오)" % scenario_path())
     if num == "02":
@@ -2878,6 +2911,32 @@ def github_login_problem(project):
     return None
 
 
+HEAD_MISMATCH = "가지 머리가 원격과 다르다"
+
+
+def head_mismatch(project, branch):
+    """올린 뒤 원격 가지 머리와 작업 폴더 HEAD 를 대조한다. 같으면 None, 아니면 멈춤 문장.
+
+    `git push` 는 가지 참조가 앞으로 가지 않았으면(떨어진 HEAD 에 커밋한 경우 등) rc 0 을
+    낸다 — rc 만 믿으면 낡은 원격 가지를 준비됨·병합으로 넘긴다(PR #131). HEAD 가 가지에
+    붙어 있지 않으면 해시가 같아도 불일치다. 해시는 40자 그대로 적는다.
+    """
+    def git(*args):
+        return subprocess.run(("git",) + args, cwd=project, capture_output=True, text=True)
+
+    head = git("rev-parse", "HEAD")
+    local = head.stdout.strip() if head.returncode == 0 else "읽지 못함"
+    ls = git("ls-remote", "origin", "refs/heads/%s" % branch)
+    if ls.returncode:
+        remote = "읽지 못함"
+    else:
+        remote = (ls.stdout.split() or ["없음"])[0]
+    attached = git("symbolic-ref", "-q", "HEAD").stdout.strip() == "refs/heads/%s" % branch
+    if attached and local == remote and local != "읽지 못함":
+        return None
+    return "%s — 로컬 %s · 원격 %s" % (HEAD_MISMATCH, local, remote)
+
+
 def handoff(project, issue_id, body_path, mode="pr"):
     """가지를 올리고 PR 을 초안으로 연다 — 반자동. 준비됨으로 바꾸고 병합하는 것은
     소각 뒤 `ready_and_merge` 의 일이다(기록 41).
@@ -2927,6 +2986,9 @@ def handoff(project, issue_id, body_path, mode="pr"):
     push = git("push", "-u", "origin", branch)
     if push.returncode:
         return ["가지를 올리지 못했다 — %s" % tail(push)]
+    mismatch = head_mismatch(project, branch)
+    if mismatch:
+        return [mismatch]
     out = ["가지 `%s` 를 올렸다" % branch]
 
     base = base_branch(heads)
@@ -2982,6 +3044,9 @@ def repush(project, issue_id, mode):
     push = git("push", "-u", "origin", branch)
     if push.returncode:
         return ["소각 뒤 가지를 올리지 못했다 — %s" % tail(push)]
+    mismatch = head_mismatch(project, branch)
+    if mismatch:
+        return [mismatch]
     return ["소각 뒤 가지를 다시 올렸다"]
 
 
@@ -3197,6 +3262,8 @@ def ready_and_merge(project, issue_id, repush_lines, pr_opened, state, models):
         return [], None
     if repush_lines and repush_lines[0].startswith("소각 뒤 가지를 올리지 못했다"):
         return [], "준비됨으로 바꾸지 못했다 — %s" % repush_lines[0]
+    if repush_lines and repush_lines[0].startswith(HEAD_MISMATCH):
+        return [], "준비됨으로 바꾸지 못했다 — %s" % repush_lines[0]
     if repush_lines != ["소각 뒤 가지를 다시 올렸다"]:
         return [], None                       # 원격이 없거나 local — PR 을 만질 수 없다
 
@@ -3283,7 +3350,12 @@ def ready_and_merge(project, issue_id, repush_lines, pr_opened, state, models):
                 out.append("PR 댓글을 달지 못했다 — %s" % tail(c))
         return out, None
 
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=project,
+                          capture_output=True, text=True)
+    if head.returncode or not head.stdout.strip():
+        return out, "병합하지 못했다 — 로컬 HEAD 를 읽지 못했다"
     m = gh(project, "pr", "merge", target, "--merge",
+           "--match-head-commit", head.stdout.strip(),
            "--subject", "[loop] %s — 자동 병합" % issue_id,
            "--body", "기록 41 조건을 모두 채워 러너가 병합했다\n\nLoop-Issue: %s" % issue_id)
     if m.returncode:
@@ -3377,7 +3449,7 @@ def close_worktree(root, path):
 # `handoff` 가 가지를 올리기 전에 끝나면 이 머리 중 하나로 시작하는 문장을 돌려준다
 # (ISSUE-handoff-defects-2026-09-18). 가지가 이미 올라간 뒤의 결과(PR 못 엶 등)와
 # `local` 방식의 문장은 여기 없다 — 그 경우는 멈추지 않는다.
-HANDOFF_FAIL_PREFIXES = ("원격이 없다", "원격에 닿지 못했다", "가지를 올리지 못했다", ACCOUNT_FAIL)
+HANDOFF_FAIL_PREFIXES = ("원격이 없다", "원격에 닿지 못했다", "가지를 올리지 못했다", ACCOUNT_FAIL, HEAD_MISMATCH)
 
 
 def stage_handoff(project, wd, issue, issue_id, state, models, events, outp, config_dir):
@@ -3421,7 +3493,7 @@ def stage_handoff(project, wd, issue, issue_id, state, models, events, outp, con
         fire(state, "BREAK", {}, events, **({"turn": turn} if turn else {}))
         save_state(statef, state)
         print("\n중단 — %s. %s (10-merge.md)." % (
-            reason, "기준 가지가 고쳐지면 --resume 으로 다시 띄운다" if turn else "사람이 볼 차례다"))
+            reason, "기준 가지가 고쳐지면 배차가 다시 넘긴다(재인계)" if turn else "사람이 볼 차례다"))
         return code
 
     problems = []
@@ -3436,7 +3508,7 @@ def stage_handoff(project, wd, issue, issue_id, state, models, events, outp, con
         if result != "no-base":
             ok, failed = machine_checks(project, dict(models, _base=state.get("tddBase")))
         marks = upload_markers(project, m.get("sha"), branch)
-        problems += ["기계 검사 실패: %s (rc=%d)\n         %s"
+        problems += [(MACHINE_FAIL_FMT + "\n         %s")
                      % (x["cmd"], x["rc"], x["tail"].replace("\n", "\n         "))
                      for x in failed]
         if failed and not marks:
@@ -3459,12 +3531,12 @@ def stage_handoff(project, wd, issue, issue_id, state, models, events, outp, con
             f.write("# 10 병합 — 07 이 고칠 차례\n\n기준 가지: %s\n해시: %s\n결과: %s\n\n## 고칠 것\n\n"
                     % (m.get("base"), m.get("sha"), result))
             for x in split["card"]:
-                f.write("- 기계 검사 실패: %s (rc=%d)\n         %s\n"
+                f.write("- " + (MACHINE_FAIL_FMT + "\n         %s\n")
                         % (x["cmd"], x["rc"], x["tail"].replace("\n", "\n         ")))
             if split["base"]:
                 f.write("\n## 기준 가지에서도 실패 — 참고\n\n")
                 for x in split["base"]:
-                    f.write("- 기계 검사 실패: %s (rc=%d)\n" % (x["cmd"], x["rc"]))
+                    f.write("- " + MACHINE_FAIL_FMT % (x["cmd"], x["rc"]) + "\n")
         stoploop.append_event(events, {"stage": "10", "gate": "handoff-card-fault",
                                        "problems": [x["cmd"] for x in split["card"]]})
         state["fix10"] = findings
@@ -3475,7 +3547,7 @@ def stage_handoff(project, wd, issue, issue_id, state, models, events, outp, con
         base_only = bool(split and not split["error"] and split["base"] and not split["card"])
         return stop("인계 전 병합·검사 실패", problems, 7 if result == "remote-fail" else 2,
                     title="기준 가지를 기다릴 차례" if base_only else "사람이 볼 차례",
-                    detail=("기준 가지에서도 실패하는 검사 — 기준 가지가 고쳐지면 --resume (%s)"
+                    detail=("기준 가지에서도 실패하는 검사 — 기준 가지가 고쳐지면 배차가 다시 넘긴다 (%s)"
                             % split["base"][0]["cmd"]) if base_only else None,
                     turn="러너" if base_only else None)
 
@@ -4111,9 +4183,12 @@ def main(argv):
                     gate_secs = int(time.monotonic() - t0)
                     if not ok:
                         for x in failed:
-                            probs.append("기계 검사 실패: %s (rc=%d)\n         %s"
+                            probs.append((MACHINE_FAIL_FMT + "\n         %s")
                                          % (x["cmd"], x["rc"],
                                             x["tail"].replace("\n", "\n         ")))
+                    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+                    import featuremap_check  # noqa: E402 — ledger 와 같은 방식(함수 안 가져오기)
+                    probs += ["기능맵: " + x for x in featuremap_check.check(project) or []]
                     if probs:
                         for x in probs:
                             print("       ! %s" % x)

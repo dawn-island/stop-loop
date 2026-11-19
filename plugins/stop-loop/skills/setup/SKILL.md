@@ -13,7 +13,7 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/setup_project.py" .
 ```
 
 실행 파일은 `CLAUDE.md` 가 없으면 새 프로젝트 틀로 만들고, 있으면 표시 구간만 바꾼다(구간 바깥은 그대로다).
-`stop-loop.config.json` 과 `docs/backlog/_템플릿.md` 는 없을 때만 만들고, `.claude/settings.json` 에는 다른 열쇠를
+`stop-loop.config.json`·`docs/backlog/_템플릿.md`·`docs/기능맵.md` 는 없을 때만 만들고, `.claude/settings.json` 에는 다른 열쇠를
 지킨 채 이 플러그인 정의만 더한다.
 
 ## 결과를 알려 줄 때

@@ -1,8 +1,8 @@
 # 플러그인 판
 
-- 판: 0.9.0
-- 정본 커밋: 4923bcef15b4a5484f450c8166c0ae40ba33021f
-- 만든 날짜: 2026-11-19
+- 판: 0.10.0
+- 정본 커밋: fe15ad2c3ce8ef03e7625ab89f557e7abbd2cbb5
+- 만든 날짜: 2026-11-20
 
 ## 담은 것
 
@@ -19,6 +19,7 @@
 - `scripts/dispatch.py`
 - `scripts/doctor.py`
 - `scripts/endreport.py`
+- `scripts/featuremap_check.py`
 - `scripts/ledger.py`
 - `scripts/report_workflow.py`
 - `scripts/runcost.py`
@@ -29,6 +30,7 @@
 - `setup/standard.md`
 - `setup/todo/_고객답.md`
 - `setup/todo/_직접.md`
+- `setup/기능맵.md`
 - `skills/board/SKILL.md`
 - `skills/briefing/SKILL.md`
 - `skills/dispatch/SKILL.md`
@@ -54,5 +56,6 @@
 - `workflows/stop-loop/templates/QA-guide.template.md`
 - `workflows/stop-loop/templates/SC-scenario.template.md`
 - `workflows/stop-loop/templates/verdict.schema.json`
+- `workflows/stop-loop/templates/기능맵.template.md`
 - `.claude-plugin/plugin.json`
 - `RELEASE.md`
