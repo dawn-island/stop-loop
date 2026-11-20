@@ -1,7 +1,7 @@
 # 플러그인 판
 
-- 판: 0.11.0
-- 정본 커밋: 959805ae4bec2a1eec78410080996ec6606a9d0a
+- 판: 0.12.0
+- 정본 커밋: 899157c15ecb6fd0d3fabf49d641ca7fb289a088
 - 만든 날짜: 2026-11-20
 
 ## 담은 것
@@ -34,6 +34,7 @@
 - `skills/board/SKILL.md`
 - `skills/briefing/SKILL.md`
 - `skills/dispatch/SKILL.md`
+- `skills/featuremap/SKILL.md`
 - `skills/loop/SKILL.md`
 - `skills/qa-guide/SKILL.md`
 - `skills/report/SKILL.md`

@@ -54,9 +54,13 @@ Nothing else is input — not your memory of other issues, not the issue tracker
    `excluded: <reason>`. If you change a shared fake world — a test file that
    other tests import — check the tests that import it too. Record each
    matching test file in the 「파급」 table of `01-scope.md`; do not add a new key.
-6. When `docs/기능맵.md` is among the inputs, read it before you search the
-   source. Take the feature IDs from the card header `기능:` (in the issue text)
-   and follow each one's 「관련 기능」 one step. Use those rows' code and test
+6. When `docs/기능맵.md` is among the inputs, do not read the whole file;
+   look it up before you search the source. Take the feature IDs from the card
+   header `기능:` (in the issue text) and run `rg -n "<ID>" docs/기능맵.md` for
+   each (one table row is one feature, so you get its row and the rows that
+   point at it). Look up each 「관련 기능」 ID in those rows one more step. If
+   `기능:` is empty, look up a word or code path this issue touches; if no row
+   matches, write that and analyse as usual. Use those rows' code and test
    locations to set the impact range. Write what you read in the
    「기능맵에서 읽은 것」 section of `01-scope.md` (IDs read, related features
    followed with their kind, IDs not in the map). A feature linked by `짝:` is a
@@ -124,7 +128,8 @@ Nothing else is input — not your memory of other issues, not the issue tracker
    entries `### 1.`, `### 2.` inside the file and refer to them as
    「runner/<issue>.md 1번」. Do not move existing entries. Name that file in
    `05-design.md`.
-10. When `docs/기능맵.md` is among the inputs, read it before you design. Start
+10. When `docs/기능맵.md` is among the inputs, look it up before you design —
+   do not read the whole file: `rg -n "<ID>" docs/기능맵.md` for each ID. Start
    the impact range from the code and test locations of the card's feature IDs
    (`기능:`) and of their 「관련 기능」. When it is not among the inputs, skip this.
 
@@ -194,6 +199,8 @@ if there are none).
 - The index does not cover every file. Search what it misses (shell scripts, JSON
   schemas, other extensions, config files) with plain `grep`. An empty result is
   not proof that something is absent — confirm with plain `grep`.
+- For documents (markdown) and what the index misses, search with `rg -n <pattern>` first;
+  if `rg` is missing, use plain `grep -n` and say nothing about it.
 - `graft callers` is a hint only. It misses module-qualified calls, so never
   judge impact from it alone — confirm with `graft grep` or `grep`.
 - If `graft` is missing or fails, use plain `grep` and say nothing about it.

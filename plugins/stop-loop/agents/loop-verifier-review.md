@@ -102,6 +102,8 @@ the one place that guards the result.
 - The index does not cover every file. Search what it misses (shell scripts, JSON
   schemas, other extensions, config files) with plain `grep`. An empty result is
   not proof that something is absent — confirm with plain `grep`.
+- For documents (markdown) and what the index misses, search with `rg -n <pattern>` first;
+  if `rg` is missing, use plain `grep -n` and say nothing about it.
 - `graft callers` is a hint only. It misses module-qualified calls, so never
   judge impact from it alone — confirm with `graft grep` or `grep`.
 - If `graft` is missing or fails, use plain `grep` and say nothing about it.

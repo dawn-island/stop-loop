@@ -1647,6 +1647,7 @@ FEATURE_MAP = "docs/기능맵.md"
 FEATURE_MAP_REVIEW = """
 기능맵 갱신 확인 — 이 카드가 만들거나 바꾼 기능의 기능맵 줄이 갱신됐는지 본다:
   - 카드 머리말 `기능:` 의 ID 와, 이 카드에서 바뀐 파일의 앞 10줄 머리 주석 `기능: F-ddd` 의 ID 를 모은다.
+  - 기능맵 전체를 읽지 않는다. 모은 ID 마다 `rg -n "<ID>" docs/기능맵.md` 로 그 줄만 조회한다.
   - 그 ID 의 기능맵 줄에서 이 카드의 변경 때문에 바뀌어야 할 칸(정의·상태·위치·관련 기능·알려진 문제)이
     이 카드에서 갱신되지 않았으면 지적한다.
   - 이 카드가 새 기능을 만들었는데 기능맵에 그 줄이 더해지지 않았으면 지적한다.
@@ -1689,7 +1690,7 @@ def delegate_text(num, name, out, issue_path, wd, extra="", models=None):
         if num in ("01", "05"):
             fmap = os.path.join(os.path.dirname(os.path.dirname(wd)), FEATURE_MAP)
             if os.path.isfile(fmap):
-                inputs.append("  - %s  (기능맵 — 먼저 읽는다)" % fmap)
+                inputs.append("  - %s  (기능맵 — 조회한다)" % fmap)
     if num in ("08", "09") and num == featuremap_review_stage(models):
         fmap = os.path.join(os.path.dirname(os.path.dirname(wd)), FEATURE_MAP)
         if os.path.isfile(fmap):
