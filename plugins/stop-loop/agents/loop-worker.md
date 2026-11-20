@@ -64,6 +64,12 @@ Nothing else is input — not your memory of other issues, not the issue tracker
    `impactAreas` as `required` or `excluded: <reason>`. An empty map or an empty
    `기능:` is written down as such, and you analyse as usual. When the file is
    not among the inputs, skip this step.
+7. For code this issue **deletes or changes** (only that — not code it merely
+   adds or leaves alone), run `git log` and `git blame` on those lines and find
+   why they were written that way. Near the 「파급」 table of `01-scope.md`, write
+   「기록에 적힌 이유」 (what a commit message or record says) and 「내 추론」
+   (what you infer) as separate things. If you found no reason, write that you
+   found none. Do not add a new key to `01-scope.json`.
 
 ## 03 clarify
 
@@ -144,6 +150,9 @@ Nothing else is input — not your memory of other issues, not the issue tracker
    요구를 놓쳤다 (the design missed a requirement) ·
    구현이 넘쳤다 (the implementation overran the design). Write 「없음」 if
    there is none.
+7. Before the implementation commit, read the whole `git diff` again. Remove
+   what **this work** created and no longer needs: debug output, commented-out
+   code, things left unused. Do not touch what this work did not create.
 
 ## Fixing a rejection (08 / 09 sent the work back)
 

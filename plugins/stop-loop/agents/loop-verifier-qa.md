@@ -64,6 +64,9 @@ file and read again, so the same text enters the context twice.
      in place.
    - Record in 08-qa.md 「기동과 정리」 one line: what you started, on which port,
      and what you stopped. If you started nothing, write 「띄우지 않음」.
+   - If the check fails, doubt your observation method before you write a
+     rejection: is it the instance you started, the build of the current
+     commit, and the right command?
 3. **Check the stored value, not the reply.** Assert against what the system
    kept, not what it answered.
 4. **Run the chained scenario** from the design. Functions that pass alone and
