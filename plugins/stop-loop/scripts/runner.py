@@ -1643,16 +1643,23 @@ QA_GUIDE = "docs/qa-guide.md"
 # 기능맵의 자리 — 설정 키가 아니라 고정 경로다(ISSUE-featuremap-a-read-2026-11-19). 파일로 있을 때만 01·05 입력이 된다.
 FEATURE_MAP = "docs/기능맵.md"
 
-# 기능맵이 파일일 때 08·09 가운데 한 곳의 위임문에만 싣는 확인 지시(ISSUE-featuremap-c-review-2026-11-19).
+# 기능맵 자리는 featuremap_check.locations(root) 가 정한다 — 옛 파일 `docs/기능맵.md`·그룹 폴더 `docs/기능맵/`(ISSUE-featuremap-groups-2026-11-20).
+# 기능맵이 있을 때 08·09 가운데 한 곳의 위임문에만 싣는 확인 지시(ISSUE-featuremap-c-review-2026-11-19).
 FEATURE_MAP_REVIEW = """
 기능맵 갱신 확인 — 이 카드가 만들거나 바꾼 기능의 기능맵 줄이 갱신됐는지 본다:
   - 카드 머리말 `기능:` 의 ID 와, 이 카드에서 바뀐 파일의 앞 10줄 머리 주석 `기능: F-ddd` 의 ID 를 모은다.
-  - 기능맵 전체를 읽지 않는다. 모은 ID 마다 `rg -n "<ID>" docs/기능맵.md` 로 그 줄만 조회한다.
+  - 기능맵 전체를 읽지 않는다. 모은 ID 마다 `rg -n "<ID>" {places}` 로 그 줄만 조회한다.
   - 그 ID 의 기능맵 줄에서 이 카드의 변경 때문에 바뀌어야 할 칸(정의·상태·위치·관련 기능·알려진 문제)이
     이 카드에서 갱신되지 않았으면 지적한다.
   - 이 카드가 새 기능을 만들었는데 기능맵에 그 줄이 더해지지 않았으면 지적한다.
   - 기능맵을 직접 고치지 않는다. 판정 파일 findings 로만 낸다(where 는 기능맵 줄이나 바뀐 파일 자리).
 """
+
+
+def _featuremap_check():
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import featuremap_check
+    return featuremap_check
 
 
 def featuremap_review_stage(models):
@@ -1663,6 +1670,7 @@ def featuremap_review_stage(models):
 
 def delegate_text(num, name, out, issue_path, wd, extra="", models=None):
     inputs = ["  - %s  (이슈 원문)" % issue_path]
+    featuremap_check = _featuremap_check()
     if num in VERIFIER_INPUTS:
         os.listdir(wd)                      # 실행 디렉터리를 못 읽으면 예외를 그대로 올린다
         for fn in VERIFIER_INPUTS[num]:
@@ -1688,14 +1696,17 @@ def delegate_text(num, name, out, issue_path, wd, extra="", models=None):
             if prev.endswith(".md") and prev != os.path.basename(out):
                 inputs.append("  - %s" % os.path.join(wd, prev))
         if num in ("01", "05"):
-            fmap = os.path.join(os.path.dirname(os.path.dirname(wd)), FEATURE_MAP)
-            if os.path.isfile(fmap):
-                inputs.append("  - %s  (기능맵 — 조회한다)" % fmap)
+            root = os.path.dirname(os.path.dirname(wd))
+            for loc in featuremap_check.locations(root):
+                inputs.append("  - %s  (기능맵 — 조회한다)" % os.path.join(root, loc))
     if num in ("08", "09") and num == featuremap_review_stage(models):
-        fmap = os.path.join(os.path.dirname(os.path.dirname(wd)), FEATURE_MAP)
-        if os.path.isfile(fmap):
-            inputs.append("  - %s  (기능맵 — 갱신을 확인한다)" % fmap)
-            extra = FEATURE_MAP_REVIEW + extra
+        root = os.path.dirname(os.path.dirname(wd))
+        locs = featuremap_check.locations(root)
+        for loc in locs:
+            inputs.append("  - %s  (기능맵 — 갱신을 확인한다)" % os.path.join(root, loc))
+        if locs:
+            places = " ".join(l + "/" if l == featuremap_check.MAP_DIR else l for l in locs)
+            extra = FEATURE_MAP_REVIEW.replace("{places}", places) + extra
     if num in ("03a", "07a") and scenario_path():
         inputs.append("  - %s  (이 카드의 시나리오)" % scenario_path())
     if num == "02":

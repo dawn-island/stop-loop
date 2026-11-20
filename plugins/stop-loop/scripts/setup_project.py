@@ -76,8 +76,9 @@ def plan(proj, root):
         put("stop-loop.config.json", json.dumps(CONFIG, indent=2, ensure_ascii=False) + "\n", None)
     if not os.path.exists(os.path.join(proj, "docs", "backlog", "_템플릿.md")):
         put("docs/backlog/_템플릿.md", _read(assets["_템플릿.md"]), None)
-    if not os.path.exists(os.path.join(proj, "docs", "기능맵.md")):
-        put("docs/기능맵.md", _read(assets["기능맵.md"]), None)
+    if not (os.path.lexists(os.path.join(proj, "docs", "기능맵.md"))
+            or os.path.lexists(os.path.join(proj, "docs", "기능맵"))):
+        put("docs/기능맵/README.md", _read(assets["기능맵.md"]), None)
 
     spath = os.path.join(proj, ".claude", "settings.json")
     old = None

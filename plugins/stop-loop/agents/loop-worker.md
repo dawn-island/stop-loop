@@ -54,9 +54,11 @@ Nothing else is input — not your memory of other issues, not the issue tracker
    `excluded: <reason>`. If you change a shared fake world — a test file that
    other tests import — check the tests that import it too. Record each
    matching test file in the 「파급」 table of `01-scope.md`; do not add a new key.
-6. When `docs/기능맵.md` is among the inputs, do not read the whole file;
-   look it up before you search the source. Take the feature IDs from the card
-   header `기능:` (in the issue text) and run `rg -n "<ID>" docs/기능맵.md` for
+6. When the feature map is among the inputs (the folder `docs/기능맵/`, one
+   file per feature group, and/or the old single file `docs/기능맵.md`), do not
+   read the whole map; look it up before you search the source. Take the
+   feature IDs from the card header `기능:` (in the issue text) and run
+   `rg -n "<ID>"` on the path(s) listed in the inputs for
    each (one table row is one feature, so you get its row and the rows that
    point at it). Look up each 「관련 기능」 ID in those rows one more step. If
    `기능:` is empty, look up a word or code path this issue touches; if no row
@@ -128,8 +130,9 @@ Nothing else is input — not your memory of other issues, not the issue tracker
    entries `### 1.`, `### 2.` inside the file and refer to them as
    「runner/<issue>.md 1번」. Do not move existing entries. Name that file in
    `05-design.md`.
-10. When `docs/기능맵.md` is among the inputs, look it up before you design —
-   do not read the whole file: `rg -n "<ID>" docs/기능맵.md` for each ID. Start
+10. When the feature map (the folder `docs/기능맵/` and/or the old file
+   `docs/기능맵.md`) is among the inputs, look it up before you design —
+   do not read the whole map: `rg -n "<ID>"` on the path(s) listed in the inputs for each ID. Start
    the impact range from the code and test locations of the card's feature IDs
    (`기능:`) and of their 「관련 기능」. When it is not among the inputs, skip this.
 
