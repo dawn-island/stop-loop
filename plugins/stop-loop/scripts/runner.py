@@ -941,7 +941,259 @@ def backlog_set(**fields):
     with open(tmp, "w", encoding="utf-8") as f:
         f.writelines([lines[0]] + head + lines[end:])
     os.replace(tmp, _backlog_path)
+    card_push(_backlog_path)       # 머리말 고침을 원격 기준 가지에 올린다 — 실패해도 여기서 멈추지 않는다
     return True
+
+
+# ── 카드 머리말 원격 커밋 (ISSUE-sc02-e2-card-push-2026-11-20) ──────────────
+# 기계가 고치는 머리말 열쇠. 카드 본문과 사람이 쓰는 열쇠(기기·시나리오 …)는 올리지 않는다.
+CARD_KEYS = ("상태", "단계", "시작", "누적", "멈춘이유", "차례", "갱신", "재인계", "돈기계")
+# 저장소 밖 결과 폴더. 가져오기만 해서는 꺼져 있다 — 맨 아래 진입점 블록이 명령으로 띄울 때만 켠다.
+CARD_PUSH_DIR = None
+CARD_GIT_TIMEOUT = 20          # 원격 명령 한 번의 상한(초) — 머리말 쓰기가 실행을 오래 붙잡지 않게
+CARD_PUSH_TRIES = 3            # 올리는 사이 원격이 움직여 밀렸을 때 다시 받아 만드는 횟수
+
+
+def _card_git(cwd, *args, env=None, timeout=None, input=None):
+    """머리말 커밋이 `git` 을 부르는 유일한 자리 — 시험이 감싸 원격이 움직이는 순간·환경을 끼워 넣는다.
+    시간 넘김·실행 불가도 예외 대신 실패한 결과로 돌려준다."""
+    e = dict(os.environ if env is None else env)
+    e["GIT_TERMINAL_PROMPT"] = "0"
+    try:
+        return subprocess.run(["git"] + list(args), cwd=cwd, env=e, input=input, capture_output=True,
+                              encoding="utf-8", errors="replace", timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 124, "", "시간 초과")
+    except OSError as err:
+        return subprocess.CompletedProcess(args, 127, "", str(err))
+
+
+def _head_map(text):
+    """머리말 `열쇠 → 값`. 머리말이 없거나 닫히지 않았으면 None."""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    out = {}
+    for line in lines[1:]:
+        if line.strip() == "---":
+            return out
+        k, _, v = line.partition(":")
+        out[k.strip()] = v.strip()
+    return None
+
+
+def card_without_keys(text):
+    """머리말에서 기계 열쇠 줄만 뺀 글 — 두 판이 기계 열쇠 줄에서만 다른지 보는 데 쓴다."""
+    out, in_head = [], False
+    for i, line in enumerate(text.splitlines(True)):
+        if i == 0:
+            in_head = line.strip() == "---"
+        elif in_head and line.strip() == "---":
+            in_head = False
+        elif in_head and line.split(":", 1)[0].strip() in CARD_KEYS:
+            continue
+        out.append(line)
+    return "".join(out)
+
+
+def _apply_keys(text, values):
+    """`text` 의 머리말에 `values`(열쇠 → 값)만 써 넣은 글."""
+    lines = text.splitlines(True)
+    end = next(i for i, l in enumerate(lines[1:], 1) if l.strip() == "---")
+    for key, value in values.items():
+        line = "%s: %s\n" % (key, value)
+        for i in range(1, end):
+            if lines[i].split(":", 1)[0].strip() == key:
+                lines[i] = line
+                break
+        else:
+            lines.insert(end, line)
+            end += 1
+    return "".join(lines)
+
+
+def _merge_keys(mine, remote, base):
+    """올릴 열쇠 값 `(사전, 맞물리지 않은 열쇠 또는 None)`.
+
+    열쇠마다: 내 값이 원격과 같으면 올릴 것이 없다. 기준점이 없으면 내 값. 내 값이 기준점과 같으면 원격 값을 둔다
+    (그 사이 다른 기계가 고친 것). 원격 값이 기준점과 같으면 내 값. 셋이 다 다르면 맞물리지 않는다.
+    `갱신` 은 날짜라 늦은 쪽을 쓴다."""
+    out = {}
+    for k in CARD_KEYS:
+        if k not in mine or mine[k] == remote.get(k):
+            continue
+        m, r_ = mine[k], remote.get(k)
+        if k == "갱신":
+            if max(m, r_ or "") != r_:
+                out[k] = max(m, r_ or "")
+        elif base is None:
+            out[k] = m
+        elif m == base.get(k):
+            continue
+        elif r_ == base.get(k):
+            out[k] = m
+        else:
+            return {}, k
+    return out, None
+
+
+def _remote_tip(root, url, env):
+    """`(기준 가지, 끝 sha, 오류 문구)`. 주소로 부르고 객체만 받는다 — `origin/*` 참조와 `FETCH_HEAD` 를
+    건드리지 않아 사람의 pull 과 참조 잠금으로 부딪히지 않는다."""
+    ls = _card_git(root, "ls-remote", "--heads", url, env=env, timeout=CARD_GIT_TIMEOUT)
+    if ls.returncode:
+        return None, None, (ls.stderr.strip().splitlines() or ["원격에 닿지 못함"])[-1]
+    heads = {}
+    for line in ls.stdout.splitlines():
+        sha, _, ref = line.partition("\t")
+        heads[ref[len("refs/heads/"):]] = sha
+    base = base_branch(heads)
+    if base is None:
+        return None, None, "원격에 기준 가지가 없다"
+    got = _card_git(root, "fetch", "-q", "--no-write-fetch-head", url, "refs/heads/" + base,
+                    env=env, timeout=CARD_GIT_TIMEOUT)
+    if got.returncode:
+        return None, None, (got.stderr.strip().splitlines() or ["받지 못함"])[-1]
+    return base, heads[base], None
+
+
+def _base_map(root, rel, tip):
+    """맞물림 판정 기준점의 머리말 — 원격 이력에서 이 기계가 마지막으로 올린 판, 없으면 `HEAD` 와 원격 끝의 공통 조상 판."""
+    host = socket.gethostname()
+    sha = _card_git(root, "log", tip, "-n1", "--format=%H", "--grep=^Loop-Card-Host: %s$" % re.escape(host),
+                    "--", rel).stdout.strip()
+    if not sha:
+        sha = _card_git(root, "merge-base", "HEAD", tip).stdout.strip()
+    if not sha:
+        return None
+    shown = _card_git(root, "show", "%s:%s" % (sha, rel))
+    return _head_map(shown.stdout) if shown.returncode == 0 else None
+
+
+def _make_commit(root, rel, tip, tip_text, values, card):
+    """`tip` 위에 그 카드 파일 하나만 바꾼 커밋을 만든다 — 임시 색인이라 작업 사본의 색인·파일·`HEAD` 는 그대로다.
+    `(커밋, 블롭, 모드)`, 못 만들면 None."""
+    tmp = tempfile.mkdtemp(prefix="card-push-")
+    env = dict(os.environ, GIT_INDEX_FILE=os.path.join(tmp, "index"))
+    try:
+        def git(*a, **k):
+            return _card_git(root, *a, env=env, timeout=CARD_GIT_TIMEOUT, **k)
+        if git("read-tree", tip).returncode:
+            return None
+        ent = git("ls-tree", tip, "--", rel).stdout.split()
+        blob = git("hash-object", "-w", "--stdin", input=_apply_keys(tip_text, values)).stdout.strip()
+        if len(ent) < 3 or not blob or git("update-index", "--cacheinfo", "%s,%s,%s" % (ent[0], blob, rel)).returncode:
+            return None
+        tree = git("write-tree").stdout.strip()
+        msg = "작업목록: %s 머리말 — %s\n\nLoop-Card: %s\nLoop-Card-Host: %s\n" % (
+            card, ", ".join(values), card, socket.gethostname())
+        sha = git("commit-tree", tree, "-p", tip, "-m", msg).stdout.strip() if tree else ""
+        return (sha, blob, ent[0]) if sha else None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _push_remote(root, rel, card, mine, url, models):
+    env = dict(os.environ)
+    account = models.get("_githubAccount")
+    if account:
+        token = gh_token(account)
+        if not token:
+            return "밀림", "GitHub 계정 %s 의 토큰을 얻지 못함" % account, ""
+        env["GH_TOKEN"] = token                        # 이 git 호출에만 — 전역 계정은 바꾸지 않는다
+    why = ""
+    for _ in range(CARD_PUSH_TRIES):
+        base, tip, err = _remote_tip(root, url, env)
+        if err:
+            return "밀림", err, ""
+        shown = _card_git(root, "show", "%s:%s" % (tip, rel))
+        remote = _head_map(shown.stdout) if shown.returncode == 0 else None
+        if remote is None:
+            return "밀림", "원격 기준 가지에 이 카드가 없다", ""
+        values, conflict = _merge_keys(mine, remote, _base_map(root, rel, tip))
+        if conflict:
+            return "밀림", "다른 기계가 같은 열쇠를 고침: %s" % conflict, ""
+        if not values:
+            return "올림", "", ""                        # 원격이 이미 같다
+        made = _make_commit(root, rel, tip, shown.stdout, values, card)
+        if not made:
+            return "밀림", "커밋을 만들지 못함", ""
+        res = _card_git(root, "push", url, "%s:refs/heads/%s" % (made[0], base), env=env, timeout=CARD_GIT_TIMEOUT)
+        if res.returncode == 0:
+            return "올림", "", made[0]
+        why = (res.stderr.strip().splitlines() or ["올리지 못함"])[-1]
+        if "remote rejected" in res.stderr:
+            return "거부", why, ""
+        if "[rejected]" not in res.stderr:
+            return "밀림", why, ""                       # 닿지 못함·시간 넘김 — 다시 하지 않는다
+    return "밀림", "원격이 계속 움직여 %d번 밀림: %s" % (CARD_PUSH_TRIES, why), ""
+
+
+def _push_local(root, rel, card, mine):
+    """원격이 없거나 인계 방식이 local — 이 기계의 기준 가지에만 커밋한다."""
+    refs = _card_git(root, "for-each-ref", "--format=%(refname:short)", "refs/heads").stdout.split()
+    base = base_branch(refs)
+    if base is None:
+        return "밀림", "기준 가지가 없다", ""
+    tip = _card_git(root, "rev-parse", "refs/heads/" + base).stdout.strip()
+    checked = _card_git(root, "symbolic-ref", "-q", "HEAD").stdout.strip() == "refs/heads/" + base
+    if checked and _card_git(root, "diff", "--cached", "--quiet", "--", rel).returncode:
+        return "밀림", "사람이 이 카드를 색인에 올려 두었다", ""
+    shown = _card_git(root, "show", "%s:%s" % (tip, rel))
+    remote = _head_map(shown.stdout) if shown.returncode == 0 else None
+    if remote is None:
+        return "밀림", "기준 가지에 이 카드가 없다", ""
+    values, _ = _merge_keys(mine, remote, None)
+    if not values:
+        return "원격 없음", "", ""
+    made = _make_commit(root, rel, tip, shown.stdout, values, card)
+    if not made:
+        return "밀림", "커밋을 만들지 못함", ""
+    sha, blob, mode = made
+    if _card_git(root, "update-ref", "refs/heads/" + base, sha, tip).returncode:
+        return "밀림", "기준 가지가 그 사이 움직였다", ""
+    if checked:                                          # 사람의 `git status` 에 사람이 고친 것만 보이게 색인을 맞춘다
+        _card_git(root, "update-index", "--cacheinfo", "%s,%s,%s" % (mode, blob, rel))
+    return "원격 없음", "", sha
+
+
+def card_push(path):
+    """카드 머리말 고침을 원격 기준 가지에 커밋해 올린다. 결과 사전, 해당 없으면 None. 예외를 내지 않는다.
+
+    그 카드 파일의 기계 열쇠 줄만 담는다 — 임시 색인으로 원격 끝 위에 커밋을 만들어 주소로 올리므로
+    작업 사본의 색인·파일·`HEAD` 와 사람이 쌓아 둔 커밋은 건드리지도 올리지도 않는다."""
+    if not CARD_PUSH_DIR:
+        return None
+    try:
+        path = os.path.abspath(path)
+        with open(path, encoding="utf-8") as f:
+            mine = _head_map(f.read())
+        if mine is None:
+            return None
+        top = _card_git(os.path.dirname(path), "rev-parse", "--show-toplevel", timeout=CARD_GIT_TIMEOUT)
+        if top.returncode:
+            return None
+        root = top.stdout.strip()
+        rel = os.path.relpath(os.path.realpath(path), os.path.realpath(root))
+        if _card_git(root, "ls-files", "--error-unmatch", "--", rel).returncode:
+            return None
+        card = os.path.splitext(os.path.basename(path))[0]
+        models = load_models(root)
+        url = _card_git(root, "remote", "get-url", "origin").stdout.strip()
+        if models.get("_handoff") == "local" or not url:
+            kind, why, sha = _push_local(root, rel, card, mine)
+        else:
+            kind, why, sha = _push_remote(root, rel, card, mine, url, models)
+        out = {"repo": os.path.basename(root), "card": card, "결과": kind, "까닭": why, "커밋": sha,
+               "때": dt.datetime.now().isoformat(timespec="seconds")}
+        os.makedirs(CARD_PUSH_DIR, exist_ok=True)
+        stoploop.write_state(os.path.join(CARD_PUSH_DIR, "%s__%s.json" % (out["repo"], card)), out)
+        if kind in ("밀림", "거부"):
+            print("       ! 머리말을 올리지 못했다 — %s" % why)
+        return out
+    except Exception as err:        # noqa: BLE001 — 상태를 올리는 일이 실행을 멈출 이유가 없다
+        print("       ! 머리말을 올리지 못했다 — %s" % err)
+        return None
 
 
 def list_cards(bl):
@@ -3722,7 +3974,8 @@ def main(argv):
             _live_path = os.path.join(
                 LIVE_DIR, "%s__%s.log" % (_status_ctx["repo"], issue_id))
         fire(state, "PICK", {"can_pick": True}, events)
-        backlog_set(멈춘이유="")               # 시작은 PICK 전이가 찍는다
+        device = os.environ.get("STOP_LOOP_DEVICE", "").strip()   # 배차·카드 배송 도구가 넘긴 이 기계 이름
+        backlog_set(멈춘이유="", **({"돈기계": device} if device else {}))   # 시작은 PICK 전이가 찍는다
         mark = state.get("verifierTree") if a.resume else None
         if mark:
             # 검증자 세션이 비정상으로 끝난 뒤 이어받는다 — 그 세션이 고친 추적 파일이 남았으면
@@ -4477,6 +4730,7 @@ if __name__ == "__main__":
     if sys.argv[1:] == ["--guard"]:      # 세션 훅이 부르는 검사 모드(FN-07~FN-09)
         sys.exit(guard_main())
     STATUS_DIR = os.path.expanduser("~/.stop-loop/status")   # 명령으로 띄울 때만 켠다
+    CARD_PUSH_DIR = os.path.expanduser("~/.stop-loop/card-push")
     SIGNALS_DIR = os.path.expanduser("~/.stop-loop/signals")
     LIVE_DIR = os.path.expanduser("~/.stop-loop/live")
     sys.exit(main(sys.argv[1:]))

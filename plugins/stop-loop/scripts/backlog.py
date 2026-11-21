@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import board  # noqa: E402  — 머리말 읽기는 보드와 같은 것을 쓴다
 import endreport  # noqa: E402  — 정리 뒤 끝 보고를 띄운다
 import report_workflow as rw  # noqa: E402  — `gh` 호출·열린 이슈 목록·계정 토큰은 한 자리다
+import runner  # noqa: E402  — 머리말 고침을 원격에 올리는 `card_push`
 
 
 def git(project, *args):
@@ -77,6 +78,7 @@ def set_status(path, value):
         return False
     with open(path, "w", encoding="utf-8") as f:
         f.writelines(lines)
+    runner.card_push(path)            # 고침을 원격 기준 가지에 올린다 — 실패해도 여기서 멈추지 않는다
     return True
 
 
@@ -173,4 +175,5 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    runner.CARD_PUSH_DIR = os.path.expanduser("~/.stop-loop/card-push")   # 명령으로 띄울 때만 켠다
     sys.exit(main(sys.argv[1:]))

@@ -2,8 +2,9 @@
 """배차 — 한 번 띄우면 빌 때까지 도는 대기열 집기 (SC-01 E-3).
 
 프로젝트 목록(hq 는 `projects.yaml` 의 `workflow: stop-loop`, 플러그인은 `~/.stop-loop/projects.json`)의 프로젝트마다 `docs/backlog/*.md` 카드를 읽어,
-`상태: 대기` 카드를 러너(`bin/runner.py`)에 한 장씩 넘긴다. 동시 상한은 CAP(기계 전체). 같은 프로젝트에서는
-선행이 완료된 시나리오 카드끼리 함께 돌고, 시나리오에 묶이지 않은 카드는 혼자 돈다.
+`상태: 대기` 카드를 러너(`bin/runner.py`)에 한 장씩 넘긴다. 동시 상한은 기계 전체에 하나(기본 CAP=4,
+`~/.stop-loop/projects.json` 맨 위 `"maxParallel"` 로 바꾼다). 같은 프로젝트에서는 선행이 끝난 카드가 함께 돌되,
+카드 본문 「## 시작점」의 저장소 경로가 돌고 있는 카드와 하나라도 같으면 그 카드가 끝날 때까지 기다린다.
 더 돌 것이 없으면 한 줄 요약을 찍고 끝난다.
 
     python3 bin/dispatch.py
@@ -26,7 +27,7 @@ import runner  # noqa: E402
 PROJECTS_YAML = os.path.join(os.path.dirname(HERE), "projects.yaml")
 PROJECTS_JSON = os.path.expanduser("~/.stop-loop/projects.json")   # 플러그인 안의 목록. setup_project.py 와 같아야 한다 — 시험이 지킨다
 RUNNER = os.path.join(HERE, "runner.py")
-CAP = 2          # 이 기계의 동시 상한. ponytail: 설정 열쇠로 빼지 않는다(04 판정)
+CAP = 4          # 이 기계의 동시 상한 기본값. 바꾸려면 projects.json 의 maxParallel(max_parallel)
 REHANDOFF_CAP = 3  # 기준 가지 탓으로 멈춘 카드를 카드당 다시 인계하는 횟수. CAP 과 독립이다
 POLL = 1.0       # 실행이 끝났는지 보는 간격(초)
 
@@ -61,6 +62,51 @@ def load_projects(path=None, devices=None):
     return [(p["name"], os.path.expanduser(p["path"])) for p in items]
 
 
+def max_parallel():
+    """이 기계의 동시 상한 — `PROJECTS_JSON` 맨 위 `maxParallel`(1 이상 정수), 없으면 CAP.
+    잘못된 값·깨진 파일이면 한 줄 알리고 CAP. 파일이 없으면 조용히 CAP."""
+    try:
+        with open(PROJECTS_JSON, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("맨 위가 JSON 객체가 아니다")
+    except FileNotFoundError:
+        return CAP
+    except (OSError, ValueError) as e:
+        print("maxParallel 을 읽지 못해 %d 로 돈다 — %s 를 고친다 (%s)" % (CAP, PROJECTS_JSON, e))
+        return CAP
+    if "maxParallel" not in data:
+        return CAP
+    v = data["maxParallel"]
+    if isinstance(v, int) and not isinstance(v, bool) and v >= 1:
+        return v
+    print("maxParallel 값 %r 은 쓸 수 없어 %d 로 돈다 — %s 맨 위의 \"maxParallel\" 을 1 이상 정수로 고친다"
+          % (v, CAP, PROJECTS_JSON))
+    return CAP
+
+
+_PATH_EXT = r"\.(?:md|py|json|yaml|yml|sh|js|ts|html|txt)"
+
+
+def start_paths(text):
+    """카드 본문 「## 시작점」(뒤에 「 — …」가 붙어도 된다) 절(다음 `## ` 전까지)의 백틱 조각 가운데 저장소 경로. 끝의 `:줄번호` 는 뗀다.
+    경로 = 공백·`(` 없이 `/` 를 품었거나 `이름.확장자` 꼴. 절이 없으면 빈 목록."""
+    inside, out = False, []
+    for line in text.splitlines():
+        if line.startswith("## "):
+            inside = re.match(r"시작점(\s|$)", line[3:].strip()) is not None   # 「시작점」·「시작점 — 실재를 확인한 경로」
+            continue
+        if not inside:
+            continue
+        for frag in re.findall(r"`([^`]+)`", line):
+            frag = re.sub(r":\d+(?:-\d+)?$", "", frag.strip())
+            if " " in frag or "(" in frag:
+                continue
+            if "/" in frag or re.fullmatch(r"[^/\s]+" + _PATH_EXT, frag):
+                out.append(frag)
+    return out
+
+
 def read_cards(project_path):
     """(카드 목록, 건너뛴 까닭). 까닭이 있으면 그 프로젝트는 이번 훑기에서 뺀다."""
     if not os.path.isdir(project_path):
@@ -75,9 +121,11 @@ def read_cards(project_path):
         path = os.path.join(folder, fname)
         try:
             head = board.front_matter(path)
+            with open(path, encoding="utf-8") as f:
+                starts = start_paths(f.read())
         except (OSError, UnicodeDecodeError):
             return [], "카드를 읽지 못함: %s" % fname
-        cards.append({"file": fname, "path": path, **{k: head.get(k, "")
+        cards.append({"file": fname, "path": path, "시작점": starts, **{k: head.get(k, "")
                       for k in ("상태", "시나리오", "요소", "선행", "기기")}})
     return cards, None
 
@@ -120,15 +168,14 @@ def pick_next(cards, handed, live=frozenset(), held=frozenset(), lists=None, dev
     held = 승인되지 않은 시나리오 번호 — 그 시나리오의 대기 카드는 집지 않는다(E-2).
     lists = 선행 판정에 쓰는 시나리오별 카드 목록(`_ready`).
     device = 이 기기 이름. 다른 기기 카드는 집지도, 돌고 있는 카드로 세지도 않는다(상태는 건드리지 않는다). 선행 판정은 전체 카드를 본다.
-    묶이지 않은 카드는 혼자 돈다 — 돌고 있으면 아무것도 안 집고, 다른 카드가 돌면 안 집힌다.
+    돌고 있는 카드와 `시작점` 경로가 하나라도 같은 카드는 집지 않는다(시작점이 비면 겹치지 않는다) — 낱장·시나리오 카드 모두.
     """
     mine = [c for c in cards if not _other_device(c, device)]
     running = [c for c in mine if c["상태"] == "진행" or c["path"] in live]
     skip = "진행 카드 있어 건너뜀"
-    if any(not _bound(c) for c in running):
-        return None, skip
+    busy = {p for c in running for p in c.get("시작점", [])}
     ready = [c for c in mine if c["상태"] == "대기" and c["path"] not in handed and _ready(c, cards, lists)
-             and c["시나리오"] not in held and (not running or _bound(c))]
+             and c["시나리오"] not in held and not busy.intersection(c.get("시작점", []))]
     if ready:
         return min(ready, key=lambda c: c["file"]), None
     if running:
@@ -429,6 +476,7 @@ def main(argv=None):
     results = []
     shown = set()        # 이미 찍은 승인 거부·승격 실패 줄 — 같은 줄은 배차 한 번에 한 번
     paths = dict(projects)
+    cap = max_parallel()   # 배차가 시작할 때 한 번 읽는다(경고도 한 번)
     while True:
         for key, (name, proc, card) in list(running.items()):
             rc = proc.poll()
@@ -439,7 +487,7 @@ def main(argv=None):
                 backlog.tidy(paths[name], 실행=True)     # 병합된 카드를 완료로, 끝 보고 방아쇠(E-2 F-6)
                 endreport.auto(paths[name])
         for name, path in projects:
-            if len(running) >= CAP:
+            if len(running) >= cap:
                 break
             if name in dead:
                 continue
@@ -476,7 +524,8 @@ def main(argv=None):
                 print("재인계 — %s/%s: 기준 가지가 고쳐짐, %d회째" % (name, card["file"], n))
             handed.add(card["path"])
             args = [sys.executable, RUNNER, path, card["path"]] + (["--resume"] if again else [])
-            running[card["path"]] = (name, subprocess.Popen(args), card)
+            env = dict(os.environ, STOP_LOOP_DEVICE=devices.get(name, ""))     # 러너가 머리말에 돈 기계로 쓴다
+            running[card["path"]] = (name, subprocess.Popen(args, env=env), card)
         if not running:
             break
         time.sleep(POLL)
@@ -485,4 +534,5 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    runner.CARD_PUSH_DIR = os.path.expanduser("~/.stop-loop/card-push")   # 명령으로 띄울 때만 켠다
     sys.exit(main(sys.argv[1:]))
