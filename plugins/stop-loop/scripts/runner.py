@@ -844,7 +844,7 @@ def _decision_key(item):
     return item.split(" — 고를 수 있는 것:")[0].strip()
 
 
-def _answered_decisions(wd):
+def _answered_decisions(wd, labels=("[답함]", "[사람 결정]", "[사람 몫]")):
     """`07-answers.md` 「## 답」 표 첫 칸 — PM 이 답을 단(어느 라벨이든) 정할 것의 한 문장."""
     try:
         with open(os.path.join(wd, "07-answers.md"), encoding="utf-8") as fh:
@@ -855,7 +855,7 @@ def _answered_decisions(wd):
     keys = set()
     for line in (sec.group(1).splitlines() if sec else []):
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        if line.strip().startswith("|") and len(cells) >= 2 and cells[1] in ("[답함]", "[사람 결정]", "[사람 몫]"):
+        if line.strip().startswith("|") and len(cells) >= 2 and cells[1] in labels:
             keys.add(cells[0])
     return keys
 
@@ -1823,6 +1823,10 @@ def scope_candidates(project, wd):
     files = manifest.get("files")
     if not isinstance(files, list):
         return [], "01-scope.json 의 files 가 목록이 아니다"
+
+    for i, f in enumerate(files):
+        if not isinstance(f, str):
+            return [], "01-scope.json 의 files 의 %d번째 항목이 문자열이 아니다" % (i + 1)
 
     terms = search_terms(manifest)
     if not terms:
@@ -3884,6 +3888,24 @@ def blocking(missing, handoff):
     return [n for n in missing if n != "gh" or handoff == "pr"]
 
 
+LIST_FILE = os.path.expanduser("~/.stop-loop/projects.json")   # 배차의 `PROJECTS_JSON` 과 같은 파일(러너는 배차를 가져오지 않는다)
+
+
+def this_machine():
+    """이 기계의 이름 — 목록 파일 맨 위 `"이 기계"`(비지 않은 글), 없거나 잘못이면 빈 값. 알리지 않는다."""
+    try:
+        with open(LIST_FILE, encoding="utf-8") as f:
+            v = json.load(f).get("이 기계")
+    except (OSError, ValueError, AttributeError):
+        return ""
+    return v.strip() if isinstance(v, str) else ""
+
+
+def device_name():
+    """카드 머리말 `돈기계` 에 쓰는 이름 — `"이 기계"` → 배차·배송 도구가 넘긴 `STOP_LOOP_DEVICE` → 호스트 이름."""
+    return this_machine() or os.environ.get("STOP_LOOP_DEVICE", "").strip() or socket.gethostname()
+
+
 def main(argv):
     ap = argparse.ArgumentParser()
     ap.add_argument("project")
@@ -3974,7 +3996,7 @@ def main(argv):
             _live_path = os.path.join(
                 LIVE_DIR, "%s__%s.log" % (_status_ctx["repo"], issue_id))
         fire(state, "PICK", {"can_pick": True}, events)
-        device = os.environ.get("STOP_LOOP_DEVICE", "").strip()   # 배차·카드 배송 도구가 넘긴 이 기계 이름
+        device = device_name()
         backlog_set(멈춘이유="", **({"돈기계": device} if device else {}))   # 시작은 PICK 전이가 찍는다
         mark = state.get("verifierTree") if a.resume else None
         if mark:
@@ -4067,6 +4089,7 @@ def main(argv):
     redo = set()       # 02 반려 되돌림 뒤 이어받기 판단에서 빼는 단계
     tried = {}         # 단계 → 이번 실행에서 쓴 마지막 시도 번호 (다시 들어오면 이어 센다)
     asked = set()      # 이번 실행에서 PM(07a)에게 이미 물은 정할 것 원문 — 같은 것은 두 번 묻지 않는다
+    human_left = False  # 이번 실행의 07a 답에 사람 결정 라벨이 있었는가 — 그 뒤 07 이 새 정할 것을 또 적으면 멈춘다
     idx = 0
     while idx < len(order):
         num, name, agent, out, is_gate, cond = order[idx]
@@ -4408,6 +4431,14 @@ def main(argv):
 
             if not is_gate:
                 pending = [d for d in decision_items(wd) if d not in asked] if num == "07" else []
+                if pending and human_left:     # 사람 결정이 남았는데 07 이 또 새 정할 것을 적었다 — 헛돎
+                    why = "사람 결정이 남은 뒤 07 이 다시 정할 것을 적었다"
+                    state["stages"]["07"] = {"status": "failed", "reason": "사람 결정 뒤 되묻기"}
+                    state["breaker"] = {"kind": "rounds-exhausted", "stage": "07", "detail": why}
+                    fire(state, "BREAK", {}, events)
+                    save_state(statef, state)
+                    print("\n중단 — %s. 사람이 볼 차례다." % why)
+                    return 2
                 if pending:                    # 07 작업자가 정할 것을 남겼다 — 게이트 전에 PM 이 답한다 (E-11)
                     asked.update(pending)
                     ap = os.path.join(wd, "07-answers.md")
@@ -4435,6 +4466,7 @@ def main(argv):
                     commit_stage(project, wd, "07a", issue_id, attempt, "loop-pm",
                                  models.get("loop-pm"), ap, cost=pspent, used=LAST_RESULT.get("model"),
                                  effort=effort_of(models, "07a", "loop-pm"))
+                    human_left = human_left or bool(_answered_decisions(wd, ("[사람 결정]", "[사람 몫]")))
                     prompt += ("\n\n[PM 답] 07-answers.md 의 답대로 잇는다. "
                                "사람 결정으로 올라간 결정은 구현하지 않는다")
                     os.rename(outp, outp + ".r%d" % attempt)

@@ -62,6 +62,16 @@ def load_projects(path=None, devices=None):
     return [(p["name"], os.path.expanduser(p["path"])) for p in items]
 
 
+def this_machine():
+    """이 기계의 이름 — `PROJECTS_JSON` 맨 위 `"이 기계"`(비지 않은 글), 없거나 잘못이면 빈 값. 알리지 않는다."""
+    try:
+        with open(PROJECTS_JSON, encoding="utf-8") as f:
+            v = json.load(f).get("이 기계")
+    except (OSError, ValueError, AttributeError):
+        return ""
+    return v.strip() if isinstance(v, str) else ""
+
+
 def max_parallel():
     """이 기계의 동시 상한 — `PROJECTS_JSON` 맨 위 `maxParallel`(1 이상 정수), 없으면 CAP.
     잘못된 값·깨진 파일이면 한 줄 알리고 CAP. 파일이 없으면 조용히 CAP."""
@@ -90,21 +100,26 @@ _PATH_EXT = r"\.(?:md|py|json|yaml|yml|sh|js|ts|html|txt)"
 
 def start_paths(text):
     """카드 본문 「## 시작점」(뒤에 「 — …」가 붙어도 된다) 절(다음 `## ` 전까지)의 백틱 조각 가운데 저장소 경로. 끝의 `:줄번호` 는 뗀다.
-    경로 = 공백·`(` 없이 `/` 를 품었거나 `이름.확장자` 꼴. 절이 없으면 빈 목록."""
-    inside, out = False, []
+    경로 = 공백·`(` 없이 `/` 를 품었거나 `이름.확장자` 꼴. 절이 없으면 빈 목록.
+    절 안에 「고치는 파일」 줄(`- 고치는 파일: …` 또는 `| 고치는 파일 | … |`)이 있고 거기 경로가 있으면 그 줄들의 경로만 —
+    읽기만 하는 인용 문서가 겹침으로 세지 않게 한다."""
+    inside, out, fixed = False, [], []
     for line in text.splitlines():
         if line.startswith("## "):
             inside = re.match(r"시작점(\s|$)", line[3:].strip()) is not None   # 「시작점」·「시작점 — 실재를 확인한 경로」
             continue
         if not inside:
             continue
+        mine = re.match(r"\s*(?:[-*]\s*고치는 파일\s*:|\|\s*고치는 파일\s*\|)", line) is not None
         for frag in re.findall(r"`([^`]+)`", line):
             frag = re.sub(r":\d+(?:-\d+)?$", "", frag.strip())
             if " " in frag or "(" in frag:
                 continue
             if "/" in frag or re.fullmatch(r"[^/\s]+" + _PATH_EXT, frag):
                 out.append(frag)
-    return out
+                if mine:
+                    fixed.append(frag)
+    return fixed or out
 
 
 def read_cards(project_path):
@@ -524,7 +539,7 @@ def main(argv=None):
                 print("재인계 — %s/%s: 기준 가지가 고쳐짐, %d회째" % (name, card["file"], n))
             handed.add(card["path"])
             args = [sys.executable, RUNNER, path, card["path"]] + (["--resume"] if again else [])
-            env = dict(os.environ, STOP_LOOP_DEVICE=devices.get(name, ""))     # 러너가 머리말에 돈 기계로 쓴다
+            env = dict(os.environ, STOP_LOOP_DEVICE=this_machine() or devices.get(name, ""))     # 러너가 머리말에 돈 기계로 쓴다
             running[card["path"]] = (name, subprocess.Popen(args, env=env), card)
         if not running:
             break

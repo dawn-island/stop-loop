@@ -54,6 +54,9 @@ Nothing else is input — not your memory of other issues, not the issue tracker
    `excluded: <reason>`. If you change a shared fake world — a test file that
    other tests import — check the tests that import it too. Record each
    matching test file in the 「파급」 table of `01-scope.md`; do not add a new key.
+   `files` holds path strings only; write an excluded test file not as an object
+   inside `files` but in `decisions` as
+   `{"what": "<path> excluded: <reason>", "evidence": "<evidence path>"}`.
 6. When the feature map is among the inputs (the folder `docs/기능맵/`, one
    file per feature group, and/or the old single file `docs/기능맵.md`), do not
    read the whole map; look it up before you search the source. Take the

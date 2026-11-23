@@ -76,6 +76,9 @@ file and read again, so the same text enters the context twice.
    caught it. Make at most 12 mutants per round, unless the
    delegation names a mutant cap — then use that number. Pick first the places where
    breaking the code violates behaviour the issue's completion conditions ask for.
+   When a mutant survives, in the same round also try its siblings on the same
+   verdict line (opposite kind, changed order, other position) within that cap,
+   and report the survivors together as one finding.
    Do not make mutants that break prose sentences in definition or guide
    documents, unless the issue's completion conditions ask for that sentence.
    Run each mutant against only the tests of the file it touched. Run the full
