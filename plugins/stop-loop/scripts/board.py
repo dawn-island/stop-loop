@@ -31,6 +31,7 @@ import json
 import os
 import plistlib
 import re
+import shutil
 import socket
 import socketserver
 import statistics
@@ -132,6 +133,28 @@ def elapsed(시작, 누적="", 상태="진행"):
     if minutes < 60:
         return "%d분%s" % (minutes, word)
     return "%d시간 %d분%s" % (minutes // 60, minutes % 60, word)
+
+
+# 화면 이름 표 — 사이드바·제목·명령 팔레트·돌아가기 고리·빈 문구가 모두 여기서 읽는다(ISSUE-ui-11-terms-2026-11-23).
+# 그리는 함수가 부를 때마다 읽는다. 주소(`/`·`/timeline`·`/signals`)와 읽는 열쇠는 이 표와 무관하다.
+화면이름 = {"home": "홈", "search": "검색", "timeline": "타임라인", "usage": "사용량·품질", "improve": "개선 후보",
+         "todo": "내 할 일", "board": "보드"}
+# 개선 종류의 보이는 글 — 산출물 절 제목을 읽는 열쇠(`IMPROVE_KINDS`)와 탭 주소 `k=` 값은 옛 글자 그대로이고 화면에 낼 때만 거친다.
+개선_보임 = {"선택 사항": "권고", "이연 후보": "미룬 일", "사람 결정 미결": "결정 대기", "되풀이 신호": "반복 지적", "회고 몫": "회고 제안"}
+
+
+def _종류_글(종류):
+    return 개선_보임.get(종류, 종류)
+
+
+def _기기_글(값):
+    """기기 이름을 화면에 낼 때만 — 자료 값 「기기 모름」은 거르기·정렬이 비교하므로 그대로 두고 보이는 글만 바꾼다."""
+    return str(값).replace("기기 모름", "기기 기록 없음")
+
+
+def _화면들_채우기(page):
+    """틀 안의 `@@NAMES@@` 자리(명령 팔레트 화면 목록)를 지금의 이름 표로 채운다."""
+    return page.replace("@@NAMES@@", json.dumps(화면이름, ensure_ascii=False).replace("<", "\\u003c"))
 
 
 # 러너가 도는 동안 한 줄씩 쌓는 폴더 (ISSUE-live-view-2026-09-20). 러너의 `LIVE_DIR` 과 같은
@@ -482,7 +505,7 @@ def criteria_rows(cards, s):
         rows.append({"번호": no, "문장": text if len(text) <= 40 else text[:40] + "…",
                      "카드": [(c["title"], c["상태"]) for c in have],
                      "모두 완료": bool(have) and all(c["상태"] == "완료" for c in have),
-                     "결과": None if end is None else end.get(no, "끝 보고에 없음")})
+                     "결과": None if end is None else end.get(no, "완료 보고서에 없음")})
     return rows
 
 
@@ -583,7 +606,7 @@ def plan_sums(cards, mine):
     tail = "(예상이나 누적이 없어 뺀 카드 %d장)"
     return ["끝난 카드 크기 예상 합 %s 대 실제 %s %s" % (_분글(sum(x for x, _ in est)), _분글(sum(y for _, y in est)), tail % (len(done) - len(est))),
             "사람이 하면 합 %s 대 실제 %s %s" % (_분글(sum(x for x, _ in hum)), _분글(sum(y for _, y in hum)), tail % (len(done) - len(hum))),
-            remaining_text(cards, mine).replace("남은 예상", "남은 카드 크기 예상 합", 1).replace("—", "남은 카드 없음")]
+            remaining_text(cards, mine).replace("남은 시간(예상)", "남은 카드 크기 예상 합", 1).replace("—", "남은 카드 없음")]
 
 
 def remaining_text(cards, mine):
@@ -592,7 +615,7 @@ def remaining_text(cards, mine):
     if not left:
         return "—"
     es = [size_estimate(cards, c)["분"] for c in left]
-    return "남은 예상 %s (예상 없는 카드 %d장)" % (_분글(sum(e for e in es if e is not None)), es.count(None))
+    return "남은 시간(예상) %s (예상 없는 카드 %d장)" % (_분글(sum(e for e in es if e is not None)), es.count(None))
 
 
 def plan_line(cards, c, now=None):
@@ -778,7 +801,7 @@ def human_turns(cards, scenarios, project, todo=(), today=None):
                 and end_report_cards(os.path.join(project, "docs", "plan"), sc["번호"]) == {c["file"] for c in mine}):
             때 = max((c["갱신"] for c in mine if c["갱신"]), default=_모름)
             add("완료 선언", sc["번호"], ("%s %s" % (sc["번호"], sc["이름"])).strip(),
-                "끝 보고를 보고 완료를 선언한다(시나리오 상태를 완료로)", 때, "../plan/" + END_REPORT % sc["번호"], sc["번호"])
+                "완료 보고서를 보고 완료를 선언한다(시나리오 상태를 완료로)", 때, "../plan/" + END_REPORT % sc["번호"], sc["번호"])
     out += todo_turns(todo, today or dt.date.today().isoformat(), project)
     # 생긴 때를 모르는 것은 맨 아래. 날짜 글자는 사전순이 곧 시간순이다.
     return sorted(out, key=lambda t: (t["생긴 때"] == _모름, t["생긴 때"]))
@@ -923,9 +946,37 @@ def 승격_폼(project, c):
             % (urllib.parse.quote(project, safe=""), 물음, html.escape(c["file"], quote=True)))
 
 
-def render_html(cards, project, every=0, scenarios=(), turns=(), plan_dir=None, alarms=(), 단추=False):
+def _한줄(cards, c, 누구, now):
+    """멈춘 까닭 → 기다리는 것 → 예상 차이 → 「—」 가운데 첫 번째. (글, 갈래). `누구` = {카드 파일: 사람 차례}."""
+    if c["멈춘이유"]:
+        return c["멈춘이유"], "warn"
+    if c["file"] in 누구:
+        return 누구[c["file"]]["기다리는 것"], "warn"
+    e = size_estimate(cards, c)["분"]
+    if e is not None and c["상태"] not in ("대기", "아이디어"):
+        d = actual_minutes(c, now) - e
+        if d == 0:
+            return "예상과 같음", ""
+        return "예상보다 %s %s" % (_분글(abs(d)), "늦음" if d > 0 else "빠름"), "late" if d > 0 else "fast"
+    return "—", ""
+
+
+def _보드_고리(qs, **바꿈):
+    """프로젝트 보드 주소 인자 `qs`(parse_qs 결과) 사본에 `바꿈` 을 넣은 `?…` 고리. 값이 빈 글이면 그 인자를 뺀다 — 다른 인자(보기·기간·다른 칩)는 그대로 싣는다."""
+    q = {k: list(v) for k, v in qs.items()}
+    for k, v in 바꿈.items():
+        if v:
+            q[k] = [v]
+        else:
+            q.pop(k, None)
+    return "?" + urllib.parse.urlencode(q, doseq=True)
+
+
+def render_html(cards, project, every=0, scenarios=(), turns=(), plan_dir=None, alarms=(), 단추=False, 거르개=None):
     """프로젝트 보드 화면 한 장(ISSUE-ui-2). `plan_dir` 는 끝 보고를 읽던 옛 시나리오 조각이 빠져 쓰이지 않지만 부르는 곳을 건드리지 않으려고 남긴다.
-    칸 안 카드는 `<a class="card">` 바로 뒤에 `<template class="pk">`(엿보기 자료)가 붙는다 — 아래 TEMPLATE 의 스크립트가 이 순서를 안다. 바꿀 때 두 곳을 함께 고친다."""
+    칸 안 카드는 `<a class="card">` 바로 뒤에 `<template class="pk">`(엿보기 자료)가 붙는다 — 아래 TEMPLATE 의 스크립트가 이 순서를 안다. 바꿀 때 두 곳을 함께 고친다.
+
+    `거르개` 는 서버 화면(`단추=True`)의 탭·칩이 읽는 `{"qs": parse_qs 결과, "반려된": 파일 이름 집합 또는 None, "까닭": 글}` 이다. 정적 화면은 탭·칩 줄이 없고 거르지 않는다."""
     marks = card_marks(cards, scenarios)
     now = dt.datetime.now()
     esc = html.escape
@@ -936,19 +987,7 @@ def render_html(cards, project, every=0, scenarios=(), turns=(), plan_dir=None, 
     def 기계(c):
         return c.get("도는 기계") or c.get("돈기계") or c.get("기기") or "—"
 
-    def 한줄(c):
-        """멈춘 까닭 → 기다리는 것 → 예상 차이 → 「—」 가운데 첫 번째. (글, 갈래)"""
-        if c["멈춘이유"]:
-            return c["멈춘이유"], "warn"
-        if c["file"] in 누구:
-            return 누구[c["file"]]["기다리는 것"], "warn"
-        e = size_estimate(cards, c)["분"]
-        if e is not None and c["상태"] not in ("대기", "아이디어"):
-            d = actual_minutes(c, now) - e
-            if d == 0:
-                return "예상과 같음", ""
-            return "예상보다 %s %s" % (_분글(abs(d)), "늦음" if d > 0 else "빠름"), "late" if d > 0 else "fast"
-        return "—", ""
+    한줄 = lambda c: _한줄(cards, c, 누구, now)      # noqa: E731
 
     def card(c):
         stop = bool(c["멈춘이유"]) or c["상태"] == "보류"
@@ -960,12 +999,12 @@ def render_html(cards, project, every=0, scenarios=(), turns=(), plan_dir=None, 
         else:
             켜짐, 갈래, 이름 = 0, "", c["상태"]
         pips = '<p class="pips%s" aria-label="%s">%s</p>' % (갈래, esc(이름), '<i class="on"></i>' * 켜짐 + "<i></i>" * (len(PHASES) - 켜짐))
-        tag = "%s %s" % (c["시나리오"], ", ".join(c["요소"])) if c["시나리오"] else "낱장"
+        tag = "%s %s" % (c["시나리오"], ", ".join(c["요소"])) if c["시나리오"] else "시나리오 밖"
         글, 종류 = 한줄(c)
         front = ('<a class="card" href="%s"%s><p class="tg"><span>%s</span><span>%s</span></p><h3>%s</h3>%s'
                  '<p class="ln"><span class="d %s">%s</span><span>%s</span></p></a>'
                  % (esc(c["file"], quote=True), " data-stop" if stop else "", esc(tag.strip()), esc(c["크기"]), esc(c["title"]),
-                    pips, 종류, esc(글), esc(기계(c))))
+                    pips, 종류, esc(글), esc(_기기_글(기계(c)))))
         # 엿보기 자료 — 앞면에서 빠진 정보
         strip = ""
         if here:
@@ -981,12 +1020,12 @@ def render_html(cards, project, every=0, scenarios=(), turns=(), plan_dir=None, 
             배지 += '<span class="badge b-orange">%s</span>' % esc(c["멈춘이유"])
         if c["크기"]:
             배지 += '<span class="badge b-gray">%s</span>' % esc(c["크기"])
-        배지 += '<span class="badge b-gray">%s</span>' % esc(기계(c))
+        배지 += '<span class="badge b-gray">%s</span>' % esc(_기기_글(기계(c)))
         기다림 = 누구[c["file"]]["기다리는 것"] if c["file"] in 누구 else "—"
         why = "".join('<p class="why">%s</p>' % esc(m) for m in marks[c["file"]] + list(c.get("원격표시", [])))
         if _넘김(cards, c, now):
             why += '<p class="why">예상 넘김</p>'
-        src = ('<p class="meta">도는 기계 %s · %s 기록</p>' % (esc(c["도는 기계"]), esc(c["출처"])) if "출처" in c else "")
+        src = ('<p class="meta">실행 기기 %s · %s 기록</p>' % (esc(_기기_글(c["도는 기계"])), esc(c["출처"].replace("이 기계", "이 기기"))) if "출처" in c else "")
         live = ('<p class="live">%s</p>' % esc(c["마지막줄"])) if c["마지막줄"] else ""
         pk = ('<template class="pk"><h2>%s</h2><p class="bg">%s</p><dl><dt>걸린 시간</dt><dd>%s · 예상 %s</dd><dt>비용</dt><dd>—</dd>'
               '<dt>기다리는 것</dt><dd>%s</dd><dt>고치는 파일</dt><dd>—</dd></dl>%s%s%s%s%s<a class="open" href="%s">상세 열기</a></template>'
@@ -1006,9 +1045,25 @@ def render_html(cards, project, every=0, scenarios=(), turns=(), plan_dir=None, 
         except ValueError:
             return False
 
+    거 = 거르개 or {}
+    qs = 거.get("qs") or {}
+    g1 = lambda k: (qs.get(k) or [""])[0].strip()      # noqa: E731
+    보기 = g1("보기") if 단추 and g1("보기") in ("목록", "시나리오") else "보드"
+    기계값, 시나리오값 = [], sorted({s["번호"] for s in scenarios} | {c["시나리오"] for c in cards if c["시나리오"]})
+    for c in cards:
+        if 기계(c) not in ("—", "기기 모름") and 기계(c) not in 기계값:
+            기계값.append(기계(c))
+    반려된 = 거.get("반려된")
+    켜진 = 단추 and bool(g1("기계") or g1("시나리오") or g1("반려") == "1")
+
+    def 맞나(c):
+        return ((not g1("기계") or 기계(c) == g1("기계")) and (not g1("시나리오") or c["시나리오"] == g1("시나리오"))
+                and (g1("반려") != "1" or 반려된 is None or c["file"] in 반려된))
+    보임 = [c for c in cards if 맞나(c)] if 단추 else cards
+
     cols = ""
     for col in ("아이디어", "대기", "진행", "검토", "완료", "보류"):
-        mine = [c for c in cards if c["상태"] == col]
+        mine = [c for c in 보임 if c["상태"] == col]
         if not mine:
             cols += '<section class="col fold c-%s"><h2>%s <span>0</span></h2></section>' % (col, col)
             continue
@@ -1029,6 +1084,23 @@ def render_html(cards, project, every=0, scenarios=(), turns=(), plan_dir=None, 
                 % (esc(s["번호"]), esc(s["이름"]), ' class="full"' if pct == 100 else "", pct, p["수"]["완료"], p["분모"]))
 
     strip = '<div class="strip">%s</div>' % ("".join(띠(s) for s in scenarios) or '<p class="meta">시나리오 없음</p>')
+    if 단추 and g1("반려") == "1" and 반려된 is None and 거.get("까닭"):
+        strip = '<p class="why">%s</p>' % esc(거["까닭"]) + strip
+    if 보기 == "목록" and 보임:
+        cols = '<div class="lv">%s</div>' % _표(["상태", "제목", "크기", "걸린 시간", "기기"], [
+            [esc(c["상태"]), '<a href="%s">%s</a>' % (esc(c["file"], quote=True), esc(c["title"])), esc(c["크기"]),
+             _분글(actual_minutes(c, now)), esc(_기기_글(기계(c)))] for c in 보임])
+    elif 보기 == "시나리오" and 보임:
+        번호들 = {s["번호"] for s in scenarios}
+        묶음 = "".join('<section class="sg">%s%s</section>' % (띠(s), "".join(칸_카드(c) for c in 보임 if c["시나리오"] == s["번호"]))
+                     for s in scenarios if not g1("시나리오") or s["번호"] == g1("시나리오"))
+        낱장 = [c for c in 보임 if c["시나리오"] not in 번호들]
+        cols = 묶음 + ('<section class="sg"><h2>시나리오 밖 카드</h2>%s</section>' % "".join(칸_카드(c) for c in 낱장) if 낱장 else "")
+        strip = ""
+    if 단추 and not 보임 and (켜진 or cards):
+        cols = '<p class="meta lv">%s</p>' % ('필터에 맞는 카드 없음 · <a href="%s">필터 풀기</a>' % esc(_보드_고리(qs, 기계="", 시나리오="", 반려="", 빈칸=""), quote=True)
+                                              if 켜진 else "카드 없음")
+        strip = "" if 보기 == "시나리오" else strip
 
     def turn(t):
         why = '<p class="why">알림 못 띄움</p>' if t.get("알림") is False else ""
@@ -1036,21 +1108,38 @@ def render_html(cards, project, every=0, scenarios=(), turns=(), plan_dir=None, 
                 % (esc(t["열어 볼 곳"], quote=True), esc(t["제목"]), esc(t["프로젝트"]),
                    esc(t["종류"]), esc(t["기다리는 것"]), esc(t["생긴 때"]), why))
 
-    box = ('<h2>내가 할 일 (%d)</h2>%s' % (len(turns), "".join(turn(t) for t in turns))
-           if turns else '<h2>내가 할 일 없음</h2>')
+    box = ('<h2>%s (%d)</h2>%s' % (esc(화면이름["todo"]), len(turns), "".join(turn(t) for t in turns))
+           if turns else '<h2>%s 없음</h2>' % esc(화면이름["todo"]))
+    def 칩(글, 눌림, 고리):
+        if 고리 is None:
+            return "<span>%s</span>" % esc(글)
+        return '<a href="%s" aria-pressed="%s">%s</a>' % (esc(고리, quote=True), "true" if 눌림 else "false", esc(글))
+
+    def 다음(값들, 지금):
+        """칩을 누를 때 갈 값 — 없음(전체) → 첫 값 → … → 마지막 값 → 없음. 모르는 값이 와 있으면 첫 값으로."""
+        if not 지금 or 지금 not in 값들:
+            return 값들[0] if 값들 else ""
+        return 값들[값들.index(지금) + 1] if 값들.index(지금) + 1 < len(값들) else ""
+
+    def 탭(글, 값):
+        return '<a role="tab" href="%s" aria-selected="%s">%s</a>' % (esc(_보드_고리(qs, 보기=값), quote=True), "true" if 보기 == (값 or "보드") else "false", 글)
     p = esc(project)
     q = urllib.parse.quote(project, safe="")
-    head = ('%s<h1>%s</h1><span class="cnt">시나리오 %d · 카드 %d</span>'
-            '<div class="vt" role="tablist" aria-label="보기"><button type="button" role="tab" aria-selected="true">보드</button>'
-            '<button type="button" role="tab" aria-selected="false">목록</button>'
-            '<button type="button" role="tab" aria-selected="false">시나리오</button></div>'
-            '<div class="chips"><button type="button" aria-pressed="true">모든 기계</button>'
-            '<button type="button" aria-pressed="false">시나리오: 전체</button>'
-            '<button type="button" aria-pressed="false">반려 있었던 것</button>'
-            '<button type="button" id="hide" aria-pressed="true">빈 칸 숨김</button>%s</div>'
-            % ('<a href="/">첫 화면</a><span aria-hidden="true">/</span>' if 단추 else "", p, len(scenarios), len(cards),
-               '<a href="/p/%s/improve">개선 거리</a>' % q if 단추 else ""))
-    return TEMPLATE % {"project": p, "head": head, "cols": cols, "strip": strip,
+    조작 = ""
+    if 단추:
+        조작 = ('<div class="vt" role="tablist" aria-label="보기">%s%s%s</div><div class="chips">%s%s%s%s%s</div>' % (
+            탭("보드", ""), 탭("목록", "목록"), 탭("시나리오", "시나리오"),
+            칩(("기기: " + _기기_글(g1("기계"))) if g1("기계") else "모든 기기", bool(g1("기계")),
+              _보드_고리(qs, 기계=다음(기계값, g1("기계"))) if 기계값 or g1("기계") else None),
+            칩(("시나리오: " + g1("시나리오")) if g1("시나리오") else "시나리오: 전체", bool(g1("시나리오")),
+              _보드_고리(qs, 시나리오=다음(시나리오값, g1("시나리오"))) if 시나리오값 or g1("시나리오") else None),
+            칩("반려 있었던 것", g1("반려") == "1", _보드_고리(qs, 반려="" if g1("반려") == "1" else "1")),
+            칩("빈 칸 숨김", g1("빈칸") != "보임", _보드_고리(qs, 빈칸="보임" if g1("빈칸") != "보임" else "")),
+            '<a href="/p/%s/improve">%s</a>' % (q, esc(화면이름["improve"]))))
+    head = '%s<h1>%s</h1><span class="cnt">시나리오 %d · 카드 %d</span>%s' % (
+        '<a href="/">%s</a><span aria-hidden="true">/</span>' % esc(화면이름["home"]) if 단추 else "", p, len(scenarios), len(cards), 조작)
+    return _화면들_채우기(TEMPLATE) % {"project": p, "head": head, "cols": cols, "strip": strip,
+                       "mainattr": ' class="all"' if 단추 and g1("빈칸") == "보임" else "",
                        "turns": render_alarms(alarms, lambda a: a["file"]) + '<div class="turns">%s</div>\n' % box,
                        "now": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                        "refresh": ('\n<meta http-equiv="refresh" content="%d">' % every) if every else ""}
@@ -1259,7 +1348,7 @@ HOME_TEMPLATE = """<!DOCTYPE html>
 <html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="10">
-<title>작업 보드 — 이 기계</title>
+<title>작업 보드 — 이 기기</title>
 <style>
 @@THEME@@
 body { margin:0; padding:24px 16px 48px; background:var(--bg); color:var(--fg); font:14px/1.5 var(--sans); }
@@ -1276,7 +1365,7 @@ a:hover { text-decoration:underline; }
 .why { margin:6px 0 0; font-size:12px; color:var(--orange); }
 .meta { margin:6px 0 0; font-size:12px; color:var(--dim); }
 </style></head><body>
-<header class="top"><h1>첫 화면</h1><p>%(sub)s</p>%(err)s</header>
+<header class="top"><h1>%(title)s</h1><p>%(sub)s</p>%(err)s</header>
 %(numbers)s%(progress)s<div class="duo">%(turns)s%(feed)s</div>
 %(machines)s
 </body></html>
@@ -1296,11 +1385,15 @@ body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.6 var(--sans
 .cnt { font-size:12px; color:var(--dim); }
 .vt { display:flex; gap:2px; margin-left:12px; padding:2px; border-radius:8px; background:var(--soft); }
 .vt button { min-height:30px; padding:0 12px; border:0; border-radius:6px; background:transparent; font:inherit; font-size:12px; color:var(--dim); }
-.vt button[aria-selected="true"] { background:var(--panel); color:var(--fg); font-weight:600; }
+.vt a { display:inline-flex; align-items:center; min-height:30px; padding:0 12px; border-radius:6px; font-size:12px; color:var(--dim); }
+.vt button[aria-selected="true"], .vt a[aria-selected="true"] { background:var(--panel); color:var(--fg); font-weight:600; }
 .chips { display:flex; flex-wrap:wrap; gap:6px; margin-left:auto; }
 .chips button, .chips a { min-height:32px; padding:0 12px; border:1px solid var(--line); border-radius:var(--r-pill); background:var(--panel);
   font:inherit; font-size:12px; color:var(--ink2); display:inline-flex; align-items:center; }
-.chips button[aria-pressed="true"] { border-color:var(--fg); }
+.chips button[aria-pressed="true"], .chips a[aria-pressed="true"] { border-color:var(--fg); }
+.chips span { min-height:32px; padding:0 12px; border:1px dashed var(--line); border-radius:var(--r-pill); font-size:12px; color:var(--dim); display:inline-flex; align-items:center; }
+.sg { flex:0 0 300px; min-width:0; display:flex; flex-direction:column; gap:8px; }
+.lv { flex:1 1 auto; min-width:0; }
 .note { margin:8px 20px 0; font-size:12px; color:var(--dim); }
 .bd { display:flex; flex-wrap:wrap; align-items:flex-start; }
 .bm { flex:999 1 720px; min-width:0; padding:16px 20px; display:flex; flex-direction:column; gap:16px; }
@@ -1366,9 +1459,9 @@ details.extra summary { cursor:pointer; font-size:13px; color:var(--dim); }
 @media (max-width:700px) { .bh { padding:12px 14px; } .bm { padding:12px 14px; } #peek { max-width:none; border-left:0; border-top:1px solid var(--line); } }
 </style></head><body>
 <header class="bh">%(head)s</header>
-<p class="note">파일이 진실이다. 상태를 바꾸려면 그 파일의 「상태:」 줄을 고친다. 만든 시각 %(now)s</p>
-<div class="bd"><div class="bm">%(strip)s%(turns)s<main>%(cols)s</main></div>
-<aside id="peek" aria-label="엿보기" hidden><div class="pkh"><span>엿보기</span><button type="button" id="pkx" aria-label="닫기">×</button></div><div id="pkb"></div></aside></div>
+<div class="bd"><div class="bm">%(strip)s%(turns)s<main%(mainattr)s>%(cols)s</main></div>
+<aside id="peek" aria-label="미리 보기" hidden><div class="pkh"><span>미리 보기</span><button type="button" id="pkx" aria-label="닫기">×</button></div><div id="pkb"></div></aside></div>
+<details class="note"><summary>도움말</summary><p>파일이 진실이다. 상태를 바꾸려면 그 파일의 「상태:」 줄을 고친다. 만든 시각 %(now)s</p></details>
 <script>
 (function () {
   // 엿보기 — 카드(a.card) 바로 뒤 형제 template.pk 를 패널로 옮긴다. 순서를 바꾸면 render_html 의 card() 와 함께 고친다.
@@ -1402,12 +1495,6 @@ details.extra summary { cursor:pointer; font-size:13px; color:var(--dim); }
     });
   } catch (x) {}
   document.getElementById('pkx').addEventListener('click', close);
-  var hide = document.getElementById('hide');
-  hide.addEventListener('click', function () {
-    var on = hide.getAttribute('aria-pressed') !== 'true';
-    hide.setAttribute('aria-pressed', on ? 'true' : 'false');
-    main.className = on ? '' : 'all';
-  });
 })();
 </script>
 </body></html>
@@ -1461,6 +1548,17 @@ PALETTE = """<div id="palette" hidden><div id="pbox"><div id="prow"><input id="p
     if (hint) { var r = document.createElement('span'); r.className = 'pr'; r.textContent = hint; d.insertBefore(r, d.querySelector('small')); }
     d.onclick = function () { location.href = h; };
   }
+  // 입력이 화면 이름에 들면([이름, 주소]) 그 화면 하나 — 이름이 입력으로 시작하는 것이 먼저, 그다음 목록 순서
+  function screenMatch(q, list) {
+    var t = String(q).trim().toLowerCase(), best = null;
+    if (!t) return null;
+    list.forEach(function (x) {
+      var n = String(x[0]).toLowerCase();
+      if (n.indexOf(t) < 0) return;
+      if (!best || (n.indexOf(t) === 0 && String(best[0]).toLowerCase().indexOf(t) !== 0)) best = x;
+    });
+    return best;
+  }
   function draw() {
     L.textContent = ''; rows = [];
     var q = Q.value.trim(), pm = /^\\/p\\/([^\\/]+)\\//.exec(location.pathname), cmds = [];
@@ -1472,16 +1570,21 @@ PALETTE = """<div id="palette" hidden><div id="pbox"><div id="prow"><input id="p
       var mine = proj.filter(function (p) { return p['name'] === decodeURIComponent(pm[1]); })[0];
       if (mine && hit('대기로 올리기…')) cmds.push(['대기로 올리기…', mine['href'], '아이디어 카드']);
     }
-    [['첫 화면', '/'], ['검색 화면', '/search'], ['시간 막대 열기', '/timeline']].concat(proj.map(function (p) { return [p['name'] + ' 보드', p['href']]; }))
-      .filter(function (x) { return hit(x[0]); }).forEach(function (x) { cmds.push([x[0], x[1], '화면 이동']); });
+    var NM = @@NAMES@@;
+    var screens = [[NM['home'], '/'], [NM['search'], '/search'], [NM['timeline'], '/timeline'], [NM['usage'], '/signals']]
+      .concat(proj.map(function (p) { return [p['name'] + ' ' + NM['board'], p['href']]; }))
+      .concat(proj.map(function (p) { return [NM['improve'] + ' — ' + p['name'], '/p/' + encodeURIComponent(p['name']) + '/improve']; }));
+    screens.filter(function (x) { return hit(x[0]); }).forEach(function (x) { cmds.push([x[0], x[1], '화면 이동']); });
     el('ph', '가장 맞는 것');
+    var sm = q && online && st !== 'err' ? screenMatch(q, screens) : null;
+    if (sm) item(sm[0], sm[1], '', '화면 이동');
     if (!online || st === 'err') el('pm', '서버에서만 됩니다');
     else if (q) {
       if (st === 'load') el('pm', '찾는 중…');
       else if (found) item(found['title'], found['href'], found['프로젝트'] + (found['줄'] ? ' · ' + found['줄'] : ''));
       else if (!cmds.length && !rc.length) {
         el('pm', '찾은 것 없음');
-        item('검색 화면에서 거르개와 함께 찾기', '/search?q=' + encodeURIComponent(q));
+        item('검색 화면에서 필터와 함께 찾기', '/search?q=' + encodeURIComponent(q));
       } else el('pm', '찾은 것 없음');
     }
     if (q) cmds.push(['검색 화면에서 모두 보기 — ' + q, '/search?q=' + encodeURIComponent(q), '검색']);
@@ -1632,7 +1735,7 @@ class 작업파일서버(http.server.SimpleHTTPRequestHandler):
                 shown = 본문_그리기(body)
             except Exception:                            # 그리기가 무엇으로 실패하든 원문이 보인다
                 shown = "<pre>%s</pre>" % html.escape(body)
-            page = (FILE_TEMPLATE % {"name": html.escape(os.path.basename(path)),
+            page = (_화면들_채우기(FILE_TEMPLATE) % {"name": html.escape(os.path.basename(path)),
                                      "body": shown}).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1803,6 +1906,8 @@ def read_remote(project):
         if isinstance(account, str) and account.strip():
             token = _토큰(account.strip())
             if not token:
+                if shutil.which("gh") is None:
+                    return _그림_실패("gh 를 찾지 못함 — `--상주-켜기` 를 다시 하라")
                 return _그림_실패("GitHub 계정 %s 의 토큰을 얻지 못함" % account.strip())
             env["GH_TOKEN"] = token
         r = _원격_git(project, "ls-remote", "--heads", url, env=env)
@@ -1863,11 +1968,41 @@ def refresh_remote(items):
         REMOTE[key] = pic
 
 
+def _비용품질_인자(qs):
+    """`/signals` 요청이 인자를 채우는 방식 그대로 — period 가 이기고, 아무것도 없으면 이번 주를 날짜로 풀어 넣는다(저장 열쇠에 날짜가 든다). 요청과 미리 계산이 같은 열쇠를 만들려고 한 곳에 둔다."""
+    qs = {k: list(v) for k, v in qs.items()}
+    g = lambda k: (qs.get(k) or [""])[0].strip()          # noqa: E731
+    if g("period") or not (g("from") or g("to")):
+        qs["period"] = [g("period") or "week"]
+        qs["from"], qs["to"] = ([x] for x in signals_기간(g("period"), "", "", dt.date.today())[:2])
+    return qs
+
+
+_미리계산_잠금 = threading.Lock()
+
+
+def 미리_계산(items):
+    """비용·품질 화면의 기본 기간 결과를 요청과 같은 열쇠로 저장해 둔다 — 첫 열기가 30초 넘게 걸리지 않게. 앞선 미리 계산이 돌면 곧바로 돌아오고, 예외는 삼킨다."""
+    if not _미리계산_잠금.acquire(blocking=False):
+        return
+    try:
+        시작 = time.monotonic()
+        qs = _비용품질_인자({})
+        _잠깐저장("signals", items, qs, lambda: read_signals(items, qs))
+        print("비용·품질 미리 계산 끝 (%d초)" % round(time.monotonic() - 시작), flush=True)
+    except Exception:                                # noqa: BLE001 — 미리 계산이 상주를 죽이지 않는다. 화면 요청은 직접 계산한다
+        pass
+    finally:
+        _미리계산_잠금.release()
+
+
 def 원격바퀴(extra, stop):
     """`stop` 이 서기 전까지 REMOTE_EVERY 초마다 보는 목록의 원격을 읽는다. 기다림은 Event 로 — 상주가 끝나면 곧 멈춘다."""
     while True:
         try:
-            refresh_remote(_보는목록(extra)[0])
+            items = _보는목록(extra)[0]
+            refresh_remote(items)
+            threading.Thread(target=미리_계산, args=(items,), name="미리계산", daemon=True).start()   # 바퀴는 기다리지 않는다
         except Exception:                            # noqa: BLE001 — 원격 읽기가 상주를 죽이지 않는다
             pass
         if stop.wait(REMOTE_EVERY):
@@ -1931,23 +2066,23 @@ def _원격_문구(item, cards):
     pic = REMOTE.get(os.path.abspath(item["path"]))
     if pic is None:
         out = ["원격 읽는 중" if os.path.exists(os.path.join(item["path"], ".git"))
-               else "원격 없음 — 다른 기계에서 보이지 않음"]
+               else "원격 없음 — 다른 기기에서 보이지 않음"]
     elif pic["없음"]:
-        out = ["원격 없음 — 다른 기계에서 보이지 않음"]
+        out = ["원격 없음 — 다른 기기에서 보이지 않음"]
     else:
         when = pic["때"]
         읽음 = ("원격 읽음 " + when.strftime("%H:%M" if when.date() == dt.date.today() else "%Y-%m-%d %H:%M")) if when else ""
         if not pic["오류"]:
             out = [읽음]
         elif when:
-            out = ["원격 못 읽음 — " + pic["오류"], 읽음]
+            out = ["원격 저장소를 아직 못 읽음 — " + pic["오류"], 읽음]
         else:
-            out = ["원격 못 읽음 — 이 기계 것만 — " + pic["오류"]]
+            out = ["원격 저장소를 아직 못 읽음 — 이 기기 것만 — " + pic["오류"]]
     밀림, 거부 = _올리기_결과(item, cards)
     if 밀림:
         out.append("올리지 못한 고침 있음 (%d장)" % 밀림)
     if 거부:
-        out.append("진행이 다른 기계에 보이지 않음 — 올리기 거부")
+        out.append("진행이 다른 기기에 보이지 않음 — 올리기 거부")
     return out
 
 
@@ -2000,46 +2135,57 @@ def stalled_alarms(item, cards, 그림=None, now=None, lines=_미읽음):
         elif c.get("출처") == "원격" and 그림:
             때 = ((그림.get("카드") or {}).get(c["file"]) or {}).get("커밋때")
             if 때 and (now - 때).total_seconds() > hard:
-                add("다른 기계 — %d분째 바뀌지 않음, 확인 못함" % ((now - 때).total_seconds() // 60),
+                add("다른 기기 — %d분째 바뀌지 않음, 확인 못함" % ((now - 때).total_seconds() // 60),
                     "원격 머리말 마지막 커밋 %s · %s시간 상한 %d분" % (때.strftime("%H:%M"), label, hard // 60))
     return out
 
 
-def home_numbers(rows, today, 병합=None):
-    """첫 화면 숫자 네 칸 — 보는 목록 모든 프로젝트의 합친 카드로 센다.
-    칸 = {이름, 수, 설명, 카드: [(프로젝트, 제목, 주소)], 위험, 고리}. `병합` 은 `week_merges` 결과(없으면 None → 수 「—」)."""
-    run, wait, stop = [], [], {}
-    hold = alarm = over = remote = 0
+def _칸_고름(rows):
+    """숫자 칸과 카드 목록이 함께 쓰는 고르기 — `{진행: [(줄, 카드)], 대기: [...], 멈춤: [(줄, 카드, 갈래)]}`.
+    멈춤은 카드 한 장이 한 번만 나온다(보류 → 경보 → 예상 넘김 가운데 앞선 갈래). 카드 목록에 없는 경보·넘김 파일은 센 적이 없다."""
+    out = {"진행": [], "대기": [], "멈춤": []}
     for r in rows:
         cards = {c["file"]: c for c in r.get("카드") or []}
-        ref = lambda c, r=r: (r["name"], c["title"], _주소(r["name"]) + urllib.parse.quote(c["file"]))  # noqa: E731
+        stop = {}
         for c in cards.values():
             if c["상태"] == "진행":
-                run.append(ref(c))
-                remote += c.get("출처") == "원격"
+                out["진행"].append((r, c))
             elif c["상태"] == "대기":
-                wait.append(ref(c))
+                out["대기"].append((r, c))
             elif c["상태"] == "보류":
-                hold += 1
-                stop[(r["name"], c["file"])] = ref(c)
-        files = {a["file"] for a in r.get("경보") or []}
-        alarm += len(files)
-        over += len(r.get("예상 넘김") or [])
-        for f in sorted(files | set(r.get("예상 넘김") or [])):
-            if f in cards:
-                stop[(r["name"], f)] = ref(cards[f])
+                stop[c["file"]] = "보류"
+        for 갈래, files in (("경보", {a["file"] for a in r.get("경보") or []}), ("예상 넘김", set(r.get("예상 넘김") or []))):
+            for f in sorted(files):
+                if f in cards:
+                    stop.setdefault(f, 갈래)
+        out["멈춤"] += [(r, cards[f], g) for f, g in stop.items()]
+    return out
+
+
+def home_numbers(rows, today, 병합=None):
+    """첫 화면 숫자 네 칸 — 보는 목록 모든 프로젝트의 합친 카드로 센다. 칸마다 `/cards?보기=…` 목록이 있고 줄 수가 칸 수와 같다.
+    칸 = {이름, 수, 설명, 카드: [(프로젝트, 제목, 주소)], 위험, 고리}. `병합` 은 `week_merges` 결과(없으면 None → 수 「—」)."""
+    고름 = _칸_고름(rows)
+    ref = lambda r, c: (r["name"], c["title"], _주소(r["name"]) + urllib.parse.quote(c["file"]))  # noqa: E731
+    run = [ref(r, c) for r, c in 고름["진행"]]
+    wait = [ref(r, c) for r, c in 고름["대기"]]
+    stop = [ref(r, c) for r, c, _ in 고름["멈춤"]]
+    remote = sum(c.get("출처") == "원격" for _, c in 고름["진행"])
+    hold = sum(g == "보류" for _, _, g in 고름["멈춤"])
+    alarm = sum(len({a["file"] for a in r.get("경보") or []}) for r in rows)
+    over = sum(len(r.get("예상 넘김") or []) for r in rows)
     if 병합 is None:
-        수, 설명 = "—", "원격 기준 가지를 아직 못 읽음"
+        수, 설명 = "—", "원격 저장소를 아직 못 읽음"
     else:
         수 = 병합["자동"] + 병합["사람"]
         설명 = "자동 병합 %d · 사람 병합 %d" % (병합["자동"], 병합["사람"]) + (" · 원격 모름 %d곳" % 병합["모름"] if 병합["모름"] else "")
+    고리 = lambda 보기: "/cards?보기=" + urllib.parse.quote(보기)  # noqa: E731
     return [
-        {"이름": "진행 중", "수": len(run), "설명": "이 중 %d장 다른 기계" % remote, "카드": run, "위험": False, "고리": "/timeline"},
-        {"이름": "대기", "수": len(wait), "설명": "프로젝트 %d곳" % len({x[0] for x in wait}), "카드": wait, "위험": False,
-         "고리": _주소(wait[0][0]) if wait else "/"},
-        {"이름": "이번 주 병합", "수": 수, "설명": 설명, "카드": [], "위험": False, "고리": "/signals"},
-        {"이름": "멈춤·늦음", "수": len(stop), "설명": "보류 %d · 경보 %d · 예상 넘김 %d" % (hold, alarm, over),
-         "카드": list(stop.values()), "위험": len(stop) >= 1, "고리": next(iter(stop.values()))[2] if stop else "/?tab=old"}]
+        {"이름": "진행 중", "수": len(run), "설명": "이 중 %d장 다른 기기" % remote, "카드": run, "위험": False, "고리": 고리("진행")},
+        {"이름": "대기", "수": len(wait), "설명": "프로젝트 %d곳" % len({x[0] for x in wait}), "카드": wait, "위험": False, "고리": 고리("대기")},
+        {"이름": "이번 주 완료", "수": 수, "설명": 설명, "카드": [], "위험": False, "고리": 고리("병합")},
+        {"이름": "막힘", "수": len(stop), "설명": "보류 %d · 멈춘 실행 %d · 예상 초과 %d" % (hold, alarm, over),
+         "카드": stop, "위험": len(stop) >= 1, "고리": 고리("멈춤")}]
 
 
 def read_resolved(items):
@@ -2076,7 +2222,7 @@ def _시나리오_줄(cards, scenarios):
                     "퍼센트": p["퍼센트"], "남은 예상": remaining_text(cards, mine), "기계": " · ".join(p["기기"]) or "—"})
     낱장 = [c for c in cards if c["시나리오"] not in known and c["상태"] != "완료"]
     if 낱장:
-        out.append({"시나리오": "낱장 카드 %d" % len(낱장), "상태": 상태(낱장), "완료": None, "분모": None, "퍼센트": None,
+        out.append({"시나리오": "시나리오 밖 카드 %d" % len(낱장), "상태": 상태(낱장), "완료": None, "분모": None, "퍼센트": None,
                     "남은 예상": remaining_text(cards, 낱장), "기계": " · ".join(_기기들(낱장)) or "—"})
     return out or [{"시나리오": "열린 일 없음", "상태": "쉼", "완료": None, "분모": None, "퍼센트": None, "남은 예상": "—", "기계": "—"}]
 
@@ -2149,8 +2295,12 @@ def _원격_처음_채움(project):
 
 
 def _서버_고리(x):
-    """서버 화면에서 끝 보고 고리 `../plan/<x>` 를 `plan/<x>` 로 — 서버는 `docs/plan/` 을 `/p/<이름>/plan/` 에 낸다. 정적 board.html 은 이 풀이를 안 거친다."""
-    return "plan/" + x[len("../plan/"):] if x.startswith("../plan/") else x
+    """서버 화면에서 끝 보고·할 일 카드 고리 `../plan/<x>`·`../todo/<x>` 를 `plan/<x>`·`todo/<x>` 로 — 서버는 `docs/plan/`·`docs/todo/` 를 `/p/<이름>/` 아래에 낸다.
+    정적 board.html 은 이 풀이를 안 거친다."""
+    for 폴더 in ("plan", "todo"):
+        if x.startswith("../%s/" % 폴더):
+            return x[len("../"):]
+    return x
 
 
 def all_turns(projects, sync=False):
@@ -2271,7 +2421,7 @@ def plugin_version_read():
 
 
 _사이드바_머리 = ('<nav class="side" aria-label="보드 메뉴"><div class="brand"><span class="logo">SL</span><div><b>작업 보드</b>'
-              '<small>이 기계 · %s</small></div></div>'
+              '<small>이 기기 · %s</small></div></div>'
               '<button type="button" id="pk"><span>검색·이동</span><kbd>⌘K</kbd></button>')
 
 
@@ -2293,10 +2443,11 @@ def render_shell(items, rows, turns, path):
         m = re.match(r"/p/([^/]+)/", path)
         현재 = urllib.parse.unquote(m.group(1)) if m and not path.endswith("/improve") else None
         개선 = items[0]["name"] if items else None
-        링크 = [_사이드바_고리("/", "첫 화면", path == "/", str(지금), 지금 > 0), _사이드바_고리("/timeline", "시간 막대", path == "/timeline"),
-              _사이드바_고리("/signals", "비용·품질", path == "/signals")]
-        링크.append(_사이드바_고리(_주소(개선) + "improve", "개선 거리", path.endswith("/improve") and path.startswith("/p/"))
-                  if 개선 else '<span class="nolink">개선 거리</span>')
+        이름 = 화면이름
+        링크 = [_사이드바_고리("/", 이름["home"], path == "/", str(지금), 지금 > 0), _사이드바_고리("/timeline", 이름["timeline"], path == "/timeline"),
+              _사이드바_고리("/signals", 이름["usage"], path == "/signals")]
+        링크.append(_사이드바_고리(_주소(개선) + "improve", 이름["improve"], path.endswith("/improve") and path.startswith("/p/"))
+                  if 개선 else '<span class="nolink">%s</span>' % esc(이름["improve"]))
         프로젝트 = []
         for item, r in zip(items, rows):
             수 = sum(1 for c in r["카드"] if c["상태"] == "진행")
@@ -2318,15 +2469,16 @@ def render_shell(items, rows, turns, path):
 
 def 최소_사이드바(path):
     return ('<nav class="side" aria-label="보드 메뉴"><div class="grp">%s%s%s%s</div><div class="sbox"><span>사이드바 못 그림</span></div></nav>'
-            % (_사이드바_고리("/", "첫 화면", path == "/"), _사이드바_고리("/timeline", "시간 막대", path == "/timeline"),
-               _사이드바_고리("/signals", "비용·품질", path == "/signals"), '<span class="nolink">개선 거리</span>'))
+            % (_사이드바_고리("/", 화면이름["home"], path == "/"), _사이드바_고리("/timeline", 화면이름["timeline"], path == "/timeline"),
+               _사이드바_고리("/signals", 화면이름["usage"], path == "/signals"),
+               '<span class="nolink">%s</span>' % html.escape(화면이름["improve"])))
 
 
 def with_shell(page, nav):
     """첫 `<body>` 를 사이드바와 본문 상자로, 마지막 `</body>` 를 닫는 글로 바꾼다. `<body>` 가 없으면 그대로."""
     if "<body>" not in page:
         return page
-    page = page.replace("<body>", '<body class="with-side"><div class="shell">' + nav + '<div class="page">', 1)
+    page = _화면들_채우기(page).replace("<body>", '<body class="with-side"><div class="shell">' + nav + '<div class="page">', 1)
     i = page.rindex("</body>")
     return page[:i] + "</div></div>" + page[i:]
 
@@ -2378,11 +2530,12 @@ def _병합_누가(제목):
     return ("사람", m.group(1)) if m else None
 
 
-def week_merges(items, today):
-    """이번 주(월요일 0시부터) 원격 기준 가지 끝에서 닿는 병합 커밋 수 — `{자동, 사람, 모름}`. 끝을 읽은 프로젝트가 없으면 None.
-    끝을 모르거나 git 이 실패한 프로젝트는 `모름` 으로 센다."""
+def _이번주_병합(items, today):
+    """이번 주(월요일 0시부터) 원격 기준 가지 끝에서 닿는 병합 커밋 — `(줄들, 모름)`. 줄 = {프로젝트, 누가, 카드, 때}.
+    끝을 읽은 프로젝트가 없으면 줄들은 None. 끝을 모르거나 git 이 실패한 프로젝트는 `모름` 으로 센다."""
     monday = dt.datetime.combine(today - dt.timedelta(days=today.weekday()), dt.time()).timestamp()
-    자동 = 사람 = 모름 = 읽음 = 0
+    줄들, 모름 = [], 0
+    읽음 = 0
     for item in items:
         끝 = (REMOTE.get(os.path.abspath(item["path"])) or {}).get("끝")
         try:
@@ -2398,13 +2551,80 @@ def week_merges(items, today):
             때, _, 제목 = 줄.partition("\t")
             누가 = _병합_누가(제목) if 때.isdigit() and int(때) >= monday else None
             if 누가:
-                자동 += 누가[0] == "러너"
-                사람 += 누가[0] == "사람"
-    return {"자동": 자동, "사람": 사람, "모름": 모름} if 읽음 else None
+                줄들.append({"프로젝트": item["name"], "누가": 누가[0], "카드": 누가[1], "때": dt.datetime.fromtimestamp(int(때))})
+    return (줄들 if 읽음 else None), 모름
+
+
+def week_merges(items, today):
+    """이번 주 병합 커밋 수 — `{자동, 사람, 모름}`. 끝을 읽은 프로젝트가 없으면 None. 세는 규칙은 `_이번주_병합` 하나다."""
+    줄들, 모름 = _이번주_병합(items, today)
+    if 줄들 is None:
+        return None
+    return {"자동": sum(x["누가"] == "러너" for x in 줄들), "사람": sum(x["누가"] == "사람" for x in 줄들), "모름": 모름}
 
 
 def _배지_색(상태):
     return {"완료 선언 대기": "orange", "멈춤": "orange", "읽지 못함": "orange", "진행": "blue"}.get(상태, "gray")
+
+
+카드_보기 = ("진행", "대기", "병합", "멈춤")
+
+
+def 카드_목록(rows, 보기, 병합줄, now):
+    """`/cards` 의 묶음 — `[{이름, 줄: [{프로젝트, 상태, 제목, 까닭, 때, 기계, href}]}]`. href 가 빈 글자면 고리 없음.
+    `보기` 가 넷 밖이거나 병합인데 `병합줄` 이 None(원격 끝을 못 읽음)이면 None. 칸 숫자와 같은 고르기(`_칸_고름`)·같은 병합 줄(`_이번주_병합`)이다."""
+    if 보기 not in 카드_보기 or (보기 == "병합" and 병합줄 is None):
+        return None
+    묶음 = {}
+
+    def 더(이름, 줄):
+        묶음.setdefault(이름, []).append(줄)
+
+    if 보기 == "병합":
+        파일 = {r["name"]: {c["file"]: c for c in r.get("카드") or []} for r in rows}
+        for x in sorted(병합줄, key=lambda x: (x["프로젝트"], -x["때"].timestamp())):
+            c = 파일.get(x["프로젝트"], {}).get(x["카드"] + ".md")
+            더(x["프로젝트"], {"프로젝트": x["프로젝트"], "상태": "병합", "제목": c["title"] if c else x["카드"], "까닭": x["누가"] + " 병합",
+                            "때": x["때"].strftime("%Y-%m-%d"), "기계": "—", "href": _주소(x["프로젝트"]) + urllib.parse.quote(c["file"]) if c else ""})
+        return [{"이름": k, "줄": v} for k, v in 묶음.items()]
+    for r, c, *갈래 in _칸_고름(rows)[보기]:
+        if 갈래:
+            종류 = next((a["종류"] for a in r.get("경보") or [] if a["file"] == c["file"]), "") if 갈래[0] == "경보" else ""
+            글 = 종류 or _한줄(r.get("카드") or [], c, {}, now)[0]
+        else:
+            글 = _한줄(r.get("카드") or [], c, {}, now)[0]
+        더(갈래[0] if 갈래 else r["name"],
+           {"프로젝트": r["name"], "상태": c["상태"], "제목": c["title"], "까닭": 글, "때": c["갱신"],
+            "기계": c.get("도는 기계") or c.get("돈기계") or c.get("기기") or "—", "href": _주소(r["name"]) + urllib.parse.quote(c["file"])})
+    순서 = ("보류", "경보", "예상 넘김")
+    이름들 = [k for k in 순서 if k in 묶음] if 보기 == "멈춤" else list(묶음)
+    return [{"이름": k, "줄": 묶음[k]} for k in 이름들]
+
+
+_보기_제목 = {"진행": "진행 중인 카드", "대기": "대기 중인 카드", "병합": "이번 주 완료", "멈춤": "막힘"}
+
+
+def render_cards(보기, 묶음들, 덧=()):
+    """카드 목록 화면 HTML — 검색 결과 묶음(`.sr-g`·`.sr-h`·`.sr-r`)과 같은 모양. `묶음들` 이 None 이면 원격을 아직 못 읽은 병합 목록.
+    한 줄은 고리가 있으면 `<a class="sr-r">`, 없으면 `<div class="sr-r">`(줄 세기는 둘 다 같다). 값은 모두 escape 한다."""
+    esc = html.escape
+    parts = ["<h1>%s</h1>" % esc(_보기_제목.get(보기, 보기))]
+    parts += ["<p>%s</p>" % esc(x) for x in 덧]
+    if 묶음들 is None:
+        parts.append("<p>원격 저장소를 아직 못 읽음</p>")
+    elif not 묶음들:
+        parts.append('<p>없음 · <a href="/">%s</a></p>' % 화면이름["home"])
+    for g in 묶음들 or []:
+        rows = []
+        for x in g["줄"]:
+            속 = ('<span class="sr-meta"><span class="badge b-%s">%s</span><span class="sr-b">%s</span><span class="sr-m">%s · %s</span></span>'
+                 '<span class="sr-t">%s</span><span class="sr-l">%s</span>'
+                 % (_배지_색(x["상태"]), esc(x["상태"]), esc(x["프로젝트"]), esc(x["때"]), esc(_기기_글(x["기계"])), esc(x["제목"]), esc(x["까닭"])))
+            rows.append('<a class="sr-r" href="%s">%s</a>' % (esc(x["href"], quote=True), 속) if x["href"] else '<div class="sr-r">%s</div>' % 속)
+        parts.append('<div class="sr-g" data-g="%s"><div class="sr-h"><b>%s</b><span class="sr-n">%d</span></div>%s</div>'
+                     % (esc(g["이름"]), esc(g["이름"]), len(g["줄"]), "".join(rows)))
+    틀 = FILE_TEMPLATE.replace('<a href="board.html">← 보드</a>', '<a href="/">← %s</a>' % 화면이름["home"])
+    return 틀 % {"name": esc(_보기_제목.get(보기, 보기)), "body": "\n".join(parts)}
 
 
 def render_home(rows, turns, 오류, tab="", 처리=(), today=None, machines="", now=None, 병합=None, 기계수=None, feed=""):
@@ -2418,7 +2638,7 @@ def render_home(rows, turns, 오류, tab="", 처리=(), today=None, machines="",
 
     def li(t):
         색 = _종류_색.get(t["종류"], "gray")
-        단추 = "끝 보고 보기" if t["종류"] == "완료 선언" else "보드 보기" if t["종류"] == "못 읽음" else "카드 보기"
+        단추 = "완료 보고서 보기" if t["종류"] == "완료 선언" else "보드 보기" if t["종류"] == "못 읽음" else "카드 보기"
         메타 = " · ".join(x for x in (t["프로젝트"], t["기다리는 것"], t["생긴 때"], "알림 못 띄움" if t.get("알림") is False else "") if x)
         return ('<li class="turn"><span class="kind k-%s">%s</span><div class="tbody"><div class="tt">%s</div><div class="tm">%s</div></div>'
                 '<a class="tact" href="%s">%s</a></li>' % (색, esc(t["종류"]), esc(t["제목"]), esc(메타), esc(t["열어 볼 곳"], quote=True), 단추))
@@ -2427,28 +2647,28 @@ def render_home(rows, turns, 오류, tab="", 처리=(), today=None, machines="",
         return '<ul class="tlist">%s</ul>' % "".join(li(t) for t in items) if items else '<p class="more">%s</p>' % 없음
 
     if tab == "old":
-        box = lst(오래, "오래된 것 없음")
+        box = lst(오래, "오래 기다림 없음")
     elif tab == "done":
         box = ('<ul class="tlist">%s</ul>' % "".join(
             '<li class="turn"><div class="tbody"><div class="tt">%s</div><div class="tm">%s</div></div></li>'
             % (esc(x["글"]), esc(" · ".join(y for y in (x["때"], x["프로젝트"]) if y))) for x in 처리)) if 처리 else '<p class="more">처리함 없음</p>'
     else:
-        box = lst(지금[:NOW_MAX], "내 차례 없음" if not turns else "지금 내 차례 없음")
+        box = lst(지금[:NOW_MAX], "%s 없음" % 화면이름["todo"] if not turns else "새로 온 %s 없음" % 화면이름["todo"])
         if len(지금) > NOW_MAX:
             box += '<div class="more">%d개 더</div>' % (len(지금) - NOW_MAX)
         if 오래:
             per = {}
             for t in 오래:
                 per[t["프로젝트"]] = per.get(t["프로젝트"], 0) + 1
-            box += '<div class="more">오래된 멈춤 %d장은 「오래된 것」에 — %s</div>' % (len(오래), esc(" · ".join("%s %d" % kv for kv in per.items())))
-    탭들 = (("", "지금 %d" % len(지금), "/"), ("old", "오래된 것 %d" % len(오래), "/?tab=old"), ("done", "처리함 %d" % len(처리), "/?tab=done"))
+            box += '<div class="more">오래된 멈춤 %d장은 「오래 기다림」에 — %s</div>' % (len(오래), esc(" · ".join("%s %d" % kv for kv in per.items())))
+    탭들 = (("", "새로 온 것 %d" % len(지금), "/"), ("old", "오래 기다림 %d" % len(오래), "/?tab=old"), ("done", "처리함 %d" % len(처리), "/?tab=done"))
     tabs = '<nav class="tabs">%s</nav>' % "".join(
         '<a%s href="%s">%s</a>' % (' class="on"' if k == tab else "", href, label) for k, label, href in 탭들)
-    turnp = '<section class="panel turnp" aria-labelledby="h-turn"><div class="ph"><h2 id="h-turn">내 차례</h2>%s</div>%s</section>' % (tabs, box)
+    turnp = '<section class="panel turnp" aria-labelledby="h-turn"><div class="ph"><h2 id="h-turn">%s</h2>%s</div>%s</section>' % (esc(화면이름["todo"]), tabs, box)
 
     def tile(c):
         return ('<a class="tile%s%s" href="%s"><span class="lb">%s</span><span class="v">%s</span><span class="sub">%s</span></a>'
-                % (" risk" if c["위험"] else "", " good" if c["이름"] == "이번 주 병합" and c["수"] != "—" else "",
+                % (" risk" if c["위험"] else "", " good" if c["이름"] == "이번 주 완료" and c["수"] != "—" else "",
                    esc(c["고리"], quote=True), esc(c["이름"]), c["수"], esc(c["설명"])))
     numbers = '<section class="tiles" aria-label="요약">%s</section>\n' % "".join(tile(c) for c in home_numbers(rows, today, 병합))
 
@@ -2465,16 +2685,16 @@ def render_home(rows, turns, 오류, tab="", 처리=(), today=None, machines="",
                   % ("full" if x["퍼센트"] == 100 else "zero" if not x["퍼센트"] else "", x["퍼센트"] or 0, x["완료"], x["분모"])
                   if x["분모"] else '<div class="pbar"><span>—</span></div>')
             out.append('<tr><td class="pn">%s<div class="sub">%s</div></td><td><span class="badge b-%s">%s</span></td><td>%s</td><td>%s</td><td>%s</td></tr>'
-                       % (link, esc(" · ".join(sub)), _배지_색(x["상태"]), esc(x["상태"]), 막대, esc(x["남은 예상"]), esc(x["기계"])))
+                       % (link, esc(" · ".join(sub)), _배지_색(x["상태"]), esc(x["상태"]), 막대, esc(x["남은 예상"]), esc(_기기_글(x["기계"]))))
         return "".join(out)
-    head = "".join("<th>%s</th>" % h for h in ("프로젝트 · 시나리오", "상태", "요소 진행", "남은 예상", "도는 기계"))
+    head = "".join("<th>%s</th>" % h for h in ("프로젝트 · 시나리오", "상태", "진행률", "남은 시간(예상)", "실행 기기"))
     표 = ('<div class="progress"><table><thead><tr>%s</tr></thead><tbody>%s</tbody></table></div>' % (head, "".join(prows(r) for r in rows))
          if rows else '<p class="more">보는 프로젝트 없음 — %s 의 "projects"·"보기" 에 올리면 보인다</p>' % esc(LIST_FILE))
     progress = ('<section class="panel" aria-labelledby="h-proj"><div class="ph"><h2 id="h-proj">프로젝트 진행</h2>'
                 '<span class="hint">줄을 누르면 그 프로젝트 보드</span></div>%s</section>\n' % 표)
-    sub = " · ".join(["%s" % now.strftime("%Y-%m-%d %H:%M"), "프로젝트 %d" % len(rows)] + (["기계 %d" % 기계수] if 기계수 is not None else []))
+    sub = " · ".join(["%s" % now.strftime("%Y-%m-%d %H:%M"), "프로젝트 %d" % len(rows)] + (["기기 %d" % 기계수] if 기계수 is not None else []))
     err = '<p class="why">%s</p>' % esc(오류) if 오류 else ""
-    return HOME_TEMPLATE % {"err": err, "sub": esc(sub), "numbers": numbers, "progress": progress, "turns": turnp, "feed": feed, "machines": machines}
+    return HOME_TEMPLATE % {"title": esc(화면이름["home"]), "err": err, "sub": esc(sub), "numbers": numbers, "progress": progress, "turns": turnp, "feed": feed, "machines": machines}
 
 
 def render_home_feed(줄, 못):
@@ -2486,7 +2706,7 @@ def render_home_feed(줄, 못):
         return ('<li class="act"><span class="fd fd-%s"></span><div><div><a href="/p/%s/%s">%s</a></div><div class="tm">%s</div></div></li>'
                 % (색, urllib.parse.quote(x["프로젝트"], safe=""), urllib.parse.quote(x["카드"], safe=""),
                    esc("%s · %s · %s" % (x["카드"].removesuffix(".md"), x["단계"], x["결과"])),
-                   esc("%s · %s · %s" % (x["프로젝트"], x["기계"], _얼마_전(x["때"])))))
+                   esc("%s · %s · %s" % (x["프로젝트"], _기기_글(x["기계"]), _얼마_전(x["때"])))))
     top = sorted(줄, key=lambda x: x["때"], reverse=True)[:10]
     why = "".join('<p class="why">%s: 이 프로젝트 활동 못 읽음</p>' % esc(n) for n in 못)
     body = '<ol class="flist">%s</ol>' % "".join(li(x) for x in top) if top else '<p class="more">최근 활동 없음</p>'
@@ -2509,13 +2729,13 @@ def render_machine_pills(data):
     """첫 화면 기계 줄 — 기계마다 알약 하나(점·이름·한 줄 설명)와 판 다름·못 읽음 경고."""
     esc = html.escape
     pills = "".join(
-        '<div class="pill"><span class="%s"></span><b>%s%s</b><span class="tm">카드 %d · %s · 미푸시 —</span></div>'
-        % ("dot-blue" if x["도는 카드"] else "dot-gray", esc(x["기계"]), " · 이 기계" if x["이 기계"] else "", len(x["도는 카드"]),
-           esc(x["판"] or "판 모름")) for x in data["줄"]) or '<p class="meta">알려진 기계 없음</p>'
+        '<div class="pill"><span class="%s"></span><b>%s%s</b><span class="tm">카드 %d · %s · 올리지 않은 커밋 —</span></div>'
+        % ("dot-blue" if x["도는 카드"] else "dot-gray", esc(_기기_글(x["기계"])), " · 이 기기" if x["이 기계"] else "", len(x["도는 카드"]),
+           _판_글(x["판"]) if x["판"] else "판 모름") for x in data["줄"]) or '<p class="meta">알려진 기기 없음</p>'
     why = "".join('<p class="why">%s</p>' % esc(x) for x in (
-        ["판 다름 — " + " · ".join("%s %s" % kv for kv in data["판 다름"])] if data["판 다름"] else [])
-        + ["%s — 이력을 못 읽어 기계 현황에서 뺐다" % n for n, _ in data["못 읽음"]])
-    return '<section class="panel mach" aria-labelledby="h-mach"><h2 id="h-mach">기계</h2>%s%s</section>' % (pills, why)
+        ["판 다름 — " + _판_다름_글(data["판 다름"])] if data["판 다름"] else [])
+        + ["%s — 이력을 못 읽어 기기 현황에서 뺐다" % n for n, _ in data["못 읽음"]])
+    return '<section class="panel mach" aria-labelledby="h-mach"><h2 id="h-mach">기기</h2>%s%s</section>' % (pills, why)
 
 
 # ── 카드 상세 화면 (ISSUE-sc02-e5-card-detail-2026-11-20) ──
@@ -3108,8 +3328,8 @@ def render_signals(qs, 결과, 까닭):
     거른 = {k: v(k) for k in ("p", "sc") if v(k)}
     단추 = "".join('<a href="/signals?%s" aria-pressed="%s">%s</a>' % (
         esc(urllib.parse.urlencode(dict(거른, period=k))), "true" if k == 눌림 else "false", 글) for k, 글 in _신호_기간_이름.items())
-    parts = ['<div class="sg-top"><h1>비용·품질</h1><div class="sg-pg" role="group" aria-label="기간">%s</div>'
-             '<span class="sg-hint">기간을 바꾸면 아래 숫자가 모두 바뀐다</span></div>' % 단추]
+    parts = ['<div class="sg-top"><h1>%s</h1><div class="sg-pg" role="group" aria-label="기간">%s</div>'
+             '<span class="sg-hint">기간을 바꾸면 아래 숫자가 모두 바뀐다</span></div>' % (esc(화면이름["usage"]), 단추)]
     if 까닭 or 기간까닭:
         parts.append("<p>%s</p>" % esc(까닭 or 기간까닭))
     elif not 결과:
@@ -3157,7 +3377,7 @@ def render_signals(qs, 결과, 까닭):
 
     box = lambda k, label, typ="text": '<label>%s <input type="%s" name="%s" value="%s"></label> ' % (
         label, typ, k, esc(v(k), quote=True))
-    parts.append('<details class="sg-old"><summary>거르개와 단계별 토큰 표</summary>'
+    parts.append('<details class="sg-old"><summary>필터와 단계별 토큰 표</summary>'
                  '<form method="get" action="/signals"><p>%s%s%s%s<button type="submit">보기</button></p></form>'
                  "<p>기간은 카드의 갱신 날짜 기준이다. 시작한 적이 있는 카드만 센다.</p>"
                  % (box("p", "프로젝트"), box("sc", "시나리오"), box("from", "기간 시작", "date"), box("to", "끝", "date")))
@@ -3207,8 +3427,8 @@ def render_signals(qs, 결과, 까닭):
                 file, title = r["제목"][stem]
                 parts.append('<h3><a href="/p/%s/%s">%s</a></h3>' % (urllib.parse.quote(r["name"], safe=""),
                                                                     urllib.parse.quote(file, safe=""), esc(title)))
-    틀 = FILE_TEMPLATE.replace('<a href="board.html">← 보드</a>', '<a href="/">← 첫 화면</a>').replace("<h1>%(name)s</h1>\n", "", 1)
-    return (틀 % {"name": "비용·품질", "body": "\n".join(parts)}).replace("</style>", _신호_CSS + "</style>", 1)
+    틀 = FILE_TEMPLATE.replace('<a href="board.html">← 보드</a>', '<a href="/">← %s</a>' % 화면이름["home"]).replace("<h1>%(name)s</h1>\n", "", 1)
+    return (틀 % {"name": 화면이름["usage"], "body": "\n".join(parts)}).replace("</style>", _신호_CSS + "</style>", 1)
 
 
 def _표_html(head, rows):
@@ -3234,7 +3454,7 @@ def _시나리오_절(card, cards, scenarios):
     for e in card["선행"]:
         held = next((c for c in cards if c["시나리오"] == no and e in c["요소"]), None)
         rows.append(("선행", "%s (%s)" % (e, held["상태"] if held else "카드 없음")))
-    return '<h2>시나리오</h2><p><a href="board.html">보드로</a></p>' + _표_html(("항목", "내용"), rows)
+    return '<h2>시나리오</h2><p><a href="board.html">← %s</a></p>' % html.escape(화면이름["board"]) + _표_html(("항목", "내용"), rows)
 
 
 _기능줄 = re.compile(r"F-\d{3}")
@@ -3315,7 +3535,7 @@ def _메모(n, v, h):
 def _머리_html(card, h, fm, 웹):
     esc = html.escape
     stem = os.path.splitext(card["file"])[0]
-    꼬리 = (card["시나리오"] + (" " + ", ".join(card["요소"]) if card["요소"] else "")) if card["시나리오"] else "낱장"
+    꼬리 = (card["시나리오"] + (" " + ", ".join(card["요소"]) if card["요소"] else "")) if card["시나리오"] else "시나리오 밖"
     상태 = card["상태"] + (" · %s 병합" % h["병합"] if h.get("병합") else "")
     색 = {"완료": "teal", "진행": "blue", "보류": "orange"}.get(card["상태"], "gray")
     배지 = ('<span class="badge b-%s">%s</span><span class="badge b-gray">%s</span><span class="badge b-gray">%s</span>'
@@ -3325,9 +3545,9 @@ def _머리_html(card, h, fm, 웹):
     버튼 = ('<a class="btn" href="%s/pull/%d">PR #%d</a>' % (esc(웹, quote=True), pr, pr)) if 웹 and pr else '<span class="btn">PR —</span>'
     버튼 += ('<a class="btn" href="%s/blob/HEAD/docs/backlog/%s">카드 파일</a>' % (esc(웹, quote=True), urllib.parse.quote(card["file"])) if 웹
             else '<span class="btn">카드 파일 —</span>')
-    return ('<p class="crumb"><a href="/">첫 화면</a> / <a href="board.html">프로젝트</a> / %s</p>'
+    return ('<p class="crumb"><a href="/">%s</a> / <a href="board.html">프로젝트</a> / %s</p>'
             '<div class="badges">%s</div><h1>%s</h1><p class="sub">%s · 시나리오 %s · 선행 %s</p><div class="btns">%s</div>'
-            % (esc(꼬리), 배지, esc(card["title"]), esc(stem), esc(card["시나리오"] or "—"), esc(", ".join(card["선행"]) or "—"), 버튼))
+            % (esc(화면이름["home"]), esc(꼬리), 배지, esc(card["title"]), esc(stem), esc(card["시나리오"] or "—"), esc(", ".join(card["선행"]) or "—"), 버튼))
 
 
 def _요약_html(card, cards, h, 중앙값):
@@ -3387,8 +3607,8 @@ def _판정_html(card, 검토):
         if not r["오류"] and not r["지적"]:
             줄.append('<div class="fnd"><span class="badge b-%s">%s</span><span class="tx">지적 없음</span></div>'
                     % ("orange" if r["판정"] == "반려" else "teal", esc(이름)))
-    줄 += ['<div class="fnd"><span class="badge b-gray">선택 사항</span><span class="tx">%s</span><code class="wh">%s</code></div>'
-          % (esc(x["원문"]), esc(x["출처"])) for x in (검토 or {}).get("항목", []) if x["종류"] == "선택 사항"]
+    줄 += ['<div class="fnd"><span class="badge b-gray">%s</span><span class="tx">%s</span><code class="wh">%s</code></div>'
+          % (esc(_종류_글("선택 사항")), esc(x["원문"]), esc(x["출처"])) for x in (검토 or {}).get("항목", []) if x["종류"] == "선택 사항"]
     if not 줄:
         줄 = ['<div class="more">판정 기록 없음%s</div>' % (" — 실행이 끝나 소각된 뒤에 읽힌다" if card["상태"] == "진행" else "")]
     return '<section class="panel judge"><div class="ph"><h2>판정과 지적</h2></div><div class="flist">%s</div></section>' % "".join(줄)
@@ -3398,9 +3618,10 @@ def _사람_html(card, 검토):
     esc = html.escape
     항목 = (검토 or {}).get("항목", [])
     수 = lambda 종류: sum(1 for x in 항목 if x["종류"] == 종류)          # noqa: E731
-    줄 = ["<div class=\"fnd\">%s</div>" % esc(x["원문"]) for x in 항목 if x["종류"] == "사람 결정 미결"] or ["<div class=\"fnd\">사람 결정 미결 없음</div>"]
-    줄.append('<div class="fnd">이연 후보 %d · 선택 사항 %d → <a href="improve?c=%s">개선 거리</a></div>'
-             % (수("이연 후보"), 수("선택 사항"), urllib.parse.quote(os.path.splitext(card["file"])[0], safe="")))
+    줄 = ["<div class=\"fnd\">%s</div>" % esc(x["원문"]) for x in 항목 if x["종류"] == "사람 결정 미결"] or ["<div class=\"fnd\">%s 없음</div>" % esc(_종류_글("사람 결정 미결"))]
+    줄.append('<div class="fnd">%s %d · %s %d → <a href="improve?c=%s">%s</a></div>'
+             % (_종류_글("이연 후보"), 수("이연 후보"), _종류_글("선택 사항"), 수("선택 사항"),
+                urllib.parse.quote(os.path.splitext(card["file"])[0], safe=""), esc(화면이름["improve"])))
     return '<section class="panel human"><div class="ph"><h2>사람이 볼 것</h2></div><div class="flist">%s</div></section>' % "".join(줄)
 
 
@@ -3419,7 +3640,7 @@ def render_card_detail(item, card, cards, scenarios, history, 머리말=None, �
     위 = [_머리_html(card, h, fm, 웹), 승격_폼(item["name"], card), _요약_html(card, cards, h, 중앙값), _흐름_html(h, 중앙값),
          '<div class="cols">%s%s</div>' % (_판정_html(card, 검토), _사람_html(card, 검토))]
     if "출처" in card:
-        parts.append("<p>출처: %s · 도는 기계 %s</p>" % (esc(card["출처"]), esc(card["도는 기계"])))
+        parts.append("<p>출처: %s · 실행 기기 %s</p>" % (esc(card["출처"].replace("이 기계", "이 기기")), esc(_기기_글(card["도는 기계"]))))
     parts.append("<h2>머리말</h2>" + (_표_html(("키", "값"), list(fm.items())) if fm else "<p>머리말 없음</p>"))
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
@@ -3430,7 +3651,7 @@ def render_card_detail(item, card, cards, scenarios, history, 머리말=None, �
             shown = "<pre>%s</pre>" % esc(text)
         parts.append("<h2>본문</h2>" + shown)
     except OSError:
-        parts.append("<h2>본문</h2><p>본문은 이 기계에 없음 — 원격에만 있는 카드</p>")
+        parts.append("<h2>본문</h2><p>본문은 이 기기에 없음 — 원격에만 있는 카드</p>")
     parts.append("<h2>단계별 실행 기록</h2>")
     if h.get("상태오류"):
         parts.append("<p>%s</p>" % esc(h["상태오류"]))
@@ -3736,7 +3957,7 @@ def _검색_입력(qs, 이름들=(), 건수=""):
         " open" if cond["시작"] or cond["끝"] else "", " on" if cond["시작"] or cond["끝"] else "", esc(기간),
         box("from", "시작", "date"), box("to", "끝", "date")))
     더 = any(cond[k] for k in ("시나리오", "기능", "기기", "반려")) or cond["아래"] is not None or cond["위"] is not None
-    chips.append('<details class="sr-d"%s><summary class="sr-chip%s">+ 거르개</summary>%s %s %s '
+    chips.append('<details class="sr-d"%s><summary class="sr-chip%s">+ 필터</summary>%s %s %s '
                  '<label>반려 <select name="rej"><option value="">—</option><option value="1"%s>반려 있음</option></select></label> %s %s</details>'
                  % (" open" if 더 else "", " on" if 더 else "", box("sc", "시나리오"), box("fn", "기능 ID"), box("dev", "기기"),
                     " selected" if rej else "", box("cmin", "비용 아래(달러)", "number"), box("cmax", "위", "number")))
@@ -3775,16 +3996,16 @@ def render_search(qs, 결과, 까닭, 초=None, 이름들=None):
     if 까닭:
         parts.append("<p>%s</p>" % esc(까닭))
     elif not 활성:
-        parts.append("<p>낱말이나 거르개를 넣고 찾는다</p>")
+        parts.append("<p>낱말이나 필터를 넣고 찾는다</p>")
     else:
         if 거르개:
-            parts.append('<p class="sr-flt">거르개: %s</p>' % esc(", ".join(거르개)))
+            parts.append('<p class="sr-flt">필터: %s</p>' % esc(", ".join(거르개)))
         for r in 결과:
             parts += ["<p>%s: 찾지 못함 — %s</p>" % (esc(r["name"]), esc(x)) for x in r["오류"]]
         if not n:
             parts.append("<p>찾은 것 없음</p>")
             if cond["낱말"] and 거르개:
-                parts.append('<p><a href="%s">거르개를 풀고 「%s」만으로 찾기</a></p>'
+                parts.append('<p><a href="%s">필터를 풀고 「%s」만으로 찾기</a></p>'
                              % (esc(_검색_주소({"q": [cond["낱말"]]}), quote=True), esc(cond["낱말"])))
             elif not cond["낱말"]:
                 parts.append("<p>낱말을 넣고 찾는다</p>")
@@ -3800,7 +4021,7 @@ def render_search(qs, 결과, 까닭, 초=None, 이름들=None):
             kind = {"카드": "카드", "커밋": "커밋", "인계 문서": "인계"}[이름]
             if 묶음[이름] and cond["종류"] in ("", kind):
                 parts.append(_묶음_그리기(이름, 묶음[이름], cond["낱말"], qs, bool(cond["종류"])))
-    틀 = FILE_TEMPLATE.replace('<a href="board.html">← 보드</a>', '<a href="/">← 첫 화면</a>')
+    틀 = FILE_TEMPLATE.replace('<a href="board.html">← 보드</a>', '<a href="/">← %s</a>' % 화면이름["home"])
     return 틀 % {"name": "지난 작업 검색", "body": "\n".join(parts)}
 
 
@@ -4086,33 +4307,33 @@ def _얼마_전(때):
     return "방금" if 분 < 1 else "%d분 전" % 분 if 분 < 60 else "%d시간 전" % (분 // 60) if 분 < 1440 else "%d일 전" % (분 // 1440)
 
 
-def render_feed(줄, 못, 거르개, 프로젝트들, 기계들):
-    """최근 활동 구역 하나. 줄 전체가 그 카드 상세 링크이고 거르개는 GET 폼이다."""
+def render_feed(줄, 못, 거르개, 프로젝트들, 기계들, 폼=True):
+    """최근 활동 구역 하나. 줄 전체가 그 카드 상세 링크이고 거르개는 GET 폼이다(`폼=False` 면 폼 없이 줄만 — 프로젝트 보드는 기계 칩이 거른다)."""
     esc = html.escape
 
     def select(name, 고른, 값들, 처음):
-        opts = "".join('<option value="%s"%s>%s</option>' % (esc(v, quote=True), " selected" if v == 고른 else "", esc(v)) for v in 값들)
+        opts = "".join('<option value="%s"%s>%s</option>' % (esc(v, quote=True), " selected" if v == 고른 else "", esc(_기기_글(v))) for v in 값들)
         return '<select name="%s"><option value="">%s</option>%s</select>' % (name, 처음, opts)
 
-    form = ('<form method="get">%s %s <button type="submit">거르기</button></form>'
+    form = ('<form method="get">%s %s <button type="submit">적용</button></form>'
             % (select("feed_project", 거르개.get("프로젝트", ""), 프로젝트들, "모든 프로젝트"),
-               select("feed_machine", 거르개.get("기계", ""), 기계들, "모든 기계")))
+               select("feed_machine", 거르개.get("기계", ""), 기계들, "모든 기기")))
     body = "".join('<p><a href="/p/%s/%s">%s</a></p>' % (
         urllib.parse.quote(x["프로젝트"], safe=""), urllib.parse.quote(x["카드"], safe=""),
-        esc("%s · %s · %s (%s, %s)" % (x["카드"].removesuffix(".md"), x["단계"], x["결과"], x["기계"], _얼마_전(x["때"]))))
+        esc("%s · %s · %s (%s, %s)" % (x["카드"].removesuffix(".md"), x["단계"], x["결과"], _기기_글(x["기계"]), _얼마_전(x["때"]))))
         for x in 줄) or "<p>최근 활동 없음</p>"
     why = "".join('<p class="why">%s: 이 프로젝트 활동 못 읽음</p>' % esc(n) for n in 못)
-    return '<div class="feed"><h2>최근 활동</h2>%s%s%s</div>' % (form, why, body)
+    return '<div class="feed"><h2>최근 활동</h2>%s%s%s</div>' % (form if 폼 else "", why, body)
 
 
-def _피드_구역(items, rows, qs, 고정=None):
+def _피드_구역(items, rows, qs, 고정=None, 폼=True):
     """화면에 끼울 피드 HTML. 어떤 예외가 나도 나머지 화면이 뜨도록 구역 안에서 막는다. `고정` 은 프로젝트 보드가 거르는 프로젝트."""
     g = lambda k: (qs.get(k) or [""])[0].strip()          # noqa: E731
-    거르개 = {"프로젝트": 고정 or g("feed_project"), "기계": g("feed_machine")}
+    거르개 = {"프로젝트": 고정 or g("feed_project"), "기계": g("feed_machine") or g("기계")}
     try:
         줄, 못 = collect_feed(items, rows, 거르개, dt.datetime.now())
         기계들 = sorted({c["도는 기계"] for r in rows for c in r["카드"]})
-        return render_feed(줄, 못, 거르개, [i["name"] for i in items], 기계들)
+        return render_feed(줄, 못, 거르개, [i["name"] for i in items], 기계들, 폼)
     except Exception:
         return '<div class="feed"><h2>최근 활동</h2><p class="why">활동 못 읽음</p></div>'
 
@@ -4187,6 +4408,24 @@ def _시간_글(초):
     return "%d시간 %d분" % (h, m) if h else "%d분" % m
 
 
+def _판_번호(v):
+    """`0.13.0 (364e29210a09)` → `0.13.0`. 그 꼴이 아니면 그대로."""
+    m = re.fullmatch(r"(\S+) \((.+)\)", v or "")
+    return m.group(1) if m else v
+
+
+def _판_글(v):
+    """보이는 곳의 플러그인 판 — 번호만 보이고 전체 값은 마우스를 올렸을 때(title)."""
+    n = _판_번호(v)
+    return html.escape(v) if n == v else '<span title="%s">%s</span>' % (html.escape(v, quote=True), html.escape(n))
+
+
+def _판_다름_글(쌍):
+    """판 다름 경고의 `기계 판` 이음. 번호만으로도 서로 갈리면 번호, 번호가 같고 해시만 다르면 전체 값."""
+    짧게 = len({_판_번호(v) for _, v in 쌍}) > 1
+    return " · ".join("%s %s" % (k, _판_번호(v) if 짧게 else v) for k, v in 쌍)
+
+
 def render_machines(data, 시작, 끝, 까닭):
     """첫 화면 기계 현황 조각 — 기간 입력, 판 다름 경고, 기계마다 한 줄(작업량은 `.bar` 막대)."""
     esc = html.escape
@@ -4194,8 +4433,8 @@ def render_machines(data, 시작, 끝, 까닭):
     form = ('<form method="get"><input type="date" name="시작" value="%s"> ~ <input type="date" name="끝" value="%s">'
             ' <button type="submit">보기</button></form>' % (시작.date().isoformat(), (끝 - dt.timedelta(days=1)).date().isoformat()))
     why = "".join('<p class="why">%s</p>' % esc(x) for x in (
-        ["판 다름 — " + " · ".join("%s %s" % kv for kv in data["판 다름"])] if data["판 다름"] else []) + ([까닭] if 까닭 else []) +
-        ["%s — 이력을 못 읽어 기계 현황에서 뺐다" % n for n, _ in data["못 읽음"]])
+        ["판 다름 — " + _판_다름_글(data["판 다름"])] if data["판 다름"] else []) + ([까닭] if 까닭 else []) +
+        ["%s — 이력을 못 읽어 기기 현황에서 뺐다" % n for n, _ in data["못 읽음"]])
     most = (max(x["시간"] for x in lines) or 0, max(x["카드 수"] for x in lines) or 0) if lines else (0, 0)
 
     def bar(v, top):
@@ -4204,11 +4443,11 @@ def render_machines(data, 시작, 끝, 까닭):
     def row(x):
         cards = "<br>".join(esc("%s · %s (%s)" % (p, t, s or "단계 모름")) for p, t, s in x["도는 카드"]) or "도는 카드 없음"
         move = x["마지막 움직임"].strftime("%Y-%m-%d %H:%M") if x["마지막 움직임"] else "움직임 없음"
-        return ["%s%s" % (esc(x["기계"]), " · 이 기계" if x["이 기계"] else ""), cards, move, esc(x["판"] or "판 모름"),
+        return ["%s%s" % (esc(_기기_글(x["기계"])), " · 이 기기" if x["이 기계"] else ""), cards, move, _판_글(x["판"]) if x["판"] else "판 모름",
                 "%s %s" % (bar(x["시간"], most[0]), _시간_글(x["시간"])), "%s %d" % (bar(x["카드 수"], most[1]), x["카드 수"])]
-    table = (_표(["기계", "지금 도는 카드", "마지막 움직임", "플러그인 판", "진행 시간", "돈 카드"], [row(x) for x in lines])
-             if lines else '<p class="meta">알려진 기계 없음</p>')
-    return '<div class="machines"><h2>기계 (%d)</h2>%s%s%s</div>' % (len(lines), form, why, table)
+    table = (_표(["기기", "지금 도는 카드", "마지막 움직임", "플러그인 판", "진행 시간", "돈 카드"], [row(x) for x in lines])
+             if lines else '<p class="meta">알려진 기기 없음</p>')
+    return '<div class="machines"><h2>기기 (%d)</h2>%s%s%s</div>' % (len(lines), form, why, table)
 
 
 def running_counts(cards):
@@ -4452,7 +4691,7 @@ def render_timeline(data, 시작, 끝, now, 까닭, 고른="", 카드="", 프로
     form = ('<form class="tl-form" method="get" action="/timeline"><input type="hidden" name="시작" value="%s"><input type="hidden" name="끝" value="%s">%s%s</form>'
             % (첫.isoformat(), 끝날.isoformat(), 고르개("p", "프로젝트", 이름들, 프로젝트),
                고르개("sc", "시나리오", [열쇠(p) for p in 선행_전체], 고른) if 선행_전체 else ""))
-    parts = ['<div class="tl-top"><h1>시간 막대</h1><div class="tl-pg" role="group" aria-label="기간">%s</div>%s</div>' % (단추, form)]
+    parts = ['<div class="tl-top"><h1>%s</h1><div class="tl-pg" role="group" aria-label="기간">%s</div>%s</div>' % (esc(화면이름["timeline"]), 단추, form)]
     for 글 in (프로젝트모름, 모름, 까닭):
         if 글:
             parts.append("<p>%s</p>" % esc(글))
@@ -4462,7 +4701,7 @@ def render_timeline(data, 시작, 끝, now, 까닭, 고른="", 카드="", 프로
     최대, 기계들 = _겹침_최대([(max(x["시작"], 시작), min(x["끝"], 끝), x["기계"]) for x in 안])
     기다림들 = [x for x in data.get("기다림", []) if 기간안(x)]
     칸 = [("기간 안 병합", "%d장" % sum(1 for t, _, p in data["병합"] if 시작 <= t < 끝 and ok(p)) if "병합" in data else "—"),
-         ("동시에 돈 최대", "%d장 (%s)" % (최대, "·".join(기계들)) if 최대 else "—"),
+         ("동시에 돈 최대", "%d장 (%s)" % (최대, "·".join(_기기_글(m) for m in 기계들)) if 최대 else "—"),
          ("사람 기다림 합", _시간_글(int(sum((min(x["끝"], 끝) - max(x["시작"], 시작)).total_seconds() for x in 기다림들))) if "기다림" in data else "—"),
          ("이어받기", "%d번" % sum(1 for t, p in data["이어받기 때"] if 시작 <= t < 끝 and ok(p)) if "이어받기 때" in data else "—")]
     설명 = {"이어받기": "이어받아 다시 시작한 실행(카드·실행 단위)"}
@@ -4524,20 +4763,20 @@ def render_timeline(data, 시작, 끝, now, 까닭, 고른="", 카드="", 프로
         줄수 += len(lines)
         병렬 = _겹침_최대([(max(x["시작"], 시작), min(x["끝"], 끝), name) for c in cards.values() for x in c["막대"]])[0]
         inner.append('<details%s class="tl-row" data-machine="%s"><summary class="tl-mh"><span class="tl-mn">%s</span><span class="tl-mm">카드 %d · 병렬 최대 %d</span></summary>%s</details>'
-                     % ("" if 접힘 else " open", esc(name, quote=True), esc(name), len(cards), 병렬, "".join(lines)))
+                     % ("" if 접힘 else " open", esc(name, quote=True), esc(_기기_글(name)), len(cards), 병렬, "".join(lines)))
     if not 줄수:
         inner.append("<p>이 기간에 돈 카드 없음</p>")
     if 시작 <= now < 끝:
         inner.append('<div class="tl-today" style="left:calc(var(--lab) + (100%% - var(--lab)) * %.4f)"></div>' % (pct(now) / 100))
-    lanes = '<section class="tl-lanes" aria-label="기계별 레인"><div class="tl-in">%s</div></section>' % "".join(inner)
+    lanes = '<section class="tl-lanes" aria-label="기기별 레인"><div class="tl-in">%s</div></section>' % "".join(inner)
 
-    legend = '<div class="tl-lgd">%s<span class="tl-hint">줄을 누르면 그 카드의 선행 화살표만 그린다 · 기계 레인은 접을 수 있다</span></div>' % "".join(
+    legend = '<div class="tl-lgd">%s<span class="tl-hint">줄을 누르면 그 카드의 선행 화살표만 그린다 · 기기 레인은 접을 수 있다</span></div>' % "".join(
         '<span class="tl-lg"><i class="tl-ph-%s"></i>%s</span>' % kv for kv in (
             ("분석", "분석"), ("설계", "설계"), ("구현", "구현"), ("검증", "검증·인계"), ("기다림", "사람 기다림·오류"), ("멈춤", "멈춤(세션 끝남)")))
     graph = [lanes, legend]
     if 선행:
         graph.append('<p class="tl-legend">실선 결과물 선행 · 점선 겹침 선행</p>')
-    graph.append('<p class="tl-run">%s</p>' % esc(running_text(data["동시"], data["전체"])))
+    graph.append('<p class="tl-run">%s</p>' % esc(_기기_글(running_text(data["동시"], data["전체"]))))
     if 선행:
         돈 = {(x["프로젝트"], x["카드"]) for xs in data["줄"].values() for x in xs}
         waits, seen = [], set()
@@ -4566,9 +4805,9 @@ def render_timeline(data, 시작, 끝, now, 까닭, 고른="", 카드="", 프로
         parts.append("<p>%s — 이력을 못 읽어 막대 없이 그렸다: %s</p>" % (esc(name), esc(why)))
     if 선행:
         parts.append('<details class="tl-els"><summary>요소 목록</summary>' + _요소_목록(선행) + "</details>" + _화살표_스크립트)
-    틀 = FILE_TEMPLATE.replace('<a href="board.html">← 보드</a>', '<a href="/">← 첫 화면</a>')
+    틀 = FILE_TEMPLATE.replace('<a href="board.html">← 보드</a>', '<a href="/">← %s</a>' % 화면이름["home"])
     틀 = 틀.replace("<h1>%(name)s</h1>\n", "", 1)           # 제목은 화면 안 `tl-top` 의 것 하나
-    return (틀 % {"name": "시간 막대", "body": "\n".join(parts)}).replace("</style>", _시간_CSS + ("\n" + _그림_CSS if 선행 else "") + "\n</style>", 1)
+    return (틀 % {"name": 화면이름["timeline"], "body": "\n".join(parts)}).replace("</style>", _시간_CSS + ("\n" + _그림_CSS if 선행 else "") + "\n</style>", 1)
 
 
 # ── 개선 거리 화면 (ISSUE-sc02-e17-improvement-view-2026-11-20, SC-02 E-17) ──
@@ -4588,6 +4827,11 @@ _개선_절 = {      # 산출물 파일 → [(절 제목, 종류, 단계)]. 단�
 }
 _짝_초 = 600     # 신호 `when` 뒤 이 초 안에 생긴 같은 카드의 소각 커밋을 그 실행의 소각으로 본다
 _표_줄 = re.compile(r"^\|[\s:\-|]+\|?$")
+
+
+def _없음만(t):
+    """「없음」 만 적은 문장(`없음`, `…(「없음」).`)은 지적이 아니다 — 개선 거리의 두 출처가 함께 쓴다."""
+    return t.rstrip(".") == "없음" or bool(re.search(r"\(「없음」\)\.?$", t))
 
 
 def _절_항목(text, 제목):
@@ -4621,7 +4865,7 @@ def _절_항목(text, 제목):
         cells = [c.strip() for c in row.strip("|").split("|")]
         if cells and cells[0] != "없음":
             texts.append(" · ".join(c for c in cells if c))
-    return [t for t in texts if t and not t.startswith("{") and t.rstrip(".") != "없음"]
+    return [t for t in texts if t and not t.startswith("{") and not _없음만(t)]
 
 
 def _분초(ms):
@@ -4699,7 +4943,7 @@ def _이력_읽기(project, 끝, out):
     try:
         r = run(끝)
         if r.returncode != 0 and 끝:
-            out["원격"] = ("원격을 읽지 못함 — 이 기계의 이력과 신호 폴더만", "원격 끝 커밋이 이 기계에 없음")
+            out["원격"] = ("원격을 읽지 못함 — 이 기기의 이력과 신호 폴더만", "원격 끝 커밋이 이 기기에 없음")
             r = run("")
     except (OSError, subprocess.SubprocessError):
         out["이력오류"] = "이력을 읽지 못함"
@@ -4753,7 +4997,7 @@ def _신호_읽기(project, burns, out):
         elif line.startswith("- "):
             if not (m and 카드):
                 out["못읽음"].append(("%s:%d" % (opt, n), "", "형식이 다른 줄"))
-            elif (카드, m.group(1), _정리(m.group(2))) not in 있는:
+            elif not _없음만(m.group(2).strip()) and (카드, m.group(1), _정리(m.group(2))) not in 있는:
                 있는.add((카드, m.group(1), _정리(m.group(2))))
                 out["항목"].append(_항목("선택 사항", 카드, m.group(1), 때, m.group(2).strip(), opt, "", "신호"))
     try:
@@ -4789,11 +5033,11 @@ def read_improvements(item, 그림):
     out = {"항목": [], "못읽음": [], "기록못찾음": [], "소각수": 0, "이력오류": "", "신호": [], "원격": ("", "")}
     끝 = ""
     if 그림 is None:
-        out["원격"] = ("원격을 아직 읽지 않음 — 이 기계의 이력과 신호 폴더만", "")
+        out["원격"] = ("원격을 아직 읽지 않음 — 이 기기의 이력과 신호 폴더만", "")
     elif 그림.get("없음"):
         out["원격"] = ("원격 없음", "")
     elif 그림.get("오류"):
-        out["원격"] = ("원격을 읽지 못함 — 이 기계의 이력과 신호 폴더만", 그림["오류"])
+        out["원격"] = ("원격을 읽지 못함 — 이 기기의 이력과 신호 폴더만", 그림["오류"])
     else:
         끝 = 그림.get("끝") or ""
         out["원격"] = ("원격 끝 " + 끝, "") if 끝 else ("원격 없음", "")
@@ -4976,7 +5220,7 @@ def _항목_html(x, 프로젝트):
     첫 = x["원문"].splitlines()[0] if x["원문"] else ""
     첫 = 첫 if len(첫) <= 60 else 첫[:60] + "…"
     sha = x["커밋"][:7] if x["커밋"] else "커밋 없음(신호 폴더)"
-    body = ["<p>%s</p>" % esc(x["원문"]), "<p>종류 %s · 출처 %s · 커밋 %s</p>" % (esc(x["종류"]), esc(x["경로"]), esc(sha))]
+    body = ["<p>%s</p>" % esc(x["원문"]), "<p>종류 %s · 출처 %s · 커밋 %s</p>" % (esc(_종류_글(x["종류"])), esc(x["경로"]), esc(sha))]
     안내 = ""
     if x["카드됨"]:
         file, title, 상태 = x["카드됨"]
@@ -5069,9 +5313,9 @@ def render_improve(item, 결과, qs, 까닭, 쓰기=None):
     줄들 = group_improvements(항목, "최근" if v("sort") == "최근" else "되풀이")
     실행수 = len({(x["카드"], x["커밋"] or x["경로"]) for x in 항목})
     parts.append('<style>%s</style><div class="개선"><div class="본">' % _개선_CSS)
-    parts.append('<header class="머리"><a href="/p/%s/board.html">%s</a><span aria-hidden="true">/</span><h1>개선 거리</h1>'
+    parts.append('<header class="머리"><a href="/p/%s/board.html">%s</a><span aria-hidden="true">/</span><h1>%s</h1>'
                  '<span class="작은">%d 실행에서 모은 지적 %d건 → 같은 지적끼리 묶어 %d줄</span></header>'
-                 % (urllib.parse.quote(name, safe=""), esc(name), 실행수, len(항목), len(줄들)))
+                 % (urllib.parse.quote(name, safe=""), esc(name), esc(화면이름["improve"]), 실행수, len(항목), len(줄들)))
     읽음 = ["이력을 읽지 못함" if 결과["이력오류"] else "이력 소각 커밋 %d건" % 결과["소각수"]]
     읽음 += ["신호 폴더 %s %s" % (p, "있음" if ok else "없음") for p, ok in 결과["신호"]]
     상태글, 원격까닭 = 결과["원격"]
@@ -5081,7 +5325,7 @@ def render_improve(item, 결과, qs, 까닭, 쓰기=None):
         parts.append('<p class="작은">%s</p>' % esc(결과["이력오류"]))
     if 결과.get("작업목록오류"):
         parts.append('<p class="작은">%s</p>' % esc(결과["작업목록오류"]))
-    탭들 = "".join('<a href="%s"%s>%s %d</a>' % (주소(k=k, g=None, pg=None), ' class="on"' if v("k") == k else "", esc(이름), n)
+    탭들 = "".join('<a href="%s"%s>%s %d</a>' % (주소(k=k, g=None, pg=None), ' class="on"' if v("k") == k else "", esc(_종류_글(이름)), n)
                   for 이름, k, n in 탭_개수(전체, qs))
     숨은 = "".join('<input type="hidden" name="%s" value="%s">' % (k, esc(v(k), quote=True)) for k in ("c", "st", "k", "from", "to") if v(k))
     parts.append('<div class="줄머리"><div class="탭" role="tablist" aria-label="종류">%s</div>'
@@ -5092,8 +5336,8 @@ def render_improve(item, 결과, qs, 까닭, 쓰기=None):
                     "" if v("sort") == "최근" else " selected", " selected" if v("sort") == "최근" else ""))
     골라 = "".join('<option value="%s">%s</option>' % (esc(n, quote=True), esc(n)) for n in 쓰기.get("프로젝트들") or [name])
     parts.append('<form method="post" action="/p/%s/make-card" id="고르기" class="목록"><div class="도구">'
-                 '<label>제목 <input type="text" name="title"></label> <label>짧은 이름 <input type="text" name="slug"></label> '
-                 '<label>둘 프로젝트 <select name="target"><option value="">처음 값(항목이 나온 프로젝트)</option>%s</select></label> '
+                 '<label>제목 <input type="text" name="title"></label> <label>파일 이름 <input type="text" name="slug"></label> '
+                 '<label>만들 프로젝트 <select name="target"><option value="">처음 값(항목이 나온 프로젝트)</option>%s</select></label> '
                  '<button type="submit" class="주">고른 것으로 카드 만들기</button></div>' % (urllib.parse.quote(name, safe=""), 골라))
     고른줄 = None
     if 까닭:
@@ -5116,7 +5360,7 @@ def render_improve(item, 결과, qs, 까닭, 쓰기=None):
             이 = 이어짐.get(r["열쇠"])
             링크 = ('<a href="/p/%s/%s">%s(%s)</a>' % (urllib.parse.quote(이.get("카드됨곳") or name, safe=""), urllib.parse.quote(이["카드됨"][0], safe=""),
                                                     esc(이["카드됨"][1]), esc(이["카드됨"][2]))) if 이 else "카드 아님"
-            배지 = "".join('<span class="배지 %s">%s</span>' % (_종류_배지.get(k, "bg-gray"), esc(k)) for k in r["종류들"])
+            배지 = "".join('<span class="배지 %s">%s</span>' % (_종류_배지.get(k, "bg-gray"), esc(_종류_글(k))) for k in r["종류들"])
             parts.append('<div class="줄%s">%s<div class="줄몸"><a class="줄제목" href="%s">%s</a><div class="줄메타">%s<span>%s</span><span>· 마지막 %s</span></div></div>'
                          '<span class="횟수">×%d</span><span class="이어짐">%s</span></div>'
                          % (" 고름" if r is 고른줄 else "", 칸, 주소(g=r["열쇠"], pg=pg if pg > 1 else None), esc(r["제목"].splitlines()[0] if r["제목"] else ""),
@@ -5135,8 +5379,8 @@ def render_improve(item, 결과, qs, 까닭, 쓰기=None):
                 _분초(t["끝"][0]), t["끝"][1], "{:,.0f}".format(t["끝"][2])) for t in 줄))
     못 = len(결과["못읽음"]) + len(결과["기록못찾음"])
     if 못:
-        parts.append('<details class="못읽음"><summary>읽지 못한 산출물 %d — 접어 둠</summary><ul>%s%s</ul></details>' % (
-            못, "".join("<li>%s (커밋 %s) — %s</li>" % (esc(p), esc(c[:7] or "없음"), esc(w)) for p, c, w in 결과["못읽음"]),
+        parts.append('<details class="못읽음"><summary>형식이 맞지 않는 기록 %d — 접어 둠</summary><ul>%s%s</ul></details>' % (
+            못, "".join("<li>%s (커밋 %s) — %s</li>" % (esc(p), esc(c[:7] or "없음"), esc(_종류_글(w))) for p, c, w in 결과["못읽음"]),
             "".join("<li>기록 못 찾음 — 카드 %s (커밋 %s)</li>" % (esc(c), esc(s[:7])) for c, s in 결과["기록못찾음"])))
     parts.append("</div>")
     if 고른줄:
@@ -5148,7 +5392,7 @@ def render_improve(item, 결과, qs, 까닭, 쓰기=None):
             for c, xs in 카드별.items())
         상자 = ('<aside class="자세히상자" aria-label="고른 줄 자세히"><span class="작은">고른 줄</span><h2>%s</h2>'
                '<div>%s · 카드 %d곳에서 %d번</div><ol>%s</ol>' % (
-                   esc(고른줄["제목"].splitlines()[0] if 고른줄["제목"] else ""), esc(" · ".join(고른줄["종류들"])), 고른줄["횟수"], len(고른줄["낱낱"]), 실행))
+                   esc(고른줄["제목"].splitlines()[0] if 고른줄["제목"] else ""), esc(" · ".join(_종류_글(k) for k in 고른줄["종류들"])), 고른줄["횟수"], len(고른줄["낱낱"]), 실행))
         비 = 비슷한_카드(전체, 고른줄, name)
         if 비:
             file, title, 상태 = 비["카드"]
@@ -5162,7 +5406,7 @@ def render_improve(item, 결과, qs, 까닭, 쓰기=None):
         parts.append(상자 + "</aside>")
     parts.append("</div>")
     틀 = FILE_TEMPLATE.replace("<h1>%(name)s</h1>\n", "", 1)
-    return 틀 % {"name": "개선 거리 — " + esc(name), "body": "\n".join(parts)}
+    return 틀 % {"name": 화면이름["improve"] + " — " + esc(name), "body": "\n".join(parts)}
 
 
 def 항목_열쇠(x):
@@ -5220,7 +5464,7 @@ def 쓰기_허락(보낸쪽, 머리, 자리):
     """쓰기 요청(POST)을 받아도 되는가 — (받음, 까닭). 보낸 쪽이 이 기계이고 `Host`·`Origin` 이 이 보드 자리이며
     `Sec-Fetch-Site` 가 있으면 `same-origin` 일 때만. 보드는 127.0.0.1 에만 묶이므로 보낸 쪽 검사는 다른 기계를,
     `Origin`·`Host` 검사는 이 기계 브라우저에서 연 다른 사이트 화면(과 DNS 재결합)을 막는다."""
-    글 = "이 기계의 보드 화면에서 보낸 요청만 받는다"
+    글 = "이 기기의 보드 화면에서 보낸 요청만 받는다"
     hosts = {"127.0.0.1:%d" % 자리, "localhost:%d" % 자리}
     if 보낸쪽 != "127.0.0.1":
         return False, "%s — 보낸 쪽 %s" % (글, 보낸쪽)
@@ -5302,7 +5546,7 @@ def 카드_입력_검사(item, 항목들, form, items, 오늘):
         까닭.append("제목이 비었다")
     slug = g("slug")
     if not re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", slug):
-        까닭.append("짧은 이름은 영문 소문자·숫자·붙임표만")
+        까닭.append("파일 이름은 영문 소문자·숫자·붙임표만")
     이름 = 처음_둘프로젝트(고른, item["name"], [p["name"] for p in items], g("target"))
     대상 = next((p for p in items if p["name"] == 이름), None)
     if 대상 is None:
@@ -5473,11 +5717,11 @@ def _카드만들기_처리(서버, item, items, form):
         r = 카드_올리기(대상["path"], 파일, 글)
         줄 = "카드를 만들었다 — %s/%s" % (대상["name"], 파일)
         if r["결과"] == "올림":
-            줄 += " · 원격 기준 가지에 올림(커밋 %s)" % r["커밋"][:7]
+            줄 += " · 원격 저장소에 올림(커밋 %s)" % r["커밋"][:7]
         elif r["결과"] == "원격 없음":
             줄 += " · 원격 없음 — 커밋하지 않았다"
         else:
-            줄 += " · 올리지 못함 — %s(카드는 이 기계에 있다)" % r["까닭"]
+            줄 += " · 올리지 못함 — %s(카드는 이 기기에 있다)" % r["까닭"]
         서버._그리기(improve_page(item, {}, items, {"결과줄": 줄}))
     except Exception as e:                              # noqa: BLE001
         서버.send_error(500, "Internal Error", "카드를 만들다 실패 — %s" % (str(e) or type(e).__name__))
@@ -5538,11 +5782,11 @@ def _잇기_처리(서버, item, items, form):
         r = 카드_올리기(대상["path"], 파일, 잇기=줄들)
         줄 = "카드에 이었다 — %s/%s" % (대상["name"], 파일)
         if r["결과"] == "올림":
-            줄 += " · 원격 기준 가지에 올림(커밋 %s)" % r["커밋"][:7] + (" · 원격 끝에만 더했다" if 옛 is None else "")
+            줄 += " · 원격 저장소에 올림(커밋 %s)" % r["커밋"][:7] + (" · 원격 끝에만 더했다" if 옛 is None else "")
         elif r["결과"] == "원격 없음":
             줄 += " · 원격 없음 — 커밋하지 않았다"
         else:
-            줄 += " · 올리지 못함 — %s(%s)" % (r["까닭"], "이 기계 파일에는 더했다" if 옛 is not None else "이 기계에는 파일이 없다")
+            줄 += " · 올리지 못함 — %s(%s)" % (r["까닭"], "이 기기 파일에는 더했다" if 옛 is not None else "이 기기에는 파일이 없다")
         서버._그리기(improve_page(item, {}, items, {"결과줄": 줄}))
     except Exception as e:                              # noqa: BLE001
         서버.send_error(500, "Internal Error", "카드에 잇다 실패 — %s" % (str(e) or type(e).__name__))
@@ -5554,7 +5798,7 @@ def _승격_처리(서버, item, items, form):
         return (form.get(k) or [""])[0]
 
     def 보이기(줄, 상태=200):
-        본문 = '<p>%s</p><p><a href="/p/%s/board.html">보드로</a></p>' % (html.escape(줄), urllib.parse.quote(item["name"], safe=""))
+        본문 = '<p>%s</p><p><a href="/p/%s/board.html">← %s</a></p>' % (html.escape(줄), urllib.parse.quote(item["name"], safe=""), html.escape(화면이름["board"]))
         서버._그리기(FILE_TEMPLATE % {"name": "대기로 올리기", "body": 본문}, 상태)
     try:
         파일 = g("card")
@@ -5566,7 +5810,7 @@ def _승격_처리(서버, item, items, form):
             with open(경로, encoding="utf-8", newline="") as f:
                 옛 = f.read()
         except OSError:
-            보이기("카드 파일이 이 기계에 없다 — %s" % 파일)
+            보이기("카드 파일이 이 기기에 없다 — %s" % 파일)
             return
         fm = remote_front_matter(옛) or {}
         if fm.get("상태") != "아이디어" or fm.get("시나리오"):
@@ -5589,16 +5833,16 @@ def _승격_처리(서버, item, items, form):
                     f.write(옛)
             except OSError:
                 pass
-            줄 = ("올리지 않았다 — 원격 끝에서는 이미 %s(이 기계 파일은 그대로 아이디어)" % r["까닭"] if r["결과"] == "이미 아이디어 아님"
-                  else "올리지 않았다 — %s(이 기계 파일은 그대로 아이디어)" % r["까닭"])
+            줄 = ("올리지 않았다 — 원격 끝에서는 이미 %s(이 기기 파일은 그대로 아이디어)" % r["까닭"] if r["결과"] == "이미 아이디어 아님"
+                  else "올리지 않았다 — %s(이 기기 파일은 그대로 아이디어)" % r["까닭"])
         else:
             줄 = "%s 상태 대기" % 파일
             if r["결과"] == "올림":
-                줄 += " · 원격 기준 가지에 올림(커밋 %s)" % r["커밋"][:7]
+                줄 += " · 원격 저장소에 올림(커밋 %s)" % r["커밋"][:7]
             elif r["결과"] == "원격 없음":
                 줄 += " · 원격 없음 — 커밋하지 않았다"
             else:
-                줄 += " · 올리지 못함 — %s(이 기계 파일은 대기로 바뀌어 있다)" % r["까닭"]
+                줄 += " · 올리지 못함 — %s(이 기기 파일은 대기로 바뀌어 있다)" % r["까닭"]
         보이기(줄)
     except Exception as e:                              # noqa: BLE001
         서버.send_error(500, "Internal Error", "대기로 올리다 실패 — %s" % (str(e) or type(e).__name__))
@@ -5664,9 +5908,9 @@ class 보드서버(작업파일서버):
         with _쓰기_잠금:                                 # 쓰기는 한 번에 하나 — 검사는 잠금 밖, 읽기는 잠금과 무관
             쓰기_길[urllib.parse.unquote(m.group(2))](self, item, items, urllib.parse.parse_qs(body, keep_blank_values=True))
 
-    def _plan_문서(self, item, name):
-        """`docs/plan/<name>` 을 카드 본문처럼 그려 낸다. 이름에 `/`·`\\`·`..` 이 들거나 .md 가 아니거나 파일이 없으면 404 — 폴더 밖 글은 나오지 않는다."""
-        plan = os.path.realpath(os.path.join(item["path"], "docs", "plan"))
+    def _plan_문서(self, item, name, 폴더="plan"):
+        """`docs/<폴더>/<name>` 을 카드 본문처럼 그려 낸다(폴더는 plan 또는 todo). 이름에 `/`·`\\`·`..` 이 들거나 .md 가 아니거나 파일이 없으면 404 — 폴더 밖 글은 나오지 않는다."""
+        plan = os.path.realpath(os.path.join(item["path"], "docs", 폴더))
         path = os.path.realpath(os.path.join(plan, name))
         if (not name.endswith(".md") or any(x in name for x in ("/", "\\")) or ".." in name
                 or os.path.dirname(path) != plan or not os.path.isfile(path)):
@@ -5702,12 +5946,19 @@ class 보드서버(작업파일서버):
             else:
                 self._그리기(render_search(qs, 결과, 까닭, 걸린, [p["name"] for p in items]))
             return
+        if path == "/cards":
+            보기 = (urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("보기") or [""])[0]
+            if 보기 not in 카드_보기:
+                self._그리기(render_cards(보기, [], ["보기는 진행·대기·병합·멈춤 중 하나"]), status=404)
+                return
+            rows = [project_row(p) for p in items]
+            병합줄, 모름 = _이번주_병합(items, dt.date.today()) if 보기 == "병합" else (None, 0)
+            덧 = ["%s: 못 읽음 — %s" % (r["name"], r["까닭"]) for r in rows if r["까닭"]] + (["원격 모름 %d곳" % 모름] if 병합줄 is not None and 모름 else [])
+            self._그리기(render_cards(보기, 카드_목록(rows, 보기, 병합줄, dt.datetime.now()), 덧), 틀=(items, rows, my_turns(rows, all_turns(items))))
+            return
         if path == "/signals":
             qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
-            g = lambda k: (qs.get(k) or [""])[0].strip()          # noqa: E731
-            if g("period") or not (g("from") or g("to")):          # period 가 이기고, 아무것도 없으면 이번 주 — 읽기에는 날짜로 풀어 넘겨 캐시 열쇠에 날짜가 든다
-                qs["period"] = [g("period") or "week"]
-                qs["from"], qs["to"] = ([x] for x in signals_기간(g("period"), "", "", dt.date.today())[:2])
+            qs = _비용품질_인자(qs)                                  # period 가 이기고, 아무것도 없으면 이번 주 — 읽기에는 날짜로 풀어 넘겨 캐시 열쇠에 날짜가 든다
             결과, 까닭 = _잠깐저장("signals", items, qs, lambda: read_signals(items, qs))
             self._그리기(render_signals(qs, 결과, 까닭))
             return
@@ -5741,19 +5992,26 @@ class 보드서버(작업파일서버):
                 self.send_error(500, "Internal Error", str(e))
                 return
             turns = [{**t, "열어 볼 곳": _서버_고리(t["열어 볼 곳"])} for t in _알림결과(item["path"], turns)]
+            qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            반려된, 까닭 = None, ""
+            if (qs.get("반려") or [""])[0] == "1":              # 반려 칩 — 커밋 이력의 반려 판정이 있었던 카드만(검색의 반려 거르기와 같은 읽기)
+                try:
+                    커밋 = _커밋들(item["path"])
+                    반려된 = {c["file"] for c in cards if any(x[3] and os.path.splitext(c["file"])[0] in x[2] for x in 커밋)}
+                except Exception:                              # noqa: BLE001
+                    까닭 = "반려 이력을 읽지 못해 거르지 않았다"
             page = render_html(cards, item["name"], 10, scenarios, turns,
                                os.path.join(item["path"], "docs", "plan"),
                                경보_알림결과(item["path"], stalled_alarms(item, cards, REMOTE.get(os.path.abspath(item["path"])))),
-                               단추=True)
-            qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
-            feed = _피드_구역([item], [{"까닭": "", "카드": cards}], qs, item["name"])
+                               단추=True, 거르개={"qs": qs, "반려된": 반려된, "까닭": 까닭})
+            feed = _피드_구역([item], [{"까닭": "", "카드": cards}], qs, item["name"], 폼=False)
             전체 = [project_row(p) for p in items]                    # 첫 화면에서 옮겨 온 것 — 이 프로젝트의 칸별 수, 보는 목록 전체의 기계 현황
             행 = 전체[items.index(item)]
             시작, 끝, 까닭 = timeline_period(qs, dt.date.today())
             기계 = render_machines(read_machines(items, 전체, 시작, 끝, dt.datetime.now()), 시작, 끝, 까닭)
             줄 = ('<p class="meta">%s · 사람 차례 %d · 마지막 움직임 %s</p>'
                  % (html.escape(" · ".join("%s %d" % (c, n) for c, n in 행["수"].items())), 행["차례 수"], html.escape(행["마지막 움직임"])))
-            page = page.replace("</body>", '<details class="extra"><summary>칸별 수 · 기계 현황 · 최근 활동</summary>%s</details>' % (줄 + 기계 + feed) + "</body>", 1)
+            page = page.replace("</body>", '<details class="extra"><summary>칸별 수 · 기기 현황 · 최근 활동</summary>%s</details>' % (줄 + 기계 + feed) + "</body>", 1)
             self._그리기(page)
             return
         if sub == "improve":
@@ -5762,6 +6020,9 @@ class 보드서버(작업파일서버):
         card_file = urllib.parse.unquote(sub)
         if card_file.startswith("plan/"):                          # 끝 보고·시나리오 문서 — `docs/plan/` 안의 .md 만, 카드 본문처럼
             self._plan_문서(item, card_file[len("plan/"):])
+            return
+        if card_file.startswith("todo/"):                          # 할 일 카드 — `docs/todo/` 안의 .md 만
+            self._plan_문서(item, card_file[len("todo/"):], "todo")
             return
         if card_file.endswith(".md") and "/" not in card_file:     # 카드 고리 — 상세 화면. 폴더 밖 주소는 아래로 간다
             try:
@@ -5793,7 +6054,7 @@ def serve(backlog=None, project=None, port=0):
     handler = type("보드서버", (보드서버,), {"extra": extra})
     try:
         # 요청마다 스레드 — 아무것도 안 보내는 연결이 서버를 붙잡지 않는다. 시험이 TCPServer 를 바꿔치기하므로 호출 때 만든다.
-        서버클래스 = type("스레드서버", (socketserver.ThreadingMixIn, socketserver.TCPServer), {"daemon_threads": True})
+        서버클래스 = type("스레드서버", (socketserver.ThreadingMixIn, socketserver.TCPServer), {"daemon_threads": True, "request_queue_size": 64})   # 기본 5 는 동시 요청 여섯에 연결이 끊긴다
         httpd = 서버클래스(("127.0.0.1", port), handler, bind_and_activate=False)
         httpd.allow_reuse_address = True    # 방금 내린 서버의 닫힌 연결(TIME_WAIT)이 남아도 같은 자리에 다시 묶인다
         try:
@@ -5865,13 +6126,21 @@ def _launchctl(args):
         return 1, str(e)
 
 
+def _상주_PATH():
+    """등록 파일에 적을 PATH — 켜는 순간의 PATH 에 지금 파이썬의 폴더가 빠져 있으면 앞에 더한다. launchd 의 기본 PATH 는 gh 가 있는 폴더를 담지 않는다."""
+    경로 = os.environ.get("PATH") or os.defpath
+    폴더 = os.path.dirname(sys.executable)
+    return 경로 if 폴더 in 경로.split(os.pathsep) else 폴더 + os.pathsep + 경로
+
+
 def 상주_켜기():
     """로그인 항목 파일 하나를 쓰고 등록한다 — 지금 이 board.py 를 가리킨다. 다시 켜면 경로를 덮어쓴다."""
     path = os.path.join(LAUNCH_DIR, LAUNCH_LABEL + ".plist")
     os.makedirs(LAUNCH_DIR, exist_ok=True)
     with open(path, "wb") as f:
         plistlib.dump({"Label": LAUNCH_LABEL, "ProgramArguments": [sys.executable, os.path.abspath(__file__), "--상주"],
-                       "RunAtLoad": True, "KeepAlive": True}, f)
+                       "RunAtLoad": True, "KeepAlive": True,
+                       "EnvironmentVariables": {"PATH": _상주_PATH()}}, f)
     domain = "gui/%d" % os.getuid()
     _launchctl(["bootout", "%s/%s" % (domain, LAUNCH_LABEL)])      # 이미 있으면 내린다 — 없어서 실패해도 무방
     rc, err = _launchctl(["bootstrap", domain, path])
