@@ -146,12 +146,18 @@ def read_cards(project_path):
 
 
 def _ready(card, cards, lists=None):
-    """앞선 카드(`선행:` 의 요소 번호)가 같은 시나리오 안에서 모두 완료인가.
+    """앞선 카드가 모두 완료인가. 묶인 카드는 `선행:` 의 요소 번호를 같은 시나리오 안에서, 시나리오 밖 카드는 카드 이름으로 찾는다.
 
     lists = {시나리오 번호: 「이어지는 이슈」 표의 카드 이름 집합 또는 None}. 표가 있으면 표 밖 카드(회고 카드)는 선행을 막지 않는다.
     """
     raw = card["선행"].strip()
     if raw in ("", "—", "-"):
+        return True
+    if not _bound(card):                              # 시나리오 밖 카드: 항목은 카드 이름(파일 이름에서 `.md` 뺀 것)
+        for name in (e.strip() for e in raw.split(",") if e.strip()):
+            same = [c for c in cards if c["file"][:-3] == name]
+            if not same or any(c["상태"] != "완료" for c in same):
+                return False
         return True
     names = (lists or {}).get(card["시나리오"])
     for el in (e.strip() for e in raw.split(",") if e.strip()):

@@ -1864,6 +1864,7 @@ def _보는목록(extra=None):
 # 화면 요청은 그 실이 메모리에 둔 그림(`REMOTE`)만 쓴다. 작업 사본의 파일·색인·참조는 건드리지 않는다.
 REMOTE_EVERY = 60          # 원격바퀴의 주기(초)
 REMOTE_GIT_TIMEOUT = 20    # 원격 git 호출 한 번의 상한(초) — 러너 `CARD_GIT_TIMEOUT` 과 같다
+REMOTE_FETCH_TIMEOUT = 90  # 읽기(`read_remote`)의 `fetch` 한 줄만의 상한(초). 큰 저장소는 20초를 넘긴다. 쓰기 경로는 20 그대로
 CARD_PUSH_DIR = os.path.expanduser("~/.stop-loop/card-push")   # 러너가 올리기 결과를 쓰는 폴더. 보드는 읽기만 한다
 REMOTE = {}                # {프로젝트 절대 경로: 그림}
 
@@ -1916,13 +1917,14 @@ def _토큰(account):
     return (res.stdout.strip() or None) if res.returncode == 0 else None
 
 
-def _원격_git(project, *args, env=None):
-    """원격 읽기가 git 을 부르는 유일한 자리. 묻는 창을 띄우지 않고, 시간 넘김·실행 불가도 실패한 결과로 돌려준다."""
+def _원격_git(project, *args, env=None, timeout=None):
+    """보드가 원격 git 을 부르는 자리(읽기와 카드 올리기). 묻는 창을 띄우지 않고, 시간 넘김·실행 불가도 실패한 결과로 돌려준다.
+    `timeout` 이 없으면 REMOTE_GIT_TIMEOUT."""
     e = dict(os.environ if env is None else env)
     e["GIT_TERMINAL_PROMPT"] = "0"
     try:
         return subprocess.run(["git", *args], cwd=project, env=e, capture_output=True, encoding="utf-8",
-                              errors="replace", timeout=REMOTE_GIT_TIMEOUT)
+                              errors="replace", timeout=REMOTE_GIT_TIMEOUT if timeout is None else timeout)
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(args, 124, "", "시간 초과")
     except OSError as err:
@@ -1948,7 +1950,7 @@ def _그림_없음():
 
 
 def _그림_실패(why):
-    return {"없음": False, "때": None, "카드": {}, "오류": why}
+    return {"없음": False, "때": None, "카드": {}, "오류": why, "시도": dt.datetime.now()}
 
 
 def read_remote(project):
@@ -1986,7 +1988,8 @@ def read_remote(project):
         base = next((x for x in ("develop", "main", "master") if x in heads), None)
         if base is None:
             return _그림_실패("원격에 기준 가지가 없다")
-        r = _원격_git(project, "fetch", "-q", "--no-write-fetch-head", url, "refs/heads/" + base, env=env)
+        r = _원격_git(project, "fetch", "-q", "--no-write-fetch-head", url, "refs/heads/" + base, env=env,
+                     timeout=REMOTE_FETCH_TIMEOUT)
         if r.returncode != 0:
             return _그림_실패(_끝줄(r))
         tip = heads[base]
@@ -2029,7 +2032,7 @@ def refresh_remote(items):
             pic = _그림_실패(str(e) or type(e).__name__)
         old = REMOTE.get(key)
         if pic["오류"] and old and not old["없음"]:
-            pic = {**old, "오류": pic["오류"]}
+            pic = {**old, "오류": pic["오류"], "시도": pic.get("시도")}
         REMOTE[key] = pic
 
 
@@ -2147,6 +2150,9 @@ def _원격_문구(item, cards):
             out = ["원격 저장소를 아직 못 읽음 — " + pic["오류"], 읽음]
         else:
             out = ["원격 저장소를 아직 못 읽음 — 이 기기 것만 — " + pic["오류"]]
+            시도 = pic.get("시도")
+            if 시도:
+                out.append("읽은 적 없음 · 마지막 시도 " + 시도.strftime("%H:%M" if 시도.date() == dt.date.today() else "%Y-%m-%d %H:%M"))
     밀림, 거부 = _올리기_결과(item, cards)
     if 밀림:
         out.append("올리지 못한 고침 있음 (%d장)" % 밀림)
@@ -2563,7 +2569,9 @@ def render_shell(items, rows, turns, path):
         때들 = [t for t in 때들 if t]
         가장 = min(때들) if 때들 else None
         원격 = ["원격 읽음 %s" % (가장.strftime("%H:%M" if 가장.date() == dt.date.today() else "%Y-%m-%d %H:%M") if 가장 else "—")]
-        원격 += ["%s · %s" % (i["name"], x) for i, r in zip(items, rows) for x in r.get("원격", []) if not x.startswith("원격 읽음")]
+        # 못 읽은 프로젝트는 자기 마지막 읽은 시각(「원격 읽음」)을 걸러내지 않는다 — 위의 전체 시각이 다른 프로젝트 것이어도 가려지지 않게
+        원격 += ["%s · %s" % (i["name"], x) for i, r in zip(items, rows) for x in r.get("원격", [])
+               if not x.startswith("원격 읽음") or any(y.startswith("원격 저장소를 아직 못 읽음") for y in r.get("원격", []))]
         상자 = ["러너 %s / 상한 %d" % (러너, max_parallel_read())] + 원격 + ["stop-loop %s" % (plugin_version_read() or "—")]
         return ((_사이드바_머리 % esc(이기계 or "—")) + '<div class="grp">%s</div>' % "".join(링크)
                 + '<div class="grp"><span class="gh">프로젝트</span>%s<span class="gh">숫자는 진행 중 · 막힘</span></div>' % ("".join(프로젝트) or '<span class="nolink">보는 프로젝트 없음</span>')
