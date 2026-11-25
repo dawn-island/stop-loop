@@ -92,6 +92,13 @@ is in the files is what happened.
    「8. 워크플로우 몫」 as a table of five columns: 대상 파일 · 증상 · 되풀이 횟수
    · 제안 · 판. Write 「미기록」 in 판. Never write project code, paths or business
    terms there — the section goes into the PR body.
+7. **회고 제안 열쇠** — give every proposal row in sections 3, 4, 7 and 8 a key
+   `R-<n>` (numbered across the whole retro). Never write the key inside a
+   table row (표 줄 안에 쓰지 않는다): the board and the improvement pool group rows by their text.
+   Write it on the one line right under that section's first table, in table
+   order: `열쇠: R-1 · R-2`. A card or record made from a proposal carries
+   `회고제안: <retro card name> R-<n>` in its front matter. Write the key only
+   when the section has proposal rows; never put the card name in section 8.
 
 # Output
 

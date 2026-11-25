@@ -20,6 +20,7 @@
 머리말은 파일 맨 앞의 `---` 두 줄 사이에 있고, `열쇠: 값` 형식이다. YAML 라이브러리를
 쓰지 않는 이유는 표준 라이브러리만으로 돌리기 위해서다(`bin/ledger.py` 와 같은 규율).
 """
+import collections
 import copy
 import datetime as dt
 import glob
@@ -28,6 +29,7 @@ import html
 import http.client
 import http.server
 import json
+import math
 import os
 import plistlib
 import re
@@ -137,8 +139,8 @@ def elapsed(시작, 누적="", 상태="진행"):
 
 # 화면 이름 표 — 사이드바·제목·명령 팔레트·돌아가기 고리·빈 문구가 모두 여기서 읽는다(ISSUE-ui-11-terms-2026-11-23).
 # 그리는 함수가 부를 때마다 읽는다. 주소(`/`·`/timeline`·`/signals`)와 읽는 열쇠는 이 표와 무관하다.
-화면이름 = {"home": "홈", "search": "검색", "timeline": "타임라인", "usage": "사용량·품질", "improve": "개선 후보",
-         "todo": "내 할 일", "board": "보드"}
+화면이름 = {"home": "홈", "search": "검색", "timeline": "타임라인", "usage": "사용량·품질", "retro": "워크플로우 회고", "improve": "개선 후보",
+         "todo": "내 할 일", "board": "보드", "cards": "카드 목록", "features": "기능 진척", "graph": "연관 지도", "scenario": "시나리오 상세"}
 # 개선 종류의 보이는 글 — 산출물 절 제목을 읽는 열쇠(`IMPROVE_KINDS`)와 탭 주소 `k=` 값은 옛 글자 그대로이고 화면에 낼 때만 거친다.
 개선_보임 = {"선택 사항": "권고", "이연 후보": "미룬 일", "사람 결정 미결": "결정 대기", "되풀이 신호": "반복 지적", "회고 몫": "회고 제안"}
 
@@ -507,6 +509,32 @@ def criteria_rows(cards, s):
                      "모두 완료": bool(have) and all(c["상태"] == "완료" for c in have),
                      "결과": None if end is None else end.get(no, "완료 보고서에 없음")})
     return rows
+
+
+_칸_클래스 = {"완료": "done", "진행": "doing", "보류": "hold", "멈춤": "stop", "아이디어": "idea", "없음": "none"}
+_칸_모양 = {"완료": "완료", "진행": "진행", "검토": "진행", "대기": "진행", "아이디어": "아이디어", "카드 없음": "없음"}
+
+
+def 요소_칸(cards, s):
+    """시나리오 하나의 요소 칸 — 「(카드 아님)」·「없어짐」을 뺀 요소마다 하나, `E-` 숫자 순서.
+
+    상태는 `scenario_progress` 를 그 요소 하나만 든 시나리오로 불러 얻는다(요소 상태 규칙을 한 곳에만 둔다).
+    모양은 완료·진행(진행·검토·대기)·보류·멈춤(러너가 멈춘 보류)·아이디어·없음. 읽지 못한 시나리오는 빈 목록."""
+    if s["오류"]:
+        return []
+    mine = [c for c in cards if c["시나리오"] == s["번호"]]
+    skip = set(s.get("카드아님", ())) | set(s.get("없어짐", ()))
+    out = []
+    for e in sorted((x for x in s["요소"] if x not in skip), key=lambda x: int(x[2:])):
+        p = scenario_progress(cards, {**s, "요소": {e}})
+        상태 = "카드 없음" if p["카드 없음"] else next(k for k, n in p["수"].items() if n)
+        have = sorted((c for c in mine if e in c["요소"]), key=lambda c: c["file"])
+        정한 = [c for c in have if 상태 == "완료" or c["상태"] == 상태]
+        모양 = "멈춤" if 상태 == "보류" and any(러너가_멈춤(c) for c in have) else "보류" if 상태 == "보류" else _칸_모양[상태]
+        까닭 = next((c["멈춘이유"].strip() for c in 정한 if c["멈춘이유"].strip()), "까닭 없음") if 상태 == "보류" else ""
+        out.append({"요소": e, "이름": s["요소이름"].get(e, ""), "상태": 상태, "모양": 모양,
+                    "카드": 정한[0] if 정한 else None, "카드들": have, "까닭": 까닭})
+    return out
 
 
 def waiting_rows(cards, s):
@@ -946,6 +974,9 @@ def 승격_폼(project, c):
             % (urllib.parse.quote(project, safe=""), 물음, html.escape(c["file"], quote=True)))
 
 
+앞면_최대 = 120      # 카드 앞면 아래 줄에 싣는 글자 수 — 넘으면 「실패한 검사 — 자세히」
+
+
 def _한줄(cards, c, 누구, now):
     """멈춘 까닭 → 기다리는 것 → 예상 차이 → 「—」 가운데 첫 번째. (글, 갈래). `누구` = {카드 파일: 사람 차례}."""
     if c["멈춘이유"]:
@@ -976,7 +1007,7 @@ def render_html(cards, project, every=0, scenarios=(), turns=(), plan_dir=None, 
     """프로젝트 보드 화면 한 장(ISSUE-ui-2). `plan_dir` 는 끝 보고를 읽던 옛 시나리오 조각이 빠져 쓰이지 않지만 부르는 곳을 건드리지 않으려고 남긴다.
     칸 안 카드는 `<a class="card">` 바로 뒤에 `<template class="pk">`(엿보기 자료)가 붙는다 — 아래 TEMPLATE 의 스크립트가 이 순서를 안다. 바꿀 때 두 곳을 함께 고친다.
 
-    `거르개` 는 서버 화면(`단추=True`)의 탭·칩이 읽는 `{"qs": parse_qs 결과, "반려된": 파일 이름 집합 또는 None, "까닭": 글}` 이다. 정적 화면은 탭·칩 줄이 없고 거르지 않는다."""
+    `거르개` 는 서버 화면(`단추=True`)의 탭·필터 양식이 읽는 `{"qs": parse_qs 결과, "반려된": 파일 이름 집합 또는 None, "까닭": 글}` 이다. 정적 화면은 탭·필터 줄이 없고 거르지 않는다. 내 할 일 띠는 `turns` 와 `alarms` 를 `my_turns` 로 합쳐 한 줄로 그린다(ISSUE-ui-14)."""
     marks = card_marks(cards, scenarios)
     now = dt.datetime.now()
     esc = html.escape
@@ -990,7 +1021,7 @@ def render_html(cards, project, every=0, scenarios=(), turns=(), plan_dir=None, 
     한줄 = lambda c: _한줄(cards, c, 누구, now)      # noqa: E731
 
     def card(c):
-        stop = bool(c["멈춘이유"]) or c["상태"] == "보류"
+        stop = (bool(c["멈춘이유"]) or c["상태"] == "보류") and c["상태"] not in ("완료", "아이디어")
         here = phase_of(c["단계"])
         if c["상태"] in ("완료", "검토"):
             켜짐, 갈래, 이름 = len(PHASES), " done", c["상태"]
@@ -1000,11 +1031,24 @@ def render_html(cards, project, every=0, scenarios=(), turns=(), plan_dir=None, 
             켜짐, 갈래, 이름 = 0, "", c["상태"]
         pips = '<p class="pips%s" aria-label="%s">%s</p>' % (갈래, esc(이름), '<i class="on"></i>' * 켜짐 + "<i></i>" * (len(PHASES) - 켜짐))
         tag = "%s %s" % (c["시나리오"], ", ".join(c["요소"])) if c["시나리오"] else "시나리오 밖"
-        글, 종류 = 한줄(c)
-        front = ('<a class="card" href="%s"%s><p class="tg"><span>%s</span><span>%s</span></p><h3>%s</h3>%s'
-                 '<p class="ln"><span class="d %s">%s</span><span>%s</span></p></a>'
-                 % (esc(c["file"], quote=True), " data-stop" if stop else "", esc(tag.strip()), esc(c["크기"]), esc(c["title"]),
-                    pips, 종류, esc(글), esc(_기기_글(기계(c)))))
+        if c["상태"] == "완료":                          # 완료: 갱신 날짜 · 기기뿐 — 멈춘이유·예상 대비는 상세에서
+            글, 종류 = c["갱신"] or "—", ""
+        elif c["상태"] == "보류":                        # 보류: 까닭 한 줄 — 「기다리는 것」·예상 대비는 붙지 않는다
+            글, 종류 = c["멈춘이유"] or "까닭 없음 — 적어 주세요", "hold"
+        else:
+            글, 종류 = 한줄(c)
+        if len(글) > 앞면_최대:                          # 명령줄·긴 출력은 앞면에 싣지 않는다 — 카드 전체가 상세로 가는 고리다
+            글 = "실패한 검사 — 자세히"
+        if c["상태"] == "아이디어":                      # 아이디어: 시나리오 표시 · 크기 · 제목뿐
+            pips = 아래 = ""
+        else:
+            if c["상태"] == "보류":                      # 보류: 까닭이 한 줄 전체 폭, 기기는 그 아래 줄
+                아래 = '<p class="ln wide"><span class="d %s">%s</span></p><p class="ln wide">%s</p>' % (종류, esc(글), esc(_기기_글(기계(c))))
+            else:
+                아래 = '<p class="ln"><span class="d %s">%s</span><span>%s</span></p>' % (종류, esc(글), esc(_기기_글(기계(c))))
+        front = ('<a class="card" href="%s"%s><p class="tg"><span>%s</span><span>%s</span></p><h3>%s</h3>%s%s</a>'
+                 % (esc(c["file"], quote=True), " data-stop" if stop else "", esc(tag.strip()), esc(c["크기"]), esc(_취소선_뺌(c["title"])),
+                    pips, 아래))
         # 엿보기 자료 — 앞면에서 빠진 정보
         strip = ""
         if here:
@@ -1029,12 +1073,9 @@ def render_html(cards, project, every=0, scenarios=(), turns=(), plan_dir=None, 
         live = ('<p class="live">%s</p>' % esc(c["마지막줄"])) if c["마지막줄"] else ""
         pk = ('<template class="pk"><h2>%s</h2><p class="bg">%s</p><dl><dt>걸린 시간</dt><dd>%s · 예상 %s</dd><dt>비용</dt><dd>—</dd>'
               '<dt>기다리는 것</dt><dd>%s</dd><dt>고치는 파일</dt><dd>—</dd></dl>%s%s%s%s%s<a class="open" href="%s">상세 열기</a></template>'
-              % (esc(c["title"]), 배지, _분글(actual_minutes(c, now)), _분글(e) if e is not None else "—", esc(기다림),
+              % (esc(_취소선_뺌(c["title"])), 배지, _분글(actual_minutes(c, now)), _분글(e) if e is not None else "—", esc(기다림),
                  strip, meta, src, why, live, esc(c["file"], quote=True)))
         return front + pk
-
-    def 칸_카드(c):
-        return card(c) + (승격_폼(project, c) if 단추 else "")
 
     today = dt.date.today()
     monday = today - dt.timedelta(days=today.weekday())
@@ -1054,34 +1095,38 @@ def render_html(cards, project, every=0, scenarios=(), turns=(), plan_dir=None, 
         if 기계(c) not in ("—", "기기 모름") and 기계(c) not in 기계값:
             기계값.append(기계(c))
     반려된 = 거.get("반려된")
-    켜진 = 단추 and bool(g1("기계") or g1("시나리오") or g1("반려") == "1")
+    켜진 = 단추 and bool(g1("기계") or g1("시나리오") or g1("반려") == "1" or g1("찾기"))
 
     def 맞나(c):
-        return ((not g1("기계") or 기계(c) == g1("기계")) and (not g1("시나리오") or c["시나리오"] == g1("시나리오"))
-                and (g1("반려") != "1" or 반려된 is None or c["file"] in 반려된))
+        return ((not g1("기계") or 기계(c) == g1("기계"))
+                and (not g1("시나리오") or c["시나리오"] == (g1("시나리오") if g1("시나리오") != "시나리오 밖" else ""))
+                and (g1("반려") != "1" or 반려된 is None or c["file"] in 반려된)
+                and (not g1("찾기") or g1("찾기").lower() in c["title"].lower() or g1("찾기").lower() in c["file"].lower()))
     보임 = [c for c in cards if 맞나(c)] if 단추 else cards
 
     cols = ""
     for col in ("아이디어", "대기", "진행", "검토", "완료", "보류"):
         mine = [c for c in 보임 if c["상태"] == col]
         if not mine:
-            cols += '<section class="col fold c-%s"><h2>%s <span>0</span></h2></section>' % (col, col)
+            cols += '<section class="col c-%s"><h2>%s <span>0</span></h2></section>' % (col, col)
             continue
-        shown = "".join(칸_카드(c) for c in mine[:4] if col == "완료") if col == "완료" else "".join(칸_카드(c) for c in mine)
+        shown = "".join(card(c) for c in mine[:4] if col == "완료") if col == "완료" else "".join(card(c) for c in mine)
         if col == "완료" and len(mine) > 4:
             shown += ('<details class="more"><summary>%d장 더 보기 · 이번 주 %d</summary>%s</details>'
-                      % (len(mine) - 4, len([c for c in mine if 이번주(c)]), "".join(칸_카드(c) for c in mine[4:])))
+                      % (len(mine) - 4, len([c for c in mine if 이번주(c)]), "".join(card(c) for c in mine[4:])))
         cols += '<section class="col c-%s"><h2>%s <span>%d</span></h2>%s</section>' % (col, col, len(mine), shown)
 
     def 띠(s):
+        여는 = '<a class="sx" href="plan/%s">' % esc(s["file"], quote=True) if 단추 else '<div class="sx">'
+        닫는 = "</a>" if 단추 else "</div>"
         if s["오류"]:
-            return '<div class="sx"><span class="sid">%s</span><span class="sn">%s</span><span class="why">%s</span></div>' % (
-                esc(s["번호"]), esc(s["이름"]), esc(s["오류"]))
+            return '%s<span class="sid">%s</span><span class="sn">%s</span><span class="why">%s</span>%s' % (
+                여는, esc(s["번호"]), esc(_취소선_뺌(s["이름"])), esc(s["오류"]), 닫는)
         p = scenario_progress(cards, s)
         pct = p["퍼센트"] or 0
-        return ('<div class="sx"><span class="sid">%s</span><span class="sn">%s</span>'
-                '<div class="tr2"><i%s style="width:%d%%"></i></div><span class="sf">%d/%d</span></div>'
-                % (esc(s["번호"]), esc(s["이름"]), ' class="full"' if pct == 100 else "", pct, p["수"]["완료"], p["분모"]))
+        return ('%s<span class="sid">%s</span><span class="sn">%s</span>'
+                '<div class="tr2"><i%s style="width:%d%%"></i></div><span class="sf">%d/%d</span>%s'
+                % (여는, esc(s["번호"]), esc(_취소선_뺌(s["이름"])), ' class="full"' if pct == 100 else "", pct, p["수"]["완료"], p["분모"], 닫는))
 
     strip = '<div class="strip">%s</div>' % ("".join(띠(s) for s in scenarios) or '<p class="meta">시나리오 없음</p>')
     if 단추 and g1("반려") == "1" and 반려된 is None and 거.get("까닭"):
@@ -1092,55 +1137,60 @@ def render_html(cards, project, every=0, scenarios=(), turns=(), plan_dir=None, 
              _분글(actual_minutes(c, now)), esc(_기기_글(기계(c)))] for c in 보임])
     elif 보기 == "시나리오" and 보임:
         번호들 = {s["번호"] for s in scenarios}
-        묶음 = "".join('<section class="sg">%s%s</section>' % (띠(s), "".join(칸_카드(c) for c in 보임 if c["시나리오"] == s["번호"]))
+        묶음 = "".join('<section class="sg">%s%s</section>' % (띠(s), "".join(card(c) for c in 보임 if c["시나리오"] == s["번호"]))
                      for s in scenarios if not g1("시나리오") or s["번호"] == g1("시나리오"))
         낱장 = [c for c in 보임 if c["시나리오"] not in 번호들]
-        cols = 묶음 + ('<section class="sg"><h2>시나리오 밖 카드</h2>%s</section>' % "".join(칸_카드(c) for c in 낱장) if 낱장 else "")
+        cols = 묶음 + ('<section class="sg"><h2>시나리오 밖 카드</h2>%s</section>' % "".join(card(c) for c in 낱장) if 낱장 else "")
         strip = ""
     if 단추 and not 보임 and (켜진 or cards):
-        cols = '<p class="meta lv">%s</p>' % ('필터에 맞는 카드 없음 · <a href="%s">필터 풀기</a>' % esc(_보드_고리(qs, 기계="", 시나리오="", 반려="", 빈칸=""), quote=True)
+        cols = '<p class="meta lv">%s</p>' % ('필터에 맞는 카드 없음 · <a href="%s">필터 풀기</a>' % esc(_보드_고리(qs, 기계="", 시나리오="", 반려="", 찾기=""), quote=True)
                                               if 켜진 else "카드 없음")
         strip = "" if 보기 == "시나리오" else strip
 
-    def turn(t):
+    행 = [{"name": project, "카드": cards, "경보": [{**a, "프로젝트": project, "열어 볼 곳": a["file"]} for a in alarms]}]
+    내것 = my_turns(행, [{**t, "프로젝트": project} for t in turns])      # UI-12 정의 — 미룬 보류는 빠지고 멈춘 카드 경보가 합쳐진다
+
+    def 띠_항목(t):
         why = '<p class="why">알림 못 띄움</p>' if t.get("알림") is False else ""
-        return ('<a class="card" href="%s"><h3>%s</h3><p class="meta">%s · %s · %s · %s</p>%s</a>'
-                % (esc(t["열어 볼 곳"], quote=True), esc(t["제목"]), esc(t["프로젝트"]),
-                   esc(t["종류"]), esc(t["기다리는 것"]), esc(t["생긴 때"]), why))
+        return '<li><a href="%s">%s</a> — %s%s</li>' % (esc(t["열어 볼 곳"], quote=True), esc(t["제목"]), esc(t["기다리는 것"]), why)
 
-    box = ('<h2>%s (%d)</h2>%s' % (esc(화면이름["todo"]), len(turns), "".join(turn(t) for t in turns))
-           if turns else '<h2>%s 없음</h2>' % esc(화면이름["todo"]))
-    def 칩(글, 눌림, 고리):
-        if 고리 is None:
-            return "<span>%s</span>" % esc(글)
-        return '<a href="%s" aria-pressed="%s">%s</a>' % (esc(고리, quote=True), "true" if 눌림 else "false", esc(글))
-
-    def 다음(값들, 지금):
-        """칩을 누를 때 갈 값 — 없음(전체) → 첫 값 → … → 마지막 값 → 없음. 모르는 값이 와 있으면 첫 값으로."""
-        if not 지금 or 지금 not in 값들:
-            return 값들[0] if 값들 else ""
-        return 값들[값들.index(지금) + 1] if 값들.index(지금) + 1 < len(값들) else ""
+    if 내것:
+        box = ('<div class="tb"><h2>%s (%d)</h2>%s%s<details><summary>까닭 보기</summary><ul>%s</ul></details></div>\n' % (
+            esc(화면이름["todo"]), len(내것),
+            "".join('<a href="%s">%s</a>' % (esc(t["열어 볼 곳"], quote=True), esc(t["제목"])) for t in 내것[:NOW_MAX]),
+            "<span>외 %d건</span>" % (len(내것) - NOW_MAX) if len(내것) > NOW_MAX else "",
+            "".join(띠_항목(t) for t in 내것)))
+    else:
+        box = '<div class="tb"><h2>%s 없음</h2></div>\n' % esc(화면이름["todo"])
 
     def 탭(글, 값):
         return '<a role="tab" href="%s" aria-selected="%s">%s</a>' % (esc(_보드_고리(qs, 보기=값), quote=True), "true" if 보기 == (값 or "보드") else "false", 글)
     p = esc(project)
     q = urllib.parse.quote(project, safe="")
+    def 고르개(이름, 글, 값들, 지금, 보임글=lambda v: v):
+        옵션 = '<option value="">전체</option>' + "".join(
+            '<option value="%s"%s>%s</option>' % (esc(v, quote=True), " selected" if v == 지금 else "", esc(보임글(v))) for v in 값들)
+        return '<label>%s <select name="%s" onchange="this.form.submit()">%s</select></label>' % (글, 이름, 옵션)
+
     조작 = ""
     if 단추:
-        조작 = ('<div class="vt" role="tablist" aria-label="보기">%s%s%s</div><div class="chips">%s%s%s%s%s</div>' % (
-            탭("보드", ""), 탭("목록", "목록"), 탭("시나리오", "시나리오"),
-            칩(("기기: " + _기기_글(g1("기계"))) if g1("기계") else "모든 기기", bool(g1("기계")),
-              _보드_고리(qs, 기계=다음(기계값, g1("기계"))) if 기계값 or g1("기계") else None),
-            칩(("시나리오: " + g1("시나리오")) if g1("시나리오") else "시나리오: 전체", bool(g1("시나리오")),
-              _보드_고리(qs, 시나리오=다음(시나리오값, g1("시나리오"))) if 시나리오값 or g1("시나리오") else None),
-            칩("반려 있었던 것", g1("반려") == "1", _보드_고리(qs, 반려="" if g1("반려") == "1" else "1")),
-            칩("빈 칸 숨김", g1("빈칸") != "보임", _보드_고리(qs, 빈칸="보임" if g1("빈칸") != "보임" else "")),
-            '<a href="/p/%s/improve">%s</a>' % (q, esc(화면이름["improve"]))))
+        밖 = "시나리오 밖" if any(not c["시나리오"] for c in cards) or g1("시나리오") == "시나리오 밖" else None
+        모름 = "기기 모름" if any(기계(c) == "기기 모름" for c in cards) or g1("기계") == "기기 모름" else None
+        숨은 = "".join('<input type="hidden" name="%s" value="%s">' % (esc(k, quote=True), esc(v, quote=True))
+                     for k, vs in qs.items() if k not in ("시나리오", "기계", "반려", "찾기", "빈칸") for v in vs)      # 빈칸 은 없어진 인자 — 싣지 않는다
+        조작 = ('<div class="vt" role="tablist" aria-label="보기">%s%s%s</div>'
+              '<form method="get" class="flt" aria-label="필터">%s%s%s%s<input type="search" name="찾기" value="%s" aria-label="이 보드에서 찾기" placeholder="이 보드에서 찾기"></form>%s' % (
+                  탭("보드", ""), 탭("목록", "목록"), 탭("시나리오", "시나리오"),
+                  고르개("시나리오", "시나리오", 시나리오값 + ([밖] if 밖 else []), g1("시나리오")),
+                  고르개("기계", "기기", 기계값 + ([모름] if 모름 else []), g1("기계"), _기기_글),
+                  '<label><input type="checkbox" name="반려" value="1"%s onchange="this.form.submit()">반려 있었던 것만</label>' % (
+                      " checked" if g1("반려") == "1" else ""),
+                  숨은, esc(g1("찾기"), quote=True),
+                  '<a href="/p/%s/improve">%s</a>' % (q, esc(화면이름["improve"]))))
     head = '%s<h1>%s</h1><span class="cnt">시나리오 %d · 카드 %d</span>%s' % (
         '<a href="/">%s</a><span aria-hidden="true">/</span>' % esc(화면이름["home"]) if 단추 else "", p, len(scenarios), len(cards), 조작)
     return _화면들_채우기(TEMPLATE) % {"project": p, "head": head, "cols": cols, "strip": strip,
-                       "mainattr": ' class="all"' if 단추 and g1("빈칸") == "보임" else "",
-                       "turns": render_alarms(alarms, lambda a: a["file"]) + '<div class="turns">%s</div>\n' % box,
+                       "turns": box,
                        "now": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                        "refresh": ('\n<meta http-equiv="refresh" content="%d">' % every) if every else ""}
 
@@ -1152,9 +1202,10 @@ THEME = """:root {
   --blue:#2f5bd3; --orange:#c2410c; --teal:#0f766e; --gray:#8a8f98;
   --pj-0:#7c4dbd; --pj-1:#c0398a; --pj-2:#27337a; --pj-3:#6b7a1f;
   --side:#fbfbfa; --soft:#ececea; --line2:#efefed; --ink2:#333;
+  --ochre:#b08a2e; --ochre-bg:#fbf3dc; --ochre-ink:#6b531a;
   --blue-bg:#eaf0fd; --orange-bg:#fdf0e8; --teal-bg:#e7f4f2; --gray-bg:#f2f2f0; --orange-line:#f1c6ad; --orange-soft:#fffaf6;
   --card:var(--panel); --off:#e3e3e0; --dash:#dcdcd8;
-  --st-아이디어:#b9b4ab; --st-대기:#8aa4c8; --st-진행:#d4a53c; --st-검토:#9a7cc4; --st-보류:#b4553c; --st-완료:#4a8f5c;
+  --st-아이디어:var(--gray); --st-대기:var(--blue); --st-진행:var(--blue); --st-검토:var(--blue); --st-보류:var(--ochre); --st-완료:var(--teal);
   --overlay:rgba(0,0,0,.35); --today:#c0392b;
   --ph-분석:#9db5ef; --ph-설계:#5f84e0; --ph-멈춤:#b0b3b8; --lane-head:#f3f3f1;
   --sans:'Noto Sans KR', system-ui, -apple-system, 'Apple SD Gothic Neo', sans-serif;
@@ -1165,6 +1216,7 @@ THEME = """:root {
   --blue:#8aa4e8; --orange:#e8895f; --teal:#4fb3a8; --gray:#8a8f98;
   --pj-0:#b197e0; --pj-1:#e58bb8; --pj-2:#7a86d6; --pj-3:#a9b552;
   --side:#1b1a18; --soft:#2a2926; --line2:#2a2926; --ink2:#d6d3cd;
+  --ochre:#d1a94a; --ochre-bg:#352d1c; --ochre-ink:#e0c27a;
   --blue-bg:#232b3f; --orange-bg:#3a2a22; --teal-bg:#1f3330; --gray-bg:#2a2926; --orange-line:#6b3f2c; --orange-soft:#2e231d;
   --off:#33312d; --dash:#3a3834;
   --ph-분석:#5a6f9e; --ph-설계:#6f8fdc; --ph-멈춤:#5c5f64; --lane-head:#25241f; } }
@@ -1195,8 +1247,10 @@ nav.side .n.hot { color:var(--orange); font-weight:600; }
 nav.side .pn { flex-grow:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 nav.side .sbox { margin-top:auto; padding:10px; border:1px solid var(--line); border-radius:8px; background:var(--panel);
   font-size:12px; color:var(--dim); display:flex; flex-direction:column; gap:4px; }
-.dot-orange, .dot-blue, .dot-gray, .dot-teal { display:inline-block; width:8px; height:8px; flex-shrink:0; border-radius:var(--r-pill); }
-.dot-orange { background:var(--orange); } .dot-blue { background:var(--blue); } .dot-gray { background:var(--gray); } .dot-teal { background:var(--teal); }
+.dot-orange, .dot-blue, .dot-gray, .dot-teal, .dot-ochre { display:inline-block; width:8px; height:8px; flex-shrink:0; border-radius:var(--r-pill); }
+.dot-orange { background:var(--orange); } .dot-blue { background:var(--blue); } .dot-gray { background:var(--gray); } .dot-teal { background:var(--teal); } .dot-ochre { background:var(--ochre); }
+nav.side .sub { display:flex; flex-direction:column; gap:2px; padding-left:18px; }
+nav.side .sub a { min-height:32px; font-size:13px; }
 .top h1 { margin:0; font-size:22px; font-weight:700; color:var(--fg); }
 .top p { margin:4px 0 0; color:var(--dim); font-size:13px; }
 .tiles { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:12px; margin:24px 0; }
@@ -1220,12 +1274,18 @@ nav.side .sbox { margin-top:auto; padding:10px; border:1px solid var(--line); bo
 .progress .sub { font-size:12px; color:var(--dim); }
 .badge { display:inline-flex; align-items:center; gap:6px; font-size:12px; padding:2px 8px; border-radius:var(--r-pill); white-space:nowrap; }
 .b-orange { background:var(--orange-bg); color:var(--orange); } .b-blue { background:var(--blue-bg); color:var(--blue); }
+.b-ochre { background:var(--ochre-bg); color:var(--ochre-ink); }
 .b-teal { background:var(--teal-bg); color:var(--teal); } .b-gray { background:var(--gray-bg); color:var(--dim); }
 .pbar { display:flex; align-items:center; gap:10px; min-width:160px; }
 .pbar .tr { flex-grow:1; height:6px; border-radius:3px; background:var(--soft); overflow:hidden; }
 .pbar .tr i { display:block; height:6px; background:var(--blue); }
 .pbar .tr i.full { background:var(--teal); } .pbar .tr i.zero { background:var(--gray); }
 .pbar span { font:12px var(--mono); color:var(--dim); }
+.pbar .pb2 { display:flex; flex-grow:1; height:6px; border-radius:3px; background:var(--soft); overflow:hidden; }
+.pb2 .seg { display:block; height:6px; }
+.seg-done { background:var(--teal); } .seg-doing { background:var(--blue); } .seg-hold { background:var(--ochre); }
+.seg-stop { background:var(--orange); } .seg-idea { background:var(--gray); opacity:.5; } .seg-none { background:var(--line); }
+.progress .fl { font-size:12px; }
 .duo { display:flex; flex-wrap:wrap; gap:24px; align-items:flex-start; }
 .duo > .panel { margin:0 0 24px; }
 .duo > .turnp { flex:3 1 520px; } .duo > .feedp { flex:2 1 340px; }
@@ -1387,11 +1447,6 @@ body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.6 var(--sans
 .vt button { min-height:30px; padding:0 12px; border:0; border-radius:6px; background:transparent; font:inherit; font-size:12px; color:var(--dim); }
 .vt a { display:inline-flex; align-items:center; min-height:30px; padding:0 12px; border-radius:6px; font-size:12px; color:var(--dim); }
 .vt button[aria-selected="true"], .vt a[aria-selected="true"] { background:var(--panel); color:var(--fg); font-weight:600; }
-.chips { display:flex; flex-wrap:wrap; gap:6px; margin-left:auto; }
-.chips button, .chips a { min-height:32px; padding:0 12px; border:1px solid var(--line); border-radius:var(--r-pill); background:var(--panel);
-  font:inherit; font-size:12px; color:var(--ink2); display:inline-flex; align-items:center; }
-.chips button[aria-pressed="true"], .chips a[aria-pressed="true"] { border-color:var(--fg); }
-.chips span { min-height:32px; padding:0 12px; border:1px dashed var(--line); border-radius:var(--r-pill); font-size:12px; color:var(--dim); display:inline-flex; align-items:center; }
 .sg { flex:0 0 300px; min-width:0; display:flex; flex-direction:column; gap:8px; }
 .lv { flex:1 1 auto; min-width:0; }
 .note { margin:8px 20px 0; font-size:12px; color:var(--dim); }
@@ -1409,7 +1464,7 @@ body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.6 var(--sans
 #pkb .open { display:inline-flex; align-items:center; min-height:36px; padding:0 14px; border-radius:8px; background:var(--fg); color:var(--panel);
   font-size:13px; font-weight:500; text-decoration:none; }
 .strip { display:flex; flex-wrap:wrap; gap:12px; }
-.sx { flex:1 1 280px; min-width:0; display:flex; align-items:center; gap:12px; padding:12px 14px; border:1px solid var(--line);
+.sx { color:inherit; text-decoration:none; flex:1 1 280px; min-width:0; display:flex; align-items:center; gap:12px; padding:12px 14px; border:1px solid var(--line);
   border-radius:var(--r-card); background:var(--panel); }
 .sid { font:12px var(--mono); color:var(--dim); }
 .sn { flex-grow:1; min-width:0; font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -1417,27 +1472,35 @@ body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.6 var(--sans
 .tr2 i { display:block; height:6px; background:var(--blue); } .tr2 i.full { background:var(--teal); }
 .sf { font:12px var(--mono); color:var(--dim); }
 main { display:flex; gap:12px; align-items:flex-start; overflow-x:auto; padding-bottom:8px; }
-.col { flex:0 0 300px; min-width:0; display:flex; flex-direction:column; gap:8px; }
+.col { flex:1 1 0; min-width:170px; display:flex; flex-direction:column; gap:8px; }
 .col h2 { display:flex; justify-content:flex-start; align-items:center; gap:8px; margin:0; padding:0 4px 4px; font-size:14px; color:var(--fg); font-weight:600; }
 .col h2::before { content:""; width:8px; height:8px; border-radius:50%%; background:var(--gray); }
 .col h2 span { font-size:12px; color:var(--dim); font-weight:400; }
 .c-아이디어 h2::before { background:var(--st-아이디어); } .c-대기 h2::before { background:var(--st-대기); }
 .c-진행 h2::before { background:var(--st-진행); } .c-검토 h2::before { background:var(--st-검토); }
 .c-보류 h2::before { background:var(--st-보류); } .c-완료 h2::before { background:var(--st-완료); }
-main:not(.all) .col.fold { flex:0 0 44px; min-height:160px; align-items:center; padding-top:12px; border:1px dashed var(--dash); border-radius:var(--r-card); }
-main:not(.all) .col.fold h2 { writing-mode:vertical-rl; padding:0; font-size:12px; color:var(--dim); font-weight:400; }
-main:not(.all) .col.fold h2::before { display:none; }
-.turns, .alarms { margin:0 20px 12px; padding:10px; border:1px solid var(--line); border-radius:var(--r-card); }
-.alarms { border-color:var(--orange); }
-.turns h2, .alarms h2 { font-size:13px; margin:0 0 10px; color:var(--dim); font-weight:600; }
+.tb { position:relative; display:flex; flex-wrap:nowrap; align-items:center; gap:10px; padding:8px 12px; border:1px solid var(--line);
+  border-radius:var(--r-card); background:var(--panel); white-space:nowrap; font-size:13px; }
+.tb h2 { font-size:13px; margin:0; color:var(--dim); font-weight:600; }
+.tb > a { min-width:0; max-width:16em; overflow:hidden; text-overflow:ellipsis; color:var(--fg); text-decoration:none; padding:2px 8px; border-radius:var(--r-pill); background:var(--soft); }
+.tb > span { color:var(--dim); font-size:12px; }
+.tb details { margin-left:auto; }
+.tb summary { cursor:pointer; color:var(--dim); font-size:12px; }
+.tb details ul { position:absolute; right:0; top:100%%; z-index:5; margin:4px 0 0; padding:10px 14px 10px 28px; min-width:320px; max-width:90vw;
+  white-space:normal; border:1px solid var(--line); border-radius:var(--r-card); background:var(--panel); }
+.flt { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-left:auto; font-size:12px; color:var(--ink2); }
+.flt select, .flt input[type="search"] { min-height:32px; border:1px solid var(--line); border-radius:var(--r-pill); background:var(--panel); font:inherit; font-size:12px; color:var(--ink2); padding:0 10px; }
 .card { display:flex; flex-direction:column; gap:8px; background:var(--card); border:1px solid var(--line);
   border-radius:var(--r-card); padding:12px; margin:0; text-decoration:none; color:inherit; }
 .card:hover { border-color:var(--dim); }
 .card[data-stop] { border-color:var(--orange-line); }
+.c-보류 .card { background:var(--ochre-bg); border-color:var(--ochre); }
+.d.hold { color:var(--ochre-ink); }
 .card h3 { font-size:13px; margin:0; font-weight:500; line-height:1.45; }
 .tg, .ln { display:flex; gap:8px; margin:0; font-size:12px; color:var(--dim); }
 .tg { font-size:11px; align-items:center; } .tg span:first-child { font-family:var(--mono); }
 .tg span:last-child, .ln span:last-child { margin-left:auto; }
+.ln.wide { display:block; } .ln.wide span:last-child { margin-left:0; } .ln.wide .d { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .d.warn, .d.late { color:var(--orange); font-weight:500; } .d.fast { color:var(--teal); font-weight:500; }
 .pips { display:flex; gap:3px; margin:0; }
 .pips i { flex:1; height:4px; border-radius:2px; background:var(--off); }
@@ -1459,7 +1522,7 @@ details.extra summary { cursor:pointer; font-size:13px; color:var(--dim); }
 @media (max-width:700px) { .bh { padding:12px 14px; } .bm { padding:12px 14px; } #peek { max-width:none; border-left:0; border-top:1px solid var(--line); } }
 </style></head><body>
 <header class="bh">%(head)s</header>
-<div class="bd"><div class="bm">%(strip)s%(turns)s<main%(mainattr)s>%(cols)s</main></div>
+<div class="bd"><div class="bm">%(turns)s%(strip)s<main>%(cols)s</main></div>
 <aside id="peek" aria-label="미리 보기" hidden><div class="pkh"><span>미리 보기</span><button type="button" id="pkx" aria-label="닫기">×</button></div><div id="pkb"></div></aside></div>
 <details class="note"><summary>도움말</summary><p>파일이 진실이다. 상태를 바꾸려면 그 파일의 「상태:」 줄을 고친다. 만든 시각 %(now)s</p></details>
 <script>
@@ -1571,9 +1634,11 @@ PALETTE = """<div id="palette" hidden><div id="pbox"><div id="prow"><input id="p
       if (mine && hit('대기로 올리기…')) cmds.push(['대기로 올리기…', mine['href'], '아이디어 카드']);
     }
     var NM = @@NAMES@@;
-    var screens = [[NM['home'], '/'], [NM['search'], '/search'], [NM['timeline'], '/timeline'], [NM['usage'], '/signals']]
+    var screens = [[NM['home'], '/'], [NM['search'], '/search'], [NM['timeline'], '/timeline'], [NM['usage'], '/signals'], [NM['retro'], '/retro'], [NM['cards'], '/cards?보기=진행'], [NM['improve'] + ' — 모든 프로젝트', '/improve']]
       .concat(proj.map(function (p) { return [p['name'] + ' ' + NM['board'], p['href']]; }))
-      .concat(proj.map(function (p) { return [NM['improve'] + ' — ' + p['name'], '/p/' + encodeURIComponent(p['name']) + '/improve']; }));
+      .concat(proj.map(function (p) { return [NM['improve'] + ' — ' + p['name'], '/p/' + encodeURIComponent(p['name']) + '/improve']; }))
+      .concat(proj.map(function (p) { return [NM['features'] + ' — ' + p['name'], '/p/' + encodeURIComponent(p['name']) + '/features']; }))
+      .concat(proj.map(function (p) { return [NM['graph'] + ' — ' + p['name'], '/p/' + encodeURIComponent(p['name']) + '/graph']; }));
     screens.filter(function (x) { return hit(x[0]); }).forEach(function (x) { cmds.push([x[0], x[1], '화면 이동']); });
     el('ph', '가장 맞는 것');
     var sm = q && online && st !== 'err' ? screenMatch(q, screens) : null;
@@ -1988,7 +2053,11 @@ def 미리_계산(items):
     try:
         시작 = time.monotonic()
         qs = _비용품질_인자({})
-        _잠깐저장("signals", items, qs, lambda: read_signals(items, qs))
+        for 이름, 읽기 in (("signals", read_signals), ("retro", read_retro)):
+            try:
+                _잠깐저장(이름, items, qs, lambda 읽기=읽기: 읽기(items, qs))
+            except Exception:                        # noqa: BLE001 — 한쪽이 터져도 다른 쪽은 이어 돈다
+                pass
         print("비용·품질 미리 계산 끝 (%d초)" % round(time.monotonic() - 시작), flush=True)
     except Exception:                                # noqa: BLE001 — 미리 계산이 상주를 죽이지 않는다. 화면 요청은 직접 계산한다
         pass
@@ -2140,10 +2209,17 @@ def stalled_alarms(item, cards, 그림=None, now=None, lines=_미읽음):
     return out
 
 
+def 러너가_멈춤(c):
+    """보류 카드가 러너가 실행하다 멈춘 것인가 — 러너는 단계마다 `단계` 를 쓰고 보류로 바꿀 때 지우지 않는다. `단계` 가 빈 보류는 사람이 일부러 미룬 것.
+    보류를 이 둘로 가르는 유일한 자리다."""
+    return c["상태"] == "보류" and c.get("단계", "").strip() != ""
+
+
 def _칸_고름(rows):
-    """숫자 칸과 카드 목록이 함께 쓰는 고르기 — `{진행: [(줄, 카드)], 대기: [...], 멈춤: [(줄, 카드, 갈래)]}`.
-    멈춤은 카드 한 장이 한 번만 나온다(보류 → 경보 → 예상 넘김 가운데 앞선 갈래). 카드 목록에 없는 경보·넘김 파일은 센 적이 없다."""
-    out = {"진행": [], "대기": [], "멈춤": []}
+    """숫자 칸과 카드 목록이 함께 쓰는 고르기 — `{진행: [(줄, 카드)], 대기: [...], 멈춤: [(줄, 카드, 갈래)], 보류: [(줄, 카드)]}`.
+    멈춤은 카드 한 장이 한 번만 나온다(러너가 멈춤 → 경보 → 예상 넘김 가운데 앞선 갈래). 일부러 미룬 보류는 멈춤이 아니라 보류 열쇠에 담는다.
+    카드 목록에 없는 경보·넘김 파일은 센 적이 없다."""
+    out = {"진행": [], "대기": [], "멈춤": [], "보류": []}
     for r in rows:
         cards = {c["file"]: c for c in r.get("카드") or []}
         stop = {}
@@ -2153,7 +2229,10 @@ def _칸_고름(rows):
             elif c["상태"] == "대기":
                 out["대기"].append((r, c))
             elif c["상태"] == "보류":
-                stop[c["file"]] = "보류"
+                if 러너가_멈춤(c):
+                    stop[c["file"]] = "러너가 멈춤"
+                else:
+                    out["보류"].append((r, c))
         for 갈래, files in (("경보", {a["file"] for a in r.get("경보") or []}), ("예상 넘김", set(r.get("예상 넘김") or []))):
             for f in sorted(files):
                 if f in cards:
@@ -2171,7 +2250,7 @@ def home_numbers(rows, today, 병합=None):
     wait = [ref(r, c) for r, c in 고름["대기"]]
     stop = [ref(r, c) for r, c, _ in 고름["멈춤"]]
     remote = sum(c.get("출처") == "원격" for _, c in 고름["진행"])
-    hold = sum(g == "보류" for _, _, g in 고름["멈춤"])
+    hold = sum(g == "러너가 멈춤" for _, _, g in 고름["멈춤"])
     alarm = sum(len({a["file"] for a in r.get("경보") or []}) for r in rows)
     over = sum(len(r.get("예상 넘김") or []) for r in rows)
     if 병합 is None:
@@ -2184,7 +2263,7 @@ def home_numbers(rows, today, 병합=None):
         {"이름": "진행 중", "수": len(run), "설명": "이 중 %d장 다른 기기" % remote, "카드": run, "위험": False, "고리": 고리("진행")},
         {"이름": "대기", "수": len(wait), "설명": "프로젝트 %d곳" % len({x[0] for x in wait}), "카드": wait, "위험": False, "고리": 고리("대기")},
         {"이름": "이번 주 완료", "수": 수, "설명": 설명, "카드": [], "위험": False, "고리": 고리("병합")},
-        {"이름": "막힘", "수": len(stop), "설명": "보류 %d · 멈춘 실행 %d · 예상 초과 %d" % (hold, alarm, over),
+        {"이름": "손볼 것", "수": len(stop), "설명": "멈춘 실행 %d · 예상 초과 %d" % (hold + alarm, over),
          "카드": stop, "위험": len(stop) >= 1, "고리": 고리("멈춤")}]
 
 
@@ -2206,10 +2285,23 @@ def read_resolved(items):
     return sorted(out, key=lambda x: x["때"], reverse=True)
 
 
+def _진행_상태(mine):
+    return "멈춤" if any(러너가_멈춤(c) for c in mine) else "진행" if any(c["상태"] in ("진행", "검토") for c in mine) else "쉼"
+
+
+def _시나리오_배지(cards, s):
+    """시나리오 하나의 배지 글 — 「완료」(시나리오 상태가 완료일 때만)·「완료 선언 대기」·「멈춤」·「보류 n으로 남음」·「진행」·「쉼」."""
+    if s["상태"] == "완료":
+        return "완료"
+    mine = [c for c in cards if c["시나리오"] == s["번호"]]
+    p = scenario_progress(cards, s)
+    return ("완료 선언 대기" if p["분모"] and p["수"]["완료"] == p["분모"] else "멈춤" if any(러너가_멈춤(c) for c in mine)
+            else "보류 %d으로 남음" % p["수"]["보류"] if p["수"]["보류"] and p["수"]["완료"] + p["수"]["보류"] == p["분모"] else _진행_상태(mine))
+
+
 def _시나리오_줄(cards, scenarios):
     """첫 화면 진행 표의 줄 — 완료 아닌 시나리오마다 하나, 시나리오 없는 완료 아닌 카드가 있으면 「낱장 카드 n」, 아무것도 없으면 「열린 일 없음」."""
-    def 상태(mine):
-        return "멈춤" if any(c["상태"] == "보류" for c in mine) else "진행" if any(c["상태"] in ("진행", "검토") for c in mine) else "쉼"
+    상태 = _진행_상태
     out = []
     known = {s["번호"] for s in scenarios}
     for s in scenarios:
@@ -2217,7 +2309,7 @@ def _시나리오_줄(cards, scenarios):
             continue
         mine = [c for c in cards if c["시나리오"] == s["번호"]]
         p = scenario_progress(cards, s)
-        배지 = "완료 선언 대기" if p["분모"] and p["수"]["완료"] == p["분모"] else "멈춤" if p["수"]["보류"] else 상태(mine)
+        배지 = _시나리오_배지(cards, s)
         out.append({"시나리오": ("%s %s" % (s["번호"], s["이름"])).strip(), "상태": 배지, "완료": p["수"]["완료"], "분모": p["분모"],
                     "퍼센트": p["퍼센트"], "남은 예상": remaining_text(cards, mine), "기계": " · ".join(p["기기"]) or "—"})
     낱장 = [c for c in cards if c["시나리오"] not in known and c["상태"] != "완료"]
@@ -2232,7 +2324,7 @@ def project_row(item):
     row = {"name": item["name"], "수": {c: 0 for c in COLUMNS[1:5]}, "도는 카드": [], "차례 수": 0,
            "마지막 움직임": "없음", "까닭": "", "표시": list(item["표시"]), "원격": [], "남은 예상": "—",
            "상태수": {c: 0 for c in COLUMNS}, "배지": "", "진행률": None, "기기": [], "위험": [],
-           "경보": [], "카드": [], "예상 넘김": [], "시나리오 줄": []}
+           "경보": [], "카드": [], "예상 넘김": [], "시나리오 줄": [], "요소 칸 수": {"완료": 0, "진행": 0, "보류": 0, "멈춤": 0, "아이디어": 0, "없음": 0}}
     try:
         cards, scenarios, _, turns = _읽기(item, 합치기=True)
     except Exception as e:                           # 한 프로젝트의 실패가 다른 줄을 막지 않는다
@@ -2261,6 +2353,9 @@ def project_row(item):
     known = {s["번호"] for s in scenarios}
     row["남은 예상"] = remaining_text(cards, [c for c in cards if c["시나리오"] in known])
     row["시나리오 줄"] = _시나리오_줄(cards, scenarios)
+    for s in scenarios:
+        for k in 요소_칸(cards, s):
+            row["요소 칸 수"][k["모양"]] += 1
     row["도는 카드"] = [(c["title"], c["단계"]) for c in cards if c["상태"] == "진행"]
     row["차례 수"] = len(turns)
     row["원격"] = _원격_문구(item, cards)
@@ -2441,19 +2536,29 @@ def render_shell(items, rows, turns, path):
               if 이기계 else "—")
         지금 = len(split_turns(turns, dt.datetime.now())[0])
         m = re.match(r"/p/([^/]+)/", path)
-        현재 = urllib.parse.unquote(m.group(1)) if m and not path.endswith("/improve") else None
-        개선 = items[0]["name"] if items else None
+        현재 = urllib.parse.unquote(m.group(1)) if m else None
         이름 = 화면이름
-        링크 = [_사이드바_고리("/", 이름["home"], path == "/", str(지금), 지금 > 0), _사이드바_고리("/timeline", 이름["timeline"], path == "/timeline"),
-              _사이드바_고리("/signals", 이름["usage"], path == "/signals")]
-        링크.append(_사이드바_고리(_주소(개선) + "improve", 이름["improve"], path.endswith("/improve") and path.startswith("/p/"))
-                  if 개선 else '<span class="nolink">%s</span>' % esc(이름["improve"]))
+        기능 = 현재 if 현재 in {i["name"] for i in items} else (items[0]["name"] if items else None)
+        링크 = [_사이드바_고리("/", 이름["home"], path == "/"), _사이드바_고리("/#todo", 이름["todo"], False, str(지금), 지금 > 0)]
+        if 기능 is not None:
+            링크.append(_사이드바_고리(_주소(기능) + "features", 이름["features"], False))
+            링크.append(_사이드바_고리(_주소(기능) + "graph", 이름["graph"], path == _주소(기능) + "graph"))
+        링크 += [_사이드바_고리("/cards?보기=진행", 이름["cards"], path == "/cards"), _사이드바_고리("/timeline", 이름["timeline"], path == "/timeline"),
+              _사이드바_고리("/signals", 이름["usage"], path == "/signals"), _사이드바_고리("/retro", 이름["retro"], path == "/retro"),
+              _사이드바_고리("/improve", 이름["improve"], path == "/improve")]
         프로젝트 = []
         for item, r in zip(items, rows):
             수 = sum(1 for c in r["카드"] if c["상태"] == "진행")
-            색 = "gray" if r["까닭"] else "orange" if r["상태수"]["보류"] else "blue" if 수 else "gray"
-            프로젝트.append('<a href="%s"%s><span class="dot-%s"></span><span class="pn">%s</span><span class="n">%d</span></a>'
-                        % (esc(_주소(item["name"]), quote=True), ' aria-current="page"' if item["name"] == 현재 else "", 색, esc(item["name"]), 수))
+            고름 = _칸_고름([r])
+            막힘 = len(고름["멈춤"])
+            색 = "gray" if r["까닭"] else "orange" if 막힘 else "blue" if 수 else "ochre" if 고름["보류"] else "gray"
+            아래 = ""
+            if item["name"] == 현재:
+                보드, 개선, 진척 = _주소(item["name"]), _주소(item["name"]) + "improve", _주소(item["name"]) + "features"
+                아래 = ('<div class="sub">%s%s%s</div>' % (_사이드바_고리(보드, 이름["board"], False), _사이드바_고리(진척, 이름["features"], path == 진척),
+                                                        _사이드바_고리(개선, 이름["improve"], path == 개선)))
+            프로젝트.append('<a href="%s"%s><span class="dot-%s"></span><span class="pn">%s</span><span class="n">%d · %d</span></a>%s'
+                        % (esc(_주소(item["name"]), quote=True), ' aria-current="page"' if item["name"] == 현재 else "", 색, esc(item["name"]), 수, 막힘, 아래))
         때들 = [(REMOTE.get(os.path.abspath(i["path"])) or {}).get("때") for i in items]
         때들 = [t for t in 때들 if t]
         가장 = min(때들) if 때들 else None
@@ -2461,17 +2566,17 @@ def render_shell(items, rows, turns, path):
         원격 += ["%s · %s" % (i["name"], x) for i, r in zip(items, rows) for x in r.get("원격", []) if not x.startswith("원격 읽음")]
         상자 = ["러너 %s / 상한 %d" % (러너, max_parallel_read())] + 원격 + ["stop-loop %s" % (plugin_version_read() or "—")]
         return ((_사이드바_머리 % esc(이기계 or "—")) + '<div class="grp">%s</div>' % "".join(링크)
-                + '<div class="grp"><span class="gh">프로젝트</span>%s</div>' % ("".join(프로젝트) or '<span class="nolink">보는 프로젝트 없음</span>')
+                + '<div class="grp"><span class="gh">프로젝트</span>%s<span class="gh">숫자는 진행 중 · 막힘</span></div>' % ("".join(프로젝트) or '<span class="nolink">보는 프로젝트 없음</span>')
                 + '<div class="sbox">%s</div></nav>' % "".join("<span>%s</span>" % esc(x) for x in 상자))
     except Exception:
-        return 최소_사이드바("/")
+        return 최소_사이드바(path)
 
 
 def 최소_사이드바(path):
-    return ('<nav class="side" aria-label="보드 메뉴"><div class="grp">%s%s%s%s</div><div class="sbox"><span>사이드바 못 그림</span></div></nav>'
-            % (_사이드바_고리("/", 화면이름["home"], path == "/"), _사이드바_고리("/timeline", 화면이름["timeline"], path == "/timeline"),
-               _사이드바_고리("/signals", 화면이름["usage"], path == "/signals"),
-               '<span class="nolink">%s</span>' % html.escape(화면이름["improve"])))
+    return ('<nav class="side" aria-label="보드 메뉴"><div class="grp">%s</div><div class="sbox"><span>사이드바 못 그림</span></div></nav>'
+            % "".join(_사이드바_고리(href, 화면이름[k], path == cur) for href, k, cur in (
+                ("/", "home", "/"), ("/#todo", "todo", None), ("/cards?보기=진행", "cards", "/cards"), ("/timeline", "timeline", "/timeline"),
+                ("/signals", "usage", "/signals"), ("/retro", "retro", "/retro"), ("/improve", "improve", "/improve"))))
 
 
 def with_shell(page, nav):
@@ -2503,8 +2608,9 @@ def my_turns(rows, turns):
     alarms = [{"열쇠": "경보:%s:%s" % (a["프로젝트"], a["file"]), "종류": "경보", "프로젝트": a["프로젝트"], "시나리오": "", "제목": a["title"],
                "기다리는 것": "%s — %s" % (a["종류"], a["근거"]), "생긴 때": "", "열어 볼 곳": a["열어 볼 곳"], "알림": a.get("알림")}
               for r in rows for a in r.get("경보") or []]
+    미룸 = {(r["name"], c["file"]) for r, c in _칸_고름(rows)["보류"]}       # 일부러 미룬 보류는 내 할 일이 아니다 — 보류 보기에서 본다
     bad = [t for t in turns if t["종류"] == "못 읽음"]
-    return bad + alarms + [t for t in turns if t["종류"] != "못 읽음"]
+    return bad + alarms + [t for t in turns if t["종류"] != "못 읽음" and not (t["종류"] == "멈춤" and (t["프로젝트"], t["열쇠"].partition(":")[2]) in 미룸)]
 
 
 def split_turns(turns, now):
@@ -2564,10 +2670,12 @@ def week_merges(items, today):
 
 
 def _배지_색(상태):
-    return {"완료 선언 대기": "orange", "멈춤": "orange", "읽지 못함": "orange", "진행": "blue"}.get(상태, "gray")
+    if 상태.startswith("보류"):
+        return "ochre"
+    return {"완료": "teal", "완료 선언 대기": "teal", "멈춤": "orange", "읽지 못함": "orange", "진행": "blue", "검토": "blue", "대기": "blue"}.get(상태, "gray")
 
 
-카드_보기 = ("진행", "대기", "병합", "멈춤")
+카드_보기 = ("진행", "대기", "병합", "멈춤", "보류")
 
 
 def 카드_목록(rows, 보기, 병합줄, now):
@@ -2591,17 +2699,19 @@ def 카드_목록(rows, 보기, 병합줄, now):
         if 갈래:
             종류 = next((a["종류"] for a in r.get("경보") or [] if a["file"] == c["file"]), "") if 갈래[0] == "경보" else ""
             글 = 종류 or _한줄(r.get("카드") or [], c, {}, now)[0]
+            if 보기 == "멈춤" and 갈래[0] != "경보":
+                글 = c["멈춘이유"] or "까닭 없음"
         else:
             글 = _한줄(r.get("카드") or [], c, {}, now)[0]
         더(갈래[0] if 갈래 else r["name"],
            {"프로젝트": r["name"], "상태": c["상태"], "제목": c["title"], "까닭": 글, "때": c["갱신"],
             "기계": c.get("도는 기계") or c.get("돈기계") or c.get("기기") or "—", "href": _주소(r["name"]) + urllib.parse.quote(c["file"])})
-    순서 = ("보류", "경보", "예상 넘김")
+    순서 = ("러너가 멈춤", "경보", "예상 넘김")
     이름들 = [k for k in 순서 if k in 묶음] if 보기 == "멈춤" else list(묶음)
     return [{"이름": k, "줄": 묶음[k]} for k in 이름들]
 
 
-_보기_제목 = {"진행": "진행 중인 카드", "대기": "대기 중인 카드", "병합": "이번 주 완료", "멈춤": "막힘"}
+_보기_제목 = {"진행": "진행 중인 카드", "대기": "대기 중인 카드", "병합": "이번 주 완료", "멈춤": "손볼 것", "보류": "보류"}
 
 
 def render_cards(보기, 묶음들, 덧=()):
@@ -2624,6 +2734,7 @@ def render_cards(보기, 묶음들, 덧=()):
         parts.append('<div class="sr-g" data-g="%s"><div class="sr-h"><b>%s</b><span class="sr-n">%d</span></div>%s</div>'
                      % (esc(g["이름"]), esc(g["이름"]), len(g["줄"]), "".join(rows)))
     틀 = FILE_TEMPLATE.replace('<a href="board.html">← 보드</a>', '<a href="/">← %s</a>' % 화면이름["home"])
+    틀 = 틀.replace("<h1>%(name)s</h1>\n", "", 1)           # 제목은 본문 `<h1>` 하나
     return 틀 % {"name": esc(_보기_제목.get(보기, 보기)), "body": "\n".join(parts)}
 
 
@@ -2664,7 +2775,10 @@ def render_home(rows, turns, 오류, tab="", 처리=(), today=None, machines="",
     탭들 = (("", "새로 온 것 %d" % len(지금), "/"), ("old", "오래 기다림 %d" % len(오래), "/?tab=old"), ("done", "처리함 %d" % len(처리), "/?tab=done"))
     tabs = '<nav class="tabs">%s</nav>' % "".join(
         '<a%s href="%s">%s</a>' % (' class="on"' if k == tab else "", href, label) for k, label, href in 탭들)
-    turnp = '<section class="panel turnp" aria-labelledby="h-turn"><div class="ph"><h2 id="h-turn">%s</h2>%s</div>%s</section>' % (esc(화면이름["todo"]), tabs, box)
+    미룸 = len(_칸_고름(rows)["보류"])
+    if 미룸:
+        box += '<p class="more"><a href="/cards?보기=%s">보류 %d장은 따로 보기</a></p>' % (urllib.parse.quote("보류"), 미룸)
+    turnp = '<section class="panel turnp" id="todo" aria-labelledby="h-turn"><div class="ph"><h2 id="h-turn">%s</h2>%s</div>%s</section>' % (esc(화면이름["todo"]), tabs, box)
 
     def tile(c):
         return ('<a class="tile%s%s" href="%s"><span class="lb">%s</span><span class="v">%s</span><span class="sub">%s</span></a>'
@@ -2675,19 +2789,27 @@ def render_home(rows, turns, 오류, tab="", 처리=(), today=None, machines="",
     def prows(r):
         link = '<a class="pl" href="%sboard.html">%s</a>' % (esc(_주소(r["name"]), quote=True), esc(r["name"]))
         덧 = r["표시"] + ([r["까닭"]] if r["까닭"] else [])
-        줄 = ([{"시나리오": "", "상태": "읽지 못함", "완료": None, "분모": None, "퍼센트": None, "남은 예상": "—", "기계": "—"}]
-              if r["까닭"] else r["시나리오 줄"])
-        out = []
-        for n, x in enumerate(줄):
-            sub = [x["시나리오"]] if x["시나리오"] else []
-            sub += 덧 if n == 0 else []
-            막대 = ('<div class="pbar"><div class="tr"><i class="%s" style="width:%d%%"></i></div><span>%d/%d</span></div>'
-                  % ("full" if x["퍼센트"] == 100 else "zero" if not x["퍼센트"] else "", x["퍼센트"] or 0, x["완료"], x["분모"])
-                  if x["분모"] else '<div class="pbar"><span>—</span></div>')
-            out.append('<tr><td class="pn">%s<div class="sub">%s</div></td><td><span class="badge b-%s">%s</span></td><td>%s</td><td>%s</td><td>%s</td></tr>'
-                       % (link, esc(" · ".join(sub)), _배지_색(x["상태"]), esc(x["상태"]), 막대, esc(x["남은 예상"]), esc(_기기_글(x["기계"]))))
-        return "".join(out)
-    head = "".join("<th>%s</th>" % h for h in ("프로젝트 · 시나리오", "상태", "진행률", "남은 시간(예상)", "실행 기기"))
+        sub = '<div class="sub">%s</div>' % esc(" · ".join(덧)) if 덧 else ""
+        if r["까닭"]:
+            return ('<tr><td class="pn">%s%s</td><td><span class="badge b-orange">읽지 못함</span></td><td><div class="pbar"><span>—</span></div></td>'
+                    '<td>—</td><td>—</td></tr>' % (link, sub))
+        줄 = r.get("시나리오 줄") or []
+        기다림 = sum(1 for x in 줄 if x["상태"] == "완료 선언 대기")
+        보류 = (r.get("상태수") or {}).get("보류", 0)
+        배지 = ('<span class="badge b-teal">완료 선언 대기 %d</span> ' % 기다림 if 기다림 else "") + ('<span class="badge b-ochre">보류 %d</span>' % 보류 if 보류 else "")
+        수 = r.get("요소 칸 수") or {}
+        전체 = sum(수.values())
+        if 전체:
+            조각 = "".join('<i class="seg seg-%s" style="width:%d%%"></i>' % (cls, 수.get(k, 0) * 100 // 전체)
+                         for k, cls in _칸_클래스.items() if 수.get(k, 0))
+            막대 = '<div class="pbar"><div class="pb2">%s</div><span>%d / %d 요소</span></div>' % (조각, 수.get("완료", 0), 전체)
+        else:
+            막대 = '<div class="pbar"><span>시나리오 없음</span></div>'
+        막대 += ' <a class="fl" href="%sfeatures">%s</a>' % (esc(_주소(r["name"]), quote=True), esc(화면이름["features"]))
+        기계 = " · ".join(r.get("기기") or []) or "—"
+        return ('<tr><td class="pn">%s%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>'
+                % (link, sub, 배지, 막대, esc(r.get("남은 예상", "—")), esc(_기기_글(기계))))
+    head = "".join("<th>%s</th>" % h for h in ("프로젝트", "상태", "진행률", "남은 시간(예상)", "실행 기기"))
     표 = ('<div class="progress"><table><thead><tr>%s</tr></thead><tbody>%s</tbody></table></div>' % (head, "".join(prows(r) for r in rows))
          if rows else '<p class="more">보는 프로젝트 없음 — %s 의 "projects"·"보기" 에 올리면 보인다</p>' % esc(LIST_FILE))
     progress = ('<section class="panel" aria-labelledby="h-proj"><div class="ph"><h2 id="h-proj">프로젝트 진행</h2>'
@@ -2703,10 +2825,11 @@ def render_home_feed(줄, 못):
 
     def li(x):
         색 = "teal" if x["결과"] in ("통과", "상태 → 완료") else "orange" if x["결과"] in ("반려", "멈춤") else "blue"
-        return ('<li class="act"><span class="fd fd-%s"></span><div><div><a href="/p/%s/%s">%s</a></div><div class="tm">%s</div></div></li>'
-                % (색, urllib.parse.quote(x["프로젝트"], safe=""), urllib.parse.quote(x["카드"], safe=""),
-                   esc("%s · %s · %s" % (x["카드"].removesuffix(".md"), x["단계"], x["결과"])),
-                   esc("%s · %s · %s" % (x["프로젝트"], _기기_글(x["기계"]), _얼마_전(x["때"])))))
+        글 = esc("%s · %s · %s" % (x["카드"].removesuffix(".md"), x["단계"], x["결과"]))
+        if x.get("카드있음", True):                                # 카드 파일이 없는 줄(옛 작업 폴더 이름)은 눌러도 404 라 글만 둔다
+            글 = '<a href="/p/%s/%s">%s</a>' % (urllib.parse.quote(x["프로젝트"], safe=""), urllib.parse.quote(x["카드"], safe=""), 글)
+        return ('<li class="act"><span class="fd fd-%s"></span><div><div>%s</div><div class="tm">%s</div></div></li>'
+                % (색, 글, esc("%s · %s · %s" % (x["프로젝트"], _기기_글(x["기계"]), _얼마_전(x["때"])))))
     top = sorted(줄, key=lambda x: x["때"], reverse=True)[:10]
     why = "".join('<p class="why">%s: 이 프로젝트 활동 못 읽음</p>' % esc(n) for n in 못)
     body = '<ol class="flist">%s</ol>' % "".join(li(x) for x in top) if top else '<p class="more">최근 활동 없음</p>'
@@ -2817,7 +2940,8 @@ def read_card_history(project, 카드):
     stem = os.path.splitext(카드)[0]
     out = {"단계": {}, "못찾음": [], "이어받기": 0, "커밋": [], "오류": "", "상태오류": "",
            "판정수": {n: {"판정": 0, "반려": 0} for n in ("02", "06", "08", "09")},
-           "PR": None, "병합": "", "이어받은 단계": []}
+           "PR": None, "병합": "", "이어받은 단계": [], "이어받은 실행": 0, "이어받은 실행 단계": []}
+    앞이어받음, 대기, 시작때 = False, None, None      # 대기 = 이어받은 실행이 막 시작돼 아직 단계를 새로 돌리지 않은 때 [마지막으로 건너뛴 단계]
     stages, out["상태오류"] = read_status_stages(os.path.basename(os.path.abspath(project)), stem)
     for st, v in stages.items():
         if isinstance(v, dict):
@@ -2861,7 +2985,20 @@ def read_card_history(project, 카드):
                 out["이어받기"] += 1
                 if num:
                     out["이어받은 단계"].append(num)
+                # 러너는 이어받을 때 산출물이 있는 단계마다 이 꼬리표 커밋을 남기므로(bin/runner.py 이어받음 빈 커밋) 한 실행이 여러 커밋이다 —
+                # 연속한 묶음이나 01 에서 다시 시작한 것을 한 번으로 센다(`_이어받기_묶음_첫` 과 같은 규칙)
+                if not 앞이어받음 or (num == "01" and 때 != 시작때):
+                    out["이어받은 실행"] += 1
+                    out["이어받은 실행 단계"] += 대기 or []         # 앞 실행이 새로 돈 단계 없이 끝났으면 마지막으로 건너뛴 단계
+                    대기, 시작때 = [], 때
+                if 대기 is not None and num:
+                    대기[:] = [num]
+            elif 대기 is not None and re.fullmatch(r"\d+[a-z]?", num):
+                out["이어받은 실행 단계"].append(num)          # 묶음 뒤 처음 꼬리표 없이 실제로 돈 단계 — 이어받아 막혔던 자리
+                대기 = None
+            앞이어받음 = resumed == "true"
             out["커밋"].append((때, num or ("머리말" if card else "—"), 제목))
+        out["이어받은 실행 단계"] += 대기 or []
     except Exception:                                # git 이 없거나 느려도 화면은 나머지를 그대로 낸다
         out["오류"] = "커밋 이력을 읽지 못했다"
     return out
@@ -3431,13 +3568,755 @@ def render_signals(qs, 결과, 까닭):
     return (틀 % {"name": 화면이름["usage"], "body": "\n".join(parts)}).replace("</style>", _신호_CSS + "</style>", 1)
 
 
-def _표_html(head, rows):
+# ── 워크플로우 회고 화면 (ISSUE-ui-17-workflow-retro-2026-11-24) ──
+# 단계·게이트·에이전트·러너가 어디서 사람 손과 시간과 돈을 새게 하나를 본다. 읽기만 한다 — 카드 만들기는 기존 `POST /p/<이름>/make-card` 길이다.
+# 여섯 칸이 모두 같은 카드 묶음(시작한 적이 있는 카드, 기간은 머리말 `갱신`)에서 계산한다. 칸 5 만 변경 표 줄의 날짜로 건다.
+# 멈춘 종류 이름·처방은 `bin/runner.py` 의 `STOP_KIND_RULES`·`stop_kind` 종류 이름의 사본이다 — 보드는 러너를 가져오지 못해(test_board_discipline D01) 바꿀 때 두 곳을 함께 고친다.
+_멈춤_처방 = {"일시적 실패": "다시 시도로 풀릴 멈춤", "범위 밖 파일 변경": "규칙을 바꿀 멈춤", "산출물 형식 오류": "규칙을 바꿀 멈춤",
+          "사람 결정": "규칙을 바꿀 멈춤", "기준 가지 실패": "규칙을 바꿀 멈춤", "기타": "규칙을 바꿀 멈춤"}
+# 자동 병합을 막은 까닭의 머리 — `bin/runner.py` 의 `merge_reasons`·`HUMAN_REASON`·`IRREVERSIBLE_HEAD` 글의 사본이다. 바꿀 때 두 곳을 함께 고친다.
+_막은_까닭_머리 = ("보호 경로를 건드렸다", "반려가 있었다", "크기가 S 가 아니다", "이어받은 실행이다", "사람 결정 미결이 있다", "되돌리기 어려운 변경")
+_회고_절 = (("3", "3. 되풀이 신호", "되풀이 신호"), ("4", "4. 규칙 후보", "규칙 후보"),
+          ("7", "7. 지표 제안", "지표 제안"), ("8", "8. 워크플로우 몫", "워크플로우 몫"))
+_오래머묾_날 = 14           # 채택 뒤 이 날수를 넘겨 반영되지 않으면 경고 — 근거 없이 정한 값이라 한 곳에 둔다(03 답 Q7)
+_아는_지표 = {"첫 통과율": "첫 통과율", "자동 병합": "자동 병합", "멈춘 종류별 건수": "멈춘 종류", "회고 제안 연결 비율": "회고 제안", "사람 개입": "사람 개입"}
+_변경표_경로 = os.path.join("workflows", "metrics", "워크플로우-변경.md")
+
+
+def read_stop_kinds(project):
+    """카드 파일 이력에서 러너가 쓴 `멈춘종류:` 값 — `({카드: {종류: 수}}, 오류 글)`. 빈 값(지움)은 세지 않고, 같은 카드·같은 작성 시각·같은 값은 한 번만 센다."""
+    try:
+        r = _git_읽기(project, "-c", "core.quotepath=false", "log", "--all", "--no-renames", "-p", "-U0", "--format=\x1e%at", "--", "docs/backlog")
+        if r.returncode != 0:
+            return {}, "커밋 이력을 읽지 못했다"
+        본 = set()
+        out = {}
+        for rec in r.stdout.split("\x1e")[1:]:
+            때, _, 몸 = rec.partition("\n")
+            카드 = None
+            for line in 몸.splitlines():
+                m = re.match(r"diff --git a/docs/backlog/(.+)\.md b/", line)
+                if m:
+                    카드 = m.group(1)
+                elif 카드 and line.startswith("+멈춘종류:"):
+                    값 = line[len("+멈춘종류:"):].strip()
+                    if 값 and (카드, 때.strip(), 값) not in 본:
+                        본.add((카드, 때.strip(), 값))
+                        out.setdefault(카드, {})[값] = out.get(카드, {}).get(값, 0) + 1
+        return out, ""
+    except (OSError, subprocess.SubprocessError):
+        return {}, "커밋 이력을 읽지 못했다"
+
+
+def _막은_까닭(글):
+    """`10-handoff.md` 의 `## 병합 판단` 절에서 자동 병합을 막은 까닭의 머리 목록. 절이 없으면 None(기록 없음), 까닭이 없으면 빈 목록."""
+    항목 = _절_항목(글 or "", "병합 판단")
+    if 항목 is None:
+        return None
+    머리들 = (t.split(":", 1)[0].strip() for t in 항목)
+    return [x for x in 머리들 if x.startswith(_막은_까닭_머리)]
+
+
+def _회고_제안_읽기(글):
+    """회고 글의 3·4·7·8절 제안 줄 — `[(절 번호, 원문, 열쇠 또는 None)]`. 열쇠는 표 바로 아래 `열쇠: R-1 · R-2` 한 줄이고, 줄 수와 다르면 그 절의 열쇠는 모른다."""
+    줄들 = 글.splitlines()
+    out = []
+    for 번호, 제목, _ in _회고_절:
+        글들 = _절_항목(글, 제목)
+        if not 글들:
+            continue
+        열쇠 = None
+        시작 = next(i for i, l in enumerate(줄들) if l.strip() == "## " + 제목)
+        for l in 줄들[시작 + 1:]:
+            if re.match(r"#{1,6} ", l):
+                break
+            if l.strip().startswith("열쇠:"):
+                열쇠 = re.findall(r"R-\d+", l)
+        if 열쇠 is not None and len(열쇠) != len(글들):
+            열쇠 = None
+        out += [(번호, t, 열쇠[i] if 열쇠 else None) for i, t in enumerate(글들)]
+    return out
+
+
+def _제안_묶기(회고들):
+    """`[(회고한 카드, 날짜, 제안 줄들)]` → 같은 원문끼리 묶은 `[{원문, 절, 근거수(서로 다른 회고 카드 수), 새로나옴(가장 이른 날짜), 출처: [(카드, 열쇠)]}]`."""
+    묶음 = {}
+    for 카드, 날짜, 줄들 in 회고들:
+        for 절, 원문, 열쇠 in 줄들:
+            z = 묶음.setdefault(원문, {"원문": 원문, "절": 절, "근거수": 0, "새로나옴": 날짜, "출처": [], "카드들": set()})
+            z["카드들"].add(카드)
+            z["새로나옴"] = min(z["새로나옴"], 날짜)
+            if (카드, 열쇠) not in z["출처"]:
+                z["출처"].append((카드, 열쇠))
+    for z in 묶음.values():
+        z["근거수"] = len(z.pop("카드들"))
+    return list(묶음.values())
+
+
+def _제안_진행(제안들, 카드들, 변경, 오늘):
+    """제안 줄마다 채택(그 제안을 머리말 `회고제안:` 으로 가리킨 카드)·반영(그 카드 완료)·효과 확인(변경 표 줄이 그 카드를 가리키고 판정이 「—」이 아님)·경고(채택 뒤 오래 반영 안 됨)."""
+    채택표 = {}
+    for c in 카드들:
+        m = re.fullmatch(r"(\S+)\s+(R-\d+)", (c.get("회고제안") or "").strip())
+        if m:
+            채택표.setdefault((m.group(1), m.group(2)), c)
+    out = []
+    for z in 제안들:
+        c = next((채택표[s] for s in z["출처"] if s in 채택표), None)
+        stem = c["file"].removesuffix(".md") if c else None
+        반영 = bool(c) and c["상태"] == "완료"
+        효과 = bool(c) and any(stem in x["변경"] and x["판정"] != "—" for x in 변경)
+        경고 = False
+        if c and not 반영:
+            m = re.search(r"(\d{4}-\d{2}-\d{2})$", stem)
+            날 = m.group(1) if m else c.get("갱신", "")
+            경고 = _날짜(날) and (오늘 - dt.datetime.strptime(날, "%Y-%m-%d").date()).days > _오래머묾_날
+        out.append(dict(z, 채택=stem, 반영=반영, 효과=효과, 경고=bool(경고)))
+    return out
+
+
+def _변경표_읽기(글):
+    """변경 표의 줄 — `([{날짜, 변경, 지표, 기대, 아는지표}], 건너뛴 줄 수)`. 네 칸이 아닌 줄은 건너뛴다."""
+    줄들, 건너뜀 = [], 0
+    for l in 글.splitlines():
+        if not l.strip().startswith("|") or _표_줄.match(l.strip()):
+            continue
+        칸 = [c.strip() for c in l.strip().strip("|").split("|")]
+        if 칸[0] == "날짜":
+            continue
+        if len(칸) != 4:
+            건너뜀 += 1
+            continue
+        아는 = [이름 for 조각 in 칸[2].split(" · ") for 이름, 낱말 in _아는_지표.items() if 낱말 in 조각]
+        줄들.append({"날짜": 칸[0], "변경": 칸[1], "지표": 칸[2], "기대": 칸[3], "아는지표": 아는})
+    return 줄들, 건너뜀
+
+
+def _수치(글):
+    m = re.search(r"-?\d+(?:\.\d+)?", str(글))
+    return float(m.group()) if m else None
+
+
+def _판정(전, 뒤, 기대):
+    """기대 방향과 전·뒤 값만 본다(문턱 없음) — 기대대로·반대로·변화 없음, 계산할 수 없으면 「—」."""
+    a, c = _수치(전), _수치(뒤)
+    낮을수록 = True if "줄" in 기대 else False if ("늘" in 기대 or "오르" in 기대) else None
+    if a is None or c is None or 낮을수록 is None:
+        return "—"
+    if a == c:
+        return "변화 없음"
+    return "기대대로" if (c < a) == 낮을수록 else "반대로"
+
+
+def _병합_찾기(project):
+    """병합 커밋 제목에서 `{카드: (누가, 병합 커밋)}` — 러너가 있으면 러너. 못 읽으면 OSError."""
+    r = _git_읽기(project, "log", "--all", "--merges", "--format=%H" + _구분 + "%s")
+    if r.returncode != 0:
+        raise OSError("커밋 이력을 읽지 못했다")
+    out = {}
+    for line in r.stdout.splitlines():
+        sha, _, 제목 = line.partition(_구분)
+        누가 = _병합_누가(제목)
+        if 누가 and (누가[1] not in out or (누가[0] == "러너" and out[누가[1]][0] != "러너")):
+            out[누가[1]] = (누가[0], sha)
+    return out
+
+
+def _손으로_고친(project, 병합):
+    """병합 커밋 가지의 꼬리표 달린 마지막 커밋 뒤에 쌓인 꼬리표 없는 병합 아닌 커밋 수 — 러너가 마지막 단계를 커밋한 뒤 사람이 고친 것. 못 읽으면 None."""
+    r = _git_읽기(project, "log", "--topo-order", "--no-merges", "--format=\x1e%H" + _구분 + "%(trailers:key=Loop-Issue,valueonly)",
+                  "%s^1..%s^2" % (병합, 병합))
+    if r.returncode != 0:
+        return None
+    n = 0
+    for rec in r.stdout.split("\x1e")[1:]:
+        if rec.partition(_구분)[2].strip():
+            break
+        n += 1
+    return n
+
+
+def _회고_맥락(item):
+    """프로젝트 하나를 한 번 읽은 것 — 카드 목록·멈춘종류 이력·병합·소각된 실행. 못 읽으면 예외."""
+    path = item["path"]
+    backlog = os.path.join(path, "docs", "backlog")
+    if not os.path.isdir(backlog):
+        raise OSError("작업목록 폴더를 읽지 못했다: %s" % backlog)
+    cards = merge_cards(read_cards(backlog), REMOTE.get(os.path.abspath(path)), item.get("기기", ""))
+    stops, 오류 = read_stop_kinds(path)
+    if 오류:
+        raise OSError(오류)
+    소각 = {}
+    for sha, stem, names in _소각_로그(path):
+        폴더들 = {}
+        for n in names:
+            m = re.fullmatch(r"\.workflow/([^/]+)/(.+)", n)
+            if m:
+                폴더들.setdefault(m.group(1), []).append(m.group(2))
+        for 폴더, 파일 in sorted(폴더들.items()):
+            소각.setdefault(stem, []).append({"sha": sha, "폴더": 폴더, "파일": 파일})
+    for rs in 소각.values():
+        rs.sort(key=lambda r: r["폴더"])
+    채택 = []
+    for c in cards:                          # 채택은 시작하지 않은 카드의 머리말도 센다
+        try:
+            fm = front_matter(os.path.join(backlog, c["file"]))
+        except (OSError, UnicodeDecodeError):
+            fm = {}
+        채택.append({"file": c["file"], "상태": c["상태"], "갱신": c["갱신"], "회고제안": fm.get("회고제안", "")})
+    return {"item": item, "path": path, "cards": cards, "stops": stops, "병합": _병합_찾기(path), "소각": 소각, "글": None, "메모": {}, "채택": 채택}
+
+
+def _본문(ctx, 실행, 이름):
+    """소각된 실행이 지운 산출물의 글 — 부모 커밋의 글이다(`git show <소각>^:<경로>` 와 같다). 한 프로젝트의 것을 git 한 번으로 읽는다."""
+    if ctx["글"] is None:
+        ctx["글"] = _묶음_읽기(ctx["path"], ["%s^:.workflow/%s/%s" % (r["sha"], r["폴더"], n)
+                                             for rs in ctx["소각"].values() for r in rs for n in r["파일"]
+                                             if n in ("11-retro.md", "10-handoff.md", "state.json")])
+    return ctx["글"].get("%s^:.workflow/%s/%s" % (실행["sha"], 실행["폴더"], 이름))
+
+
+def _카드_자료(ctx, c):
+    """시작한 적이 있는 카드의 자료, 아니면 None."""
+    if c["file"] in ctx["메모"]:
+        return ctx["메모"][c["file"]]
+    stem = c["file"].removesuffix(".md")
+    h = read_card_history(ctx["path"], c["file"])
+    d = None
+    if (c.get("시작") or "").strip() or any(x[1].isdigit() for x in h["커밋"]):
+        실행 = ctx["소각"].get(stem, [])
+        병합 = ctx["병합"].get(stem)
+        막은 = {}
+        for r in 실행:
+            for 까닭 in _막은_까닭(_본문(ctx, r, "10-handoff.md") or "") or []:
+                막은[까닭] = 막은.get(까닭, 0) + 1
+        d = {"카드": stem, "제목": c["title"], "file": c["file"], "갱신": c["갱신"], "크기": c.get("크기", ""), "h": h, "c": c, "ctx": ctx,
+             "멈춤": ctx["stops"].get(stem, {}), "병합": 병합[0] if 병합 else "", "실행": 실행,
+             "답": sum(1 for r in 실행 if "07-answers.md" in r["파일"]),
+             "손커밋": _손으로_고친(ctx["path"], 병합[1]) if 병합 else None, "막은까닭": 막은}
+    ctx["메모"][c["file"]] = d
+    return d
+
+
+def _카드들(ctx, cond):
+    return [d for c in ctx["cards"] if _카드_쓸것(c, cond) for d in [_카드_자료(ctx, c)] if d]
+
+
+def _지표(ds):
+    """칸 1 의 지표 — 카드 묶음에서. 카드가 없으면 숫자는 모두 「—」."""
+    n = len(ds)
+    infos = [{"비용": sum(r["cost"] for r in d["h"]["단계"].values()), "크기": d["크기"], "갱신": d["갱신"],
+              "반려": any(v["반려"] for v in d["h"]["판정수"].values()), "판정": any(v["판정"] for v in d["h"]["판정수"].values()),
+              "병합": d["병합"]} for d in ds]
+    s = signals_지표(infos, 0)
+    넷 = {"사람 결정 멈춤": sum(d["멈춤"].get("사람 결정", 0) for d in ds), "07 답": sum(d["답"] for d in ds),
+         "이어받기": sum(d["h"]["이어받은 실행"] for d in ds)}
+    센 = [d for d in ds if d["손커밋"] is not None]
+    넷["손으로 고친 커밋"] = sum(d["손커밋"] for d in 센) if 센 else None
+    시간 = [x for x in (sum(r["ms"] for r in d["h"]["단계"].values()) for d in ds) if x > 0]
+    막은 = {}
+    for d in ds:
+        for 까닭, 수 in d["막은까닭"].items():
+            막은[까닭] = 막은.get(까닭, 0) + 수
+    return {"개입": "%.1f" % (sum(v or 0 for v in 넷.values()) / n) if n else "—", "개입넷": 넷, "손커밋표본": (len(센), n),
+            "통과": s["통과"], "통과수": s["통과수"], "자동": s["자동"], "자동수": s["자동수"], "막은까닭": 막은,
+            "비용중앙": s["중앙"], "시간중앙": _걸린(statistics.median(시간)) if 시간 else "—"}
+
+
+def _진하기(값, 가장):
+    if not 값 or not 가장:
+        return 0
+    return min(3, int(-(-round(3 * 값 / 가장, 9) // 1)))
+
+
+def _단계_표(ds):
+    """칸 2 — 단계마다 반려율·평균 시간·예상 대비·이어받기·헛도는 회차와 진하기, 막힌 카드와 막힌 자리. 고른 카드 어디에도 자료가 없는 단계는 줄을 내지 않는다."""
+    순서 = list(STAGE_NAME)
+    단계들 = {st for d in ds for st in d["h"]["단계"]} | {st for d in ds for st, v in d["h"]["판정수"].items() if v["판정"]}
+    줄들 = []
+    for st in sorted(단계들, key=lambda x: (순서.index(x) if x in 순서 else len(순서), x)):
+        판 = [d["h"]["판정수"].get(st) for d in ds if st in d["h"]["판정수"]]
+        j, rj = sum(v["판정"] for v in 판), sum(v["반려"] for v in 판)
+        ms = [d["h"]["단계"][st]["ms"] for d in ds if st in d["h"]["단계"] and d["h"]["단계"][st]["ms"] > 0]
+        배 = []
+        for d in ds:
+            중앙 = d["ctx"] and read_size_medians(d["ctx"]["item"], d["ctx"]["cards"], d["c"])["단계"].get(st)
+            row = d["h"]["단계"].get(st)
+            if row and row["ms"] > 0 and 중앙:
+                배.append(row["ms"] / 중앙)
+        값 = {"반려율": (rj / j) if j else None, "평균": (sum(ms) / len(ms) / 60000) if ms else None,
+             "예상대비": (sum(배) / len(배)) if 배 else None, "이어받기": sum(d["h"]["이어받은 실행 단계"].count(st) for d in ds),
+             "헛돎": sum(1 for d in ds if st in d["h"]["단계"] and d["h"]["단계"][st]["runs"] > 1)}
+        글 = {"반려율": _비율(rj, j), "평균": "%d분" % int(값["평균"] + 0.5) if ms else "—",
+             "예상대비": "%.1f배" % 값["예상대비"] if 배 else "—", "이어받기": str(값["이어받기"]), "헛돎": str(값["헛돎"])}
+        막힌, 자리 = [], []
+        for d in ds:
+            row = d["h"]["단계"].get(st)
+            조각 = [("반려", d["h"]["판정수"].get(st, {}).get("반려", 0)), ("이어받기", d["h"]["이어받은 실행 단계"].count(st)),
+                  ("회차", row["runs"] if row and row["runs"] > 1 else 0)]
+            까닭 = " · ".join("%s %d" % x for x in 조각 if x[1])
+            if not 까닭:
+                continue
+            막힌.append((d["카드"], d["제목"], 까닭))
+            for r in d["실행"]:
+                for 문장 in _절_항목(_본문(d["ctx"], r, "11-retro.md") or "", "2. 막힌 자리") or []:
+                    if 문장.split(" · ")[0].strip().startswith(st):
+                        자리.append((d["카드"], 문장))
+        줄들.append({"단계": st, "이름": STAGE_NAME.get(st, ""), "값": 값, "글": 글, "진하기": {}, "막힌카드": 막힌, "막힌자리": 자리})
+    for 열 in ("반려율", "평균", "예상대비", "이어받기", "헛돎"):
+        가장 = max([z["값"][열] or 0 for z in 줄들] or [0])
+        for z in 줄들:
+            z["진하기"][열] = 0 if 열 == "예상대비" and (z["값"][열] or 0) <= 1.2 else _진하기(z["값"][열], 가장)
+    return 줄들
+
+
+def _회고_줄들(ctx, ds):
+    """카드들의 소각된 실행 가운데 회고 글이 있는 것 — `[(카드, 날짜, 제안 줄들)]` 와 `{(카드, 원문): (프로젝트, 경로, 커밋, 종류)}`."""
+    out, 위치 = [], {}
+    for d in ds:
+        for r in d["실행"]:
+            글 = _본문(ctx, r, "11-retro.md")
+            if not 글:
+                continue
+            줄들 = _회고_제안_읽기(글)
+            날 = re.search(r"(\d{4}-\d{2}-\d{2})$", r["폴더"])
+            out.append((d["카드"], 날.group(1) if 날 else "", 줄들))
+            for 절, 원문, _ in 줄들:
+                위치.setdefault((d["카드"], 원문), (ctx["item"]["name"], ".workflow/%s/11-retro.md" % r["폴더"], r["sha"],
+                                                 next(t for n, _, t in _회고_절 if n == 절)))
+    return out, 위치
+
+
+def _구간_값(ctx, 구간, 이름, 캐시):
+    """변경 표 줄의 전·뒤 값 — 그 프로젝트의 시작한 카드 가운데 `갱신` 날짜가 구간에 드는 것으로 칸 1·3·4 와 같은 규칙으로 센다."""
+    if 구간 not in 캐시:
+        ds = _카드들(ctx, {"시나리오": "", "기능": "", "기기": "", "시작": 구간[0], "끝": 구간[1]})
+        회고들, _ = _회고_줄들(ctx, ds)
+        진행 = _제안_진행(_제안_묶기(회고들), ctx["채택"], [], dt.date.today())
+        캐시[구간] = (ds, _지표(ds), 진행)
+    ds, m, 진행 = 캐시[구간]
+    if not ds:
+        return "—"
+    if 이름 == "첫 통과율":
+        return m["통과"]
+    if 이름 == "자동 병합":
+        return m["자동"]
+    if 이름 == "사람 개입":
+        return m["개입"]
+    if 이름 == "멈춘 종류별 건수":
+        return str(sum(sum(d["멈춤"].values()) for d in ds))
+    return _비율(sum(1 for x in 진행 if x["채택"]), len(진행))
+
+
+def _변경_칸(ctx, 시작, 끝):
+    """칸 5 — 변경 표 줄 가운데 날짜가 기간 안인 것에 전·뒤 값과 판정을 단다. 파일이 없으면 줄이 없다."""
+    try:
+        with open(os.path.join(ctx["path"], _변경표_경로), encoding="utf-8") as f:
+            줄들, 건너뜀 = _변경표_읽기(f.read())
+    except (OSError, UnicodeDecodeError):
+        return [], 0
+    일수 = ((dt.datetime.strptime(끝, "%Y-%m-%d") - dt.datetime.strptime(시작, "%Y-%m-%d")).days + 1) if 시작 and 끝 and _날짜(시작) and _날짜(끝) else None
+    캐시, out = {}, []
+    for x in 줄들:
+        if not _날짜(x["날짜"]) or (시작 and x["날짜"] < 시작) or (끝 and x["날짜"] > 끝):
+            continue
+        전 = 뒤 = "—"
+        if x["아는지표"] and 일수:
+            날 = dt.datetime.strptime(x["날짜"], "%Y-%m-%d").date()
+            이름 = x["아는지표"][0]
+            전 = _구간_값(ctx, ((날 - dt.timedelta(days=일수)).isoformat(), (날 - dt.timedelta(days=1)).isoformat()), 이름, 캐시)
+            뒤 = _구간_값(ctx, (날.isoformat(), (날 + dt.timedelta(days=일수 - 1)).isoformat()), 이름, 캐시)
+        out.append(dict(x, 전=전, 뒤=뒤, 판정=_판정(전, 뒤, x["기대"]), 프로젝트=ctx["item"]["name"]))
+    return out, 건너뜀
+
+
+def _막힘_글(d):
+    조각 = ["%s 반려 %d" % (st, v["반려"]) for st, v in d["h"]["판정수"].items() if v["반려"]]
+    if d["h"]["이어받은 실행"]:
+        조각.append("이어받기 %d" % d["h"]["이어받은 실행"])
+    조각 += ["%s 멈춤 %d" % (k, n) for k, n in d["멈춤"].items() if n]
+    return " · ".join(조각) or "막힘 없음"
+
+
+def _비용_글(ctx, 실행):
+    try:
+        metrics = json.loads(_본문(ctx, 실행, "state.json") or "").get("metrics") or {}
+        비용 = [v["cost"] for v in metrics.values() if isinstance(v, dict) and isinstance(v.get("cost"), (int, float))]
+    except (ValueError, AttributeError):
+        return "—"
+    return _돈(sum(비용)) if 비용 else "—"
+
+
+def read_retro(items, qs):
+    """`/retro` 의 자료 — `(자료, 까닭)`. 예외를 내지 않는다 — 못 읽은 프로젝트는 `자료["오류"]` 한 줄이 되고 나머지 칸은 그대로 낸다."""
+    qs = _비용품질_인자(qs)
+    g = lambda k: (qs.get(k) or [""])[0].strip()          # noqa: E731
+    시작, 끝, 앞시작, 앞끝, 기간까닭 = signals_기간(g("period"), g("from"), g("to"), dt.date.today())
+    자료 = {"기간": (시작, 끝, 앞시작, 앞끝), "기간까닭": 기간까닭, "프로젝트들": [i["name"] for i in items], "오류": [], "지표": _지표([]), "앞지표": _지표([]),
+          "단계": [], "멈춤": [], "제안": [], "변경": {"줄": [], "건너뜀": 0}, "회고": []}
+    cond, 까닭 = _조건(qs)
+    if 까닭:
+        return 자료, 까닭
+    현재, 앞, 변경, 채택, 회고들, 위치, 회고줄 = [], [], [], [], [], {}, []
+    for item in items:
+        if cond["프로젝트"] and item["name"] != cond["프로젝트"]:
+            continue
+        try:
+            ctx = _회고_맥락(item)
+            ds = _카드들(ctx, cond)
+            앞ds = _카드들(ctx, dict(cond, 시작=앞시작, 끝=앞끝)) if 앞시작 else []
+            줄, 건너뜀 = _변경_칸(ctx, 시작, 끝)
+            회, 위 = _회고_줄들(ctx, ds)
+            행 = [{"카드": d["카드"], "제목": d["제목"], "폴더": r["폴더"], "날짜": (re.search(r"(\d{4}-\d{2}-\d{2})$", r["폴더"]) or [None, ""])[1],
+                  "커밋": r["sha"], "글": _본문(ctx, r, "11-retro.md"), "막힘": _막힘_글(d), "비용": _비용_글(ctx, r)}
+                 for d in ds for r in d["실행"]]
+        except Exception as e:                       # 한 프로젝트의 실패가 다른 프로젝트 읽기를 막지 않는다
+            자료["오류"].append("%s: 못 읽음 — %s" % (item["name"], str(e) or type(e).__name__))
+            continue
+        현재 += ds
+        앞 += 앞ds
+        변경 += 줄
+        자료["변경"]["건너뜀"] += 건너뜀
+        채택 += ctx["채택"]
+        회고들 += 회
+        위치.update(위)
+        회고줄 += 행
+    자료["지표"], 자료["앞지표"] = _지표(현재), _지표(앞)
+    자료["단계"] = _단계_표(현재)
+    종류 = {}
+    for d in 현재:
+        for k, n in d["멈춤"].items():
+            z = 종류.setdefault(k, {"종류": k, "수": 0, "사례": [], "처방": _멈춤_처방.get(k, "분류 없음")})
+            z["수"] += n
+            if len(z["사례"]) < 3 and d["카드"] not in z["사례"]:
+                z["사례"].append(d["카드"])
+    자료["멈춤"] = sorted(종류.values(), key=lambda z: (-z["수"], z["종류"]))
+    자료["변경"]["줄"] = 변경
+    for z in _제안_진행(_제안_묶기(회고들), 채택, 변경, dt.date.today()):
+        카드, 열쇠 = z["출처"][0]
+        프로젝트, 경로, 커밋, 종류_ = 위치.get((카드, z["원문"]), (None, None, None, None))
+        z["종류"] = 종류_ or ""
+        z["양식"] = ({"프로젝트": 프로젝트, "pick": 항목_열쇠(_항목(종류_, 카드, "11", z["새로나옴"], z["원문"], 경로, 커밋, "이력"))}
+                   if not z["채택"] and 프로젝트 else None)
+        자료["제안"].append(z)
+    자료["회고"] = 회고줄
+    return 자료, ""
+
+
+_회고_CSS = """.rt-lv { display:inline-block; min-width:44px; padding:2px 6px; border-radius:4px; text-align:center; }
+.rt-lv[data-lv="1"] { background:var(--soft); } .rt-lv[data-lv="2"] { background:var(--orange-bg); color:var(--orange); } .rt-lv[data-lv="3"] { background:var(--orange-line); color:var(--orange); }
+.rt-head { display:grid; grid-template-columns:minmax(120px,1.4fr) repeat(5, minmax(70px,1fr)); gap:8px; font-size:12px; color:var(--dim); padding:6px 0; }
+.stg > summary { display:grid; grid-template-columns:minmax(120px,1.4fr) repeat(5, minmax(70px,1fr)); gap:8px; align-items:center; cursor:pointer; padding:6px 0; }
+.rt pre { white-space:pre-wrap; font-family:ui-monospace,Menlo,monospace; font-size:12px; overflow:auto; }
+.rt-warn { color:var(--orange); font-weight:600; }
+.rt-empty { color:var(--dim); font-size:13px; }
+.rt-sub { font-size:12px; color:var(--dim); }
+.sg-t form input { width:130px; }
+"""
+
+
+def render_retro(qs, 자료, 까닭):
+    """워크플로우 회고 화면 HTML. 칸마다 `<section class="panel" data-panel="n">`, 숫자 칸마다 `data-k`. 값은 모두 escape 한다."""
+    esc = html.escape
+    qs = _비용품질_인자(qs)
+    v = lambda k: (qs.get(k) or [""])[0]          # noqa: E731
+    눌림 = v("period") if v("period") in _신호_기간_이름 else ("week" if v("period") or not (v("from") or v("to")) else "")
+    거른 = {k: v(k) for k in ("p",) if v(k)}
+    단추 = "".join('<a href="/retro?%s" aria-pressed="%s">%s</a>' % (
+        esc(urllib.parse.urlencode(dict(거른, period=k))), "true" if k == 눌림 else "false", 글) for k, 글 in _신호_기간_이름.items())
+    고르개 = ('<form method="get" action="/retro"><select name="p" aria-label="프로젝트"><option value="">모든 프로젝트</option>%s</select>'
+           '<input type="hidden" name="period" value="%s"><button type="submit">보기</button></form>'
+           % ("".join('<option value="%s"%s>%s</option>' % (esc(n, quote=True), " selected" if n == v("p") else "", esc(n)) for n in 자료.get("프로젝트들", [])),
+              esc(눌림 or "week", quote=True)))
+    parts = ['<div class="sg-top"><h1>%s</h1><div class="sg-pg" role="group" aria-label="기간">%s</div>%s'
+             '<span class="sg-hint">기간을 바꾸면 여섯 칸이 모두 바뀐다</span></div>' % (esc(화면이름["retro"]), 단추, 고르개)]
+    if 까닭 or 자료.get("기간까닭"):
+        parts.append("<p>%s</p>" % esc(까닭 or 자료["기간까닭"]))
+    parts += ['<p class="sg-hint">%s</p>' % esc(x) for x in 자료.get("오류", [])]
+    비었음 = '<p class="rt-empty">기록이 아직 없음</p>'
+
+    def 칸(번호, 제목, 본문):
+        return '<section class="panel" data-panel="%d"><div class="ph"><h2>%s</h2></div><div class="sg-in">%s</div></section>' % (번호, esc(제목), 본문)
+
+    # 1. 핵심 지표
+    m, 앞 = 자료["지표"], 자료["앞지표"]
+    넷 = m["개입넷"]
+    칸글 = lambda x: "—" if x is None else str(x)          # noqa: E731
+    타일 = [("개입", "카드당 사람 개입", "사람 결정 멈춤 %s · 07 답 %s · 이어받기 %s · 손으로 고친 커밋 %s" % tuple(칸글(넷[k]) for k in ("사람 결정 멈춤", "07 답", "이어받기", "손으로 고친 커밋"))),
+          ("통과", "첫 통과율", m["통과수"]),
+          ("자동", "자동 병합 비율", "막은 까닭: " + (", ".join("%s %d" % x for x in m["막은까닭"].items()) or "—")),
+          ("비용", "카드당 비용 중앙값", "")]
+    칸1 = ['<div class="tiles sg-k">']
+    for 열쇠, 이름, 아래 in 타일:
+        값, 앞값 = (m["비용중앙"], 앞["비용중앙"]) if 열쇠 == "비용" else (m[열쇠], 앞[열쇠])
+        부 = esc(아래) + ('카드당 걸린 시간 중앙값 <span data-k="지표:시간">%s</span> (직전 <span data-k="앞:시간">%s</span>)' % (esc(m["시간중앙"]), esc(앞["시간중앙"])) if 열쇠 == "비용" else "")
+        칸1.append('<div class="tile"><div class="lb">%s</div><div class="v" data-k="지표:%s">%s</div><div class="sub">%s</div>'
+                 '<div class="sub">직전 기간 <span data-k="앞:%s">%s</span></div></div>' % (esc(이름), 열쇠, esc(값), 부, 열쇠, esc(앞값)))
+    칸1.append("</div>")
+    if m["손커밋표본"][1]:
+        칸1.append('<p class="rt-sub">손으로 고친 커밋: 병합된 카드만 센다(%d장 중 %d장)</p>' % (m["손커밋표본"][1], m["손커밋표본"][0]))
+    # 2. 단계별 표
+    열 = (("반려율", "반려율"), ("평균", "평균 시간"), ("예상대비", "예상 대비"), ("이어받기", "이어받기"), ("헛돎", "헛도는 회차"))
+    칸2 = ""
+    if 자료["단계"]:
+        칸2 = '<div class="rt-head"><span>단계</span>%s</div>' % "".join("<span>%s</span>" % esc(n) for _, n in 열)
+        for z in 자료["단계"]:
+            칸들 = "".join('<span class="rt-lv" data-k="%s" data-lv="%d">%s</span>' % (
+                esc("단계:%s:%s" % (z["단계"], k), quote=True), z["진하기"][k], esc(z["글"][k])) for k, _ in 열)
+            막힌 = "".join("<li>%s %s — %s</li>" % (esc(c), esc(t), esc(why)) for c, t, why in z["막힌카드"]) or "<li>막힌 카드 없음</li>"
+            자리 = "".join("<li>%s — %s</li>" % (esc(c), esc(s)) for c, s in z["막힌자리"]) or "<li>기록이 아직 없음</li>"
+            칸2 += ('<details class="stg" data-st="%s"><summary><b>%s %s</b>%s</summary><p class="rt-sub">막힌 카드</p><ul>%s</ul>'
+                  '<p class="rt-sub">막힌 자리</p><ul>%s</ul></details>' % (esc(z["단계"], quote=True), esc(z["단계"]), esc(z["이름"]), 칸들, 막힌, 자리))
+    # 3. 멈춤 원인
+    칸3 = ""
+    if 자료["멈춤"]:
+        칸3 = ("<table class=\"sg-t\"><thead><tr><th>종류</th><th>수</th><th>사례</th><th>처방</th></tr></thead><tbody>%s</tbody></table>" % "".join(
+            '<tr><td>%s</td><td data-k="%s">%d</td><td>%s</td><td data-k="%s">%s</td></tr>' % (
+                esc(z["종류"]), esc("멈춤:%s:수" % z["종류"], quote=True), z["수"], esc(", ".join(z["사례"])),
+                esc("멈춤:%s:처방" % z["종류"], quote=True), esc(z["처방"])) for z in 자료["멈춤"]))
+    # 4. 반복 지적에서 규칙까지
+    칸4 = ""
+    if 자료["제안"]:
+        행 = []
+        for z in 자료["제안"]:
+            양식 = z.get("양식")
+            만들기 = ('<form method="post" action="/p/%s/make-card"><input type="hidden" name="pick" value="%s">'
+                   '<input name="title" placeholder="제목" required><input name="slug" placeholder="파일 이름(영문 소문자)" required>'
+                   '<button type="submit">카드로 만들기</button></form>' % (esc(urllib.parse.quote(양식["프로젝트"], safe=""), quote=True), esc(양식["pick"], quote=True))
+                   if 양식 else "—")
+            행.append("<tr><td>%s</td><td>%d</td><td>%s</td><td>%s</td><td>%s</td><td>%s%s</td><td>%s</td></tr>" % (
+                esc(z["원문"]), z["근거수"], esc(z["새로나옴"]), esc(z["채택"] or "—"), "예" if z["반영"] else "—",
+                "예" if z["효과"] else "—", ' <span class="rt-warn">오래 머묾</span>' if z["경고"] else "", 만들기))
+        칸4 = ("<table class=\"sg-t\"><thead><tr><th>제안</th><th>근거 수</th><th>새로 나옴</th><th>채택</th><th>반영</th><th>효과 확인</th><th>카드로 만들기</th></tr></thead>"
+             "<tbody>%s</tbody></table>" % "".join(행))
+    # 5. 바꾼 것의 효과
+    칸5 = ""
+    if 자료["변경"]["줄"]:
+        행 = []
+        for i, x in enumerate(자료["변경"]["줄"], 1):
+            행.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td>%s</tr>" % (
+                esc(x["날짜"]), esc(x["변경"]), esc(x["지표"]), esc(x["기대"]),
+                "".join('<td data-k="변경:%d:%s">%s</td>' % (i, k, esc(x[k])) for k in ("전", "뒤", "판정"))))
+        칸5 = ("<table class=\"sg-t\"><thead><tr><th>날짜</th><th>변경</th><th>겨냥한 지표</th><th>기대 방향</th><th>전</th><th>뒤</th><th>판정</th></tr></thead>"
+             "<tbody>%s</tbody></table>" % "".join(행))
+    if 자료["변경"]["건너뜀"]:
+        칸5 += '<p class="rt-sub">형식이 다른 줄 %d개를 건너뜀</p>' % 자료["변경"]["건너뜀"]
+    # 6. 이 기간의 회고
+    칸6 = ""
+    for x in 자료["회고"]:
+        본문 = '<pre>%s</pre>' % esc(x["글"]) if x["글"] is not None else 비었음
+        칸6 += ('<details class="rt"><summary><b>%s</b> %s %s <code>%s</code> <span data-k="%s">%s</span> <span data-k="%s">%s</span></summary>%s</details>' % (
+            esc(x["제목"]), esc(x["카드"]), esc(x["날짜"]), esc(x["커밋"][:7]), esc("회고:%s:막힘" % x["카드"], quote=True), esc(x["막힘"]),
+            esc("회고:%s:비용" % x["카드"], quote=True), esc(x["비용"]), 본문))
+    칸들 = [("핵심 지표", "".join(칸1)), ("단계별 표", 칸2), ("멈춤 원인", 칸3),
+          ("반복 지적에서 규칙까지", 칸4), ("바꾼 것의 효과", 칸5), ("이 기간의 회고", 칸6)]
+    for i, (제목, 본문) in enumerate(칸들, 1):
+        parts.append(칸(i, 제목, 본문 + (비었음 if i == 1 and not m["손커밋표본"][1] else "") if i == 1 else 본문 or 비었음))
+    틀 = FILE_TEMPLATE.replace('<a href="board.html">← 보드</a>', '<a href="/">← %s</a>' % 화면이름["home"]).replace("<h1>%(name)s</h1>\n", "", 1)
+    return (틀 % {"name": 화면이름["retro"], "body": "\n".join(parts)}).replace("</style>", _신호_CSS + _회고_CSS + "</style>", 1)
+
+
+# ── 기능 진척 화면과 정리된 시나리오 상세 (ISSUE-ui-13-features-scenario-2026-11-24) ──
+# 요소 상태는 `요소_칸`(→ `scenario_progress`)·완료 기준은 `criteria_rows` 가 정한다 — 이 화면들은 그 결과를 그리기만 한다.
+_기능_CSS = """main { max-width:1200px; }\n.fx { font-size:14px; }
+.fx h1 { font-size:22px; font-weight:700; color:var(--fg); margin:4px 0 12px; }
+.fx h1 span { font-size:13px; font-weight:400; color:var(--dim); margin-left:8px; }
+.fx .ftabs { display:flex; flex-wrap:wrap; gap:4px; margin:0 0 16px; }
+.fx .ftabs a { padding:4px 12px; border-radius:6px; font-size:13px; color:var(--dim); }
+.fx .ftabs a[aria-current] { background:var(--soft); color:var(--fg); font-weight:600; }
+.fx .tiles { display:flex; flex-wrap:wrap; gap:12px; margin:0 0 16px; }
+.fx .tile { flex:1; min-width:150px; padding:12px 16px; border:1px solid var(--line); border-radius:var(--r-card); display:flex; flex-direction:column; }
+.fx .tile .lb { font-size:12px; color:var(--dim); } .fx .tile .v { font-size:22px; font-weight:700; color:var(--fg); } .fx .tile .sub { font-size:12px; color:var(--dim); }
+.fx .lg { display:flex; flex-wrap:wrap; gap:8px; margin:0 0 12px; font-size:12px; color:var(--dim); }
+.fx .fr { padding:12px 0; border-top:1px solid var(--line); }
+.fx .fh { display:flex; flex-wrap:wrap; align-items:center; gap:10px; margin:0 0 8px; }
+.fx .fh .sid { font:12px var(--mono); color:var(--dim); } .fx .fh .fn { font-size:15px; font-weight:600; color:var(--fg); }
+.fx .fm { margin:8px 0 0; font-size:12px; color:var(--dim); }
+.fx .cells { display:flex; flex-wrap:wrap; gap:6px; }
+.fx .ec { min-width:34px; padding:3px 8px; border-radius:6px; border:1px solid transparent; font:12px var(--mono); text-align:center; }
+.fx .ec-done { background:var(--teal-bg); color:var(--teal); } .fx .ec-doing { background:var(--blue-bg); color:var(--blue); }
+.fx .ec-hold { background:var(--ochre-bg); color:var(--ochre-ink); } .fx .ec-stop { background:var(--orange-bg); color:var(--orange); }
+.fx .ec-idea { border:1px dashed var(--gray); color:var(--dim); } .fx .ec-none { background:var(--gray-bg); color:var(--dim); }
+.fx .fbar { width:160px; height:6px; border-radius:3px; background:var(--soft); overflow:hidden; } .fx .fbar i { display:block; height:6px; background:var(--blue); }
+.fx .who { display:flex; gap:12px; flex-wrap:wrap; margin:0 0 16px; color:var(--fg); }
+.fx .who-box { flex:1 1 260px; background:var(--panel); border:1px solid var(--line); border-radius:var(--r-card); padding:12px 14px; }
+.fx .who-box h3 { margin:0 0 6px; font-size:12px; color:var(--dim); font-weight:600; } .fx .who-box p { margin:0; }
+.fx details { margin:6px 0; } .fx summary { cursor:pointer; color:var(--fg); }
+.fx .crumb { font-size:12px; color:var(--dim); margin:0 0 8px; }
+.fx table { display:table; }
+"""
+_취소선 = re.compile(r"~~(.+?)~~")
+
+
+def _취소선_뺌(x):
+    """칸 글에서 `~~지운 글~~` 조각을 빼고 공백을 하나로 줄인다."""
+    return re.sub(r"\s+", " ", _취소선.sub("", x).replace("~~", "")).strip()
+
+
+def _기능_틀():
+    return FILE_TEMPLATE.replace('<a href="board.html">← 보드</a>\n<h1>%(name)s</h1>\n', "", 1).replace("</style>", _기능_CSS + "</style>", 1)
+
+
+def render_features(item, items, cards, scenarios):
+    """`/p/<이름>/features` — 프로젝트 탭, 요약 넷, 시나리오마다 한 줄(요소 칸), 시나리오 밖 카드 한 줄."""
+    esc = html.escape
+    주소 = _주소(item["name"])
+    탭 = "".join('<a href="%sfeatures"%s>%s</a>' % (esc(_주소(p["name"]), quote=True), ' aria-current="page"' if p["name"] == item["name"] else "", esc(p["name"]))
+               for p in items)
+    칸들 = {s["번호"]: 요소_칸(cards, s) for s in scenarios}
+    기준들 = {s["번호"]: criteria_rows(cards, s) for s in scenarios if not s["오류"]}
+    요소 = [k for v in 칸들.values() for k in v]
+    기준 = [r for v in 기준들.values() for r in v]
+    보류 = [c for c in cards if c["상태"] == "보류"]
+    적힘 = sum(1 for c in 보류 if c["멈춘이유"].strip())
+    기다림 = sum(1 for s in scenarios if not s["오류"] and _시나리오_배지(cards, s) == "완료 선언 대기")
+
+    def tile(이름, 값, 설명=""):
+        return '<div class="tile"><span class="lb">%s</span><span class="v">%s</span><span class="sub">%s</span></div>' % (esc(이름), esc(값), esc(설명))
+    요약 = '<div class="tiles">%s</div>' % "".join([
+        tile("시나리오", str(len(scenarios)), "완료 선언 대기 %d" % 기다림),
+        tile("요소 완료", "%d/%d" % (sum(1 for k in 요소 if k["상태"] == "완료"), len(요소)) if scenarios else "—", "카드 없음 %d" % sum(1 for k in 요소 if k["상태"] == "카드 없음")),
+        tile("완료 기준 확인", "%d/%d" % (sum(1 for r in 기준 if r["모두 완료"]), len(기준)) if 기준 else "—", ""),
+        tile("보류", str(len(보류)), "까닭 적힘 %d · 까닭 없음 %d" % (적힘, len(보류) - 적힘))])
+
+    def 셀(k):
+        제목 = "%s · %s%s" % (k["요소"], k["상태"], " — " + k["까닭"] if k["상태"] == "보류" else "")
+        cls = "ec ec-%s" % _칸_클래스[k["모양"]]
+        if k["카드"]:
+            return '<a class="%s" href="%s" title="%s">%s</a>' % (cls, esc(주소 + urllib.parse.quote(k["카드"]["file"]), quote=True), esc(제목, quote=True), esc(k["요소"]))
+        return '<span class="%s" title="%s">%s</span>' % (cls, esc(제목, quote=True), esc(k["요소"]))
+
+    def 줄(s):
+        머리 = '<span class="sid">%s</span>' % esc(s["번호"])
+        if s["오류"]:
+            return '<section class="fr" data-sc="%s"><div class="fh">%s<span class="fn">%s</span><span class="why">%s</span></div></section>' % (
+                esc(s["번호"]), 머리, esc(s["이름"]), esc(s["오류"]))
+        p = scenario_progress(cards, s)
+        r = 기준들[s["번호"]]
+        배지 = _시나리오_배지(cards, s)
+        셀들 = "".join(셀(k) for k in 칸들[s["번호"]]) or '<span class="meta">요소 없음</span>'
+        return ('<section class="fr" data-sc="%s"><div class="fh">%s<a class="fn" href="%splan/%s">%s</a><span class="badge b-%s">%s</span>'
+                '<div class="fbar"><i style="width:%d%%"></i></div></div><div class="cells">%s</div>'
+                '<p class="fm">완료 %d/%d · 완료 기준 확인 %s</p></section>'
+                % (esc(s["번호"]), 머리, esc(주소, quote=True), esc(s["file"], quote=True), esc(_취소선_뺌(s["이름"])), _배지_색(배지), esc(배지),
+                   p["퍼센트"] or 0, 셀들, p["수"]["완료"], p["분모"],
+                   "%d/%d" % (sum(1 for x in r if x["모두 완료"]), len(r)) if r else "—"))
+    known = {s["번호"] for s in scenarios}
+    낱장 = [c for c in cards if c["시나리오"] not in known]
+    분포 = sorted(collections.Counter(c["상태"] for c in 낱장).items(), key=lambda kv: (-kv[1], COLUMNS.index(kv[0]) if kv[0] in COLUMNS else 99))
+    밖 = "시나리오 밖 카드 %d" % len(낱장) + (" — " + " · ".join("%s %d" % kv for kv in 분포) if 낱장 else "")
+    범례 = '<p class="lg">%s</p>' % "".join('<span class="ec ec-%s">%s</span>' % (c, esc(n)) for c, n in (
+        ("done", "완료"), ("doing", "진행·대기"), ("hold", "보류"), ("stop", "멈춘 실행"), ("idea", "아이디어"), ("none", "카드 없음")))
+    본문 = ('<div class="fx"><p class="crumb"><a href="/">%s</a> / <a href="%s">%s</a> / %s</p><div class="ftabs">%s</div>'
+          '<h1>%s<span>%s</span></h1>%s%s%s<p class="fm">%s</p></div>'
+          % (esc(화면이름["home"]), esc(주소, quote=True), esc(item["name"]), esc(화면이름["features"]), 탭, esc(화면이름["features"]), esc(item["name"]), 요약,
+             범례 if scenarios else "", "".join(줄(s) for s in scenarios) or '<p class="meta">시나리오 없음 — docs/plan/SC-*.md 가 없다</p>', esc(밖)))
+    return _기능_틀() % {"name": esc("%s · %s" % (화면이름["features"], item["name"])), "body": 본문}
+
+
+def _시나리오_머리(text):
+    """시나리오 문서 원문에서 (머리 표 칸 `{열쇠: 값}`, `## ` 절 `[(제목, [줄])]`). 맨 위 `---` 머리말 블록은 건너뛴다."""
+    lines = text.splitlines()
+    if lines and lines[0].strip() == "---":
+        끝 = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
+        if 끝 is not None:
+            lines = lines[끝 + 1:]
+    칸, 절, 지금 = {}, [], None
+    for l in lines:
+        if l.startswith("## "):
+            지금 = (l[3:].strip(), [])
+            절.append(지금)
+        elif 지금 is not None:
+            지금[1].append(l)
+        elif l.strip().startswith("|") and not _표_구분줄.match(l):
+            c = _칸(l)
+            if len(c) >= 2:
+                칸.setdefault(c[0], c[1])
+    return 칸, 절
+
+
+def render_scenario(item, cards, scenarios, s, text):
+    """`/p/<이름>/plan/SC-nn-*.md` 의 정리된 화면 — 머리말 블록과 `~~` 는 보이지 않고, 요소 표 줄마다 카드 고리가 있다. 원문은 `?원본=1`."""
+    esc = html.escape
+    주소 = _주소(item["name"])
+    칸값, 절들 = _시나리오_머리(text)
+    칸 = {k["요소"]: k for k in 요소_칸(cards, s)}
+    mine = [c for c in cards if c["시나리오"] == s["번호"]]
+    p = scenario_progress(cards, s)
+    기준 = criteria_rows(cards, s)
+    배지 = _시나리오_배지(cards, s)
+    바뀜 = [x for k in ("누가", "왜") for x in _취소선.findall(칸값.get(k, ""))]
+    상자 = {k: '<div class="who-box"><h3>%s</h3><p>%s</p>' % (k, esc(_취소선_뺌(칸값.get(k, ""))) or "—") for k in ("누가", "왜")}
+    if 바뀜:
+        상자["누가"] += ('<details class="chg"><summary>바뀐 내역 %d</summary><ul>%s</ul></details>'
+                      % (len(바뀜), "".join("<li><del>%s</del></li>" % esc(x) for x in 바뀜)))
+    누가왜 = "".join(v + "</div>" for v in 상자.values())
+
+    def 링크(c):
+        return '<a href="%s">%s</a>' % (esc(주소 + urllib.parse.quote(c["file"]), quote=True), esc(_취소선_뺌(c["title"])))
+    줄들 = []
+    for e in sorted(s["요소"], key=lambda x: int(x[2:])):
+        have = sorted((c for c in mine if e in c["요소"]), key=lambda c: c["file"])
+        k = 칸.get(e)
+        상태 = k["상태"] if k else "카드 아님" if e in s["카드아님"] else "없어짐"
+        까닭 = k["까닭"] if k and k["상태"] == "보류" else "—"
+        이은 = ", ".join(sorted({a for c in have for a in (c["완료기준"] or c["인수조건"])})) or "—"
+        기기 = " · ".join(dict.fromkeys(x for c in have for x in (c["돈기계"] or c["기기"],) if x)) or "—"
+        줄들.append('<tr><td>%s %s</td><td>%s</td><td><span class="badge b-%s">%s</span></td><td>%s</td><td>%s</td><td>%s</td></tr>'
+                  % (esc(e), esc(_취소선_뺌(s["요소이름"].get(e, ""))), "<br>".join(링크(c) for c in have) or "—", _배지_색(상태), esc(상태), esc(까닭), esc(이은), esc(기기)))
+    요소표 = ('<table class="et"><thead><tr>%s</tr></thead><tbody>%s</tbody></table>'
+            % ("".join("<th>%s</th>" % h for h in ("요소", "카드", "상태", "보류 까닭", "이은 완료 기준", "기기")), "".join(줄들))
+            if 줄들 else '<p class="meta">요소 없음</p>')
+    기준줄 = []
+    for r in 기준:
+        판정 = "확인됨" if r["모두 완료"] else "남음" if r["카드"] else "카드 없음 — 확인 필요"
+        기준줄.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+                    % (esc(r["번호"]), esc(_취소선_뺌(s["완료기준"].get(r["번호"], ""))), esc(", ".join("%s (%s)" % x for x in r["카드"]) or "—"), esc(판정)))
+    기준표 = ('<table class="ct"><thead><tr>%s</tr></thead><tbody>%s</tbody></table>'
+            % ("".join("<th>%s</th>" % h for h in ("번호", "기준", "이은 카드", "판정")), "".join(기준줄))
+            if 기준줄 else '<p class="meta">완료 기준 없음</p>')
+    접힘 = []
+    for 제목, 줄 in 절들:
+        if 제목 == "요소" or 제목 in _기준절:
+            continue
+        글 = "\n".join(_취소선.sub("", x).replace("~~", "") for x in 줄)
+        try:
+            속 = 본문_그리기(글)
+        except Exception:                                # 그리기가 실패해도 글은 보인다
+            속 = "<pre>%s</pre>" % esc(글)
+        접힘.append('<details class="sec"><summary>%s</summary><div class="md">%s</div></details>' % (esc(_취소선_뺌(제목)), 속))
+    본문 = ('<div class="fx"><p class="crumb"><a href="/">%s</a> / <a href="%s">%s</a> / <a href="%sfeatures">%s</a> / %s</p>'
+          '<h1>%s %s</h1><p><span class="badge b-%s">%s</span> <span class="badge b-%s">%s</span></p>'
+          '<div class="fbar"><i style="width:%d%%"></i></div><p class="fm">요소 %d/%d 완료 · 완료 기준 %s 확인</p>'
+          '<section class="who">%s</section><h2>요소</h2>%s<h2>완료 기준</h2>%s%s%s'
+          '<p><a href="%splan/%s?원본=1">원본 문서 보기</a></p></div>'
+          % (esc(화면이름["home"]), esc(주소, quote=True), esc(item["name"]), esc(주소, quote=True), esc(화면이름["features"]), esc(화면이름["scenario"]),
+             esc(s["번호"]), esc(_취소선_뺌(s["이름"])), _배지_색(배지), esc(배지), _배지_색(s["상태"]), esc(s["상태"]), p["퍼센트"] or 0,
+             p["수"]["완료"], p["분모"], "%d/%d" % (sum(1 for x in 기준 if x["모두 완료"]), len(기준)) if 기준 else "—",
+             누가왜, 요소표, 기준표, "".join(접힘), _지도_절(item, cards, scenarios, "시나리오:" + s["번호"]), esc(주소, quote=True), esc(s["file"], quote=True)))
+    return _기능_틀() % {"name": esc("%s %s" % (s["번호"], _취소선_뺌(s["이름"]))), "body": 본문}
+
+
+def _표_html(head, rows, 날것=False):
+    """`날것` 이면 칸 글을 이미 이스케이프된 HTML 로 보고 그대로 둔다(고리가 든 칸)."""
+    칸글 = (lambda c: str(c)) if 날것 else (lambda c: html.escape(str(c)))                 # noqa: E731
     return ("<table><thead><tr>%s</tr></thead><tbody>%s</tbody></table>"
             % ("".join("<th>%s</th>" % html.escape(h) for h in head),
-               "".join("<tr>%s</tr>" % "".join("<td>%s</td>" % html.escape(str(c)) for c in r) for r in rows)))
+               "".join("<tr>%s</tr>" % "".join("<td>%s</td>" % 칸글(c) for c in r) for r in rows)))
 
 
-def _시나리오_절(card, cards, scenarios):
+def _선행_고리(card, cards, scenarios, 주소, e):
+    """선행 요소 e 의 보이는 HTML 과 그 요소를 가진 같은 시나리오 카드 — 카드가 있으면 고리, 없으면 글. 어느 카드로 가는지는 기능 진척 칸과 같다."""
+    no = card.get("시나리오", "")
+    s = next((x for x in scenarios if x["번호"] == no), None)
+    칸 = {k["요소"]: k["카드"] for k in 요소_칸(cards, s)} if s else {}
+    held = 칸[e] if e in 칸 else next(iter(sorted((c for c in cards if c["시나리오"] == no and e in c["요소"]), key=lambda c: c["file"])), None)
+    if held is None:
+        return html.escape(e), None
+    return '<a href="%s">%s</a>' % (html.escape(주소 + urllib.parse.quote(held["file"]), quote=True), html.escape(e)), held
+
+
+def _시나리오_절(card, cards, scenarios, 주소=""):
     no = card.get("시나리오", "")
     if not no:
         return ""
@@ -3446,15 +4325,15 @@ def _시나리오_절(card, cards, scenarios):
         return "<h2>시나리오</h2><p>%s — 시나리오 파일을 찾지 못했다</p>" % html.escape(no)
     if s["오류"]:
         return "<h2>시나리오</h2><p>%s — %s</p>" % (html.escape(no), html.escape(s["오류"]))
-    rows = [("시나리오", '%s %s' % (no, s["이름"]))]
-    rows += [("요소", "%s %s" % (e, s["요소이름"].get(e, "")))
-             for e in card["요소"]]
+    esc = html.escape
+    rows = [("시나리오", '<a href="%splan/%s">%s</a>' % (esc(주소, quote=True), esc(s["file"], quote=True), esc('%s %s' % (no, s["이름"]))))]
+    rows += [("요소", esc("%s %s" % (e, s["요소이름"].get(e, "")))) for e in card["요소"]]
     for ac in card["완료기준"] + card["인수조건"]:
-        rows.append(("완료 기준 " + ac, s["완료기준"].get(ac, "시나리오에 없는 완료 기준")))
+        rows.append((esc("완료 기준 " + ac), esc(s["완료기준"].get(ac, "시나리오에 없는 완료 기준"))))
     for e in card["선행"]:
-        held = next((c for c in cards if c["시나리오"] == no and e in c["요소"]), None)
-        rows.append(("선행", "%s (%s)" % (e, held["상태"] if held else "카드 없음")))
-    return '<h2>시나리오</h2><p><a href="board.html">← %s</a></p>' % html.escape(화면이름["board"]) + _표_html(("항목", "내용"), rows)
+        글, held = _선행_고리(card, cards, scenarios, 주소, e)
+        rows.append(("선행", "%s (%s)" % (글, esc(held["상태"]) if held else "카드 없음")))
+    return '<h2>시나리오</h2><p><a href="board.html">← %s</a></p>' % esc(화면이름["board"]) + _표_html(("항목", "내용"), rows, 날것=True)
 
 
 _기능줄 = re.compile(r"F-\d{3}")
@@ -3532,7 +4411,7 @@ def _메모(n, v, h):
     return " · ".join(조각) or "—"
 
 
-def _머리_html(card, h, fm, 웹):
+def _머리_html(card, h, fm, 웹, 시나리오=(), 카드들=(), 주소="", 프로젝트=""):
     esc = html.escape
     stem = os.path.splitext(card["file"])[0]
     꼬리 = (card["시나리오"] + (" " + ", ".join(card["요소"]) if card["요소"] else "")) if card["시나리오"] else "시나리오 밖"
@@ -3545,9 +4424,13 @@ def _머리_html(card, h, fm, 웹):
     버튼 = ('<a class="btn" href="%s/pull/%d">PR #%d</a>' % (esc(웹, quote=True), pr, pr)) if 웹 and pr else '<span class="btn">PR —</span>'
     버튼 += ('<a class="btn" href="%s/blob/HEAD/docs/backlog/%s">카드 파일</a>' % (esc(웹, quote=True), urllib.parse.quote(card["file"])) if 웹
             else '<span class="btn">카드 파일 —</span>')
-    return ('<p class="crumb"><a href="/">%s</a> / <a href="board.html">프로젝트</a> / %s</p>'
+    sc = next((x for x in 시나리오 if x["번호"] == card["시나리오"]), None)
+    시 = ('<a href="%splan/%s">%s</a>' % (esc(주소, quote=True), esc(sc["file"], quote=True), esc(card["시나리오"]))
+        if sc else esc(card["시나리오"] or "—"))
+    선 = ", ".join(_선행_고리(card, 카드들, 시나리오, 주소, e)[0] for e in card["선행"]) or "—"
+    return ('<p class="crumb"><a href="/">%s</a> / <a href="board.html">%s</a> / %s</p>'
             '<div class="badges">%s</div><h1>%s</h1><p class="sub">%s · 시나리오 %s · 선행 %s</p><div class="btns">%s</div>'
-            % (esc(화면이름["home"]), esc(꼬리), 배지, esc(card["title"]), esc(stem), esc(card["시나리오"] or "—"), esc(", ".join(card["선행"]) or "—"), 버튼))
+            % (esc(화면이름["home"]), esc(프로젝트), esc(꼬리), 배지, esc(card["title"]), esc(stem), 시, 선, 버튼))
 
 
 def _요약_html(card, cards, h, 중앙값):
@@ -3625,6 +4508,442 @@ def _사람_html(card, 검토):
     return '<section class="panel human"><div class="ph"><h2>사람이 볼 것</h2></div><div class="flist">%s</div></section>' % "".join(줄)
 
 
+# ── 점과 선 지도 (ISSUE-ui-15-graph-2026-11-24) ──
+# 점 = 시나리오·카드·문서·기능, 선 = 선행·요소·기능·인용·언급. 계산은 모두 여기(서버)서 하고, 화면 안 스크립트는 배치·끌기·확대·누름만 맡는다.
+_점_종류 = ("시나리오", "카드", "문서", "기능")
+_선_글 = {"선행": "선행", "요소": "시나리오·요소", "기능": "기능", "인용": "문서 인용", "언급": "다른 시나리오 언급"}
+_색_기준 = ("상태", "시나리오", "기기")
+_지도_경로 = re.compile(r"docs/[A-Za-z]+/[^\s`)|,\]\"'<>]+")
+_지도_번호 = re.compile(r"(?<![A-Za-z0-9_])SC-(\d{2})(?![0-9])")
+_지도_색들 = 8
+
+
+def _깊이(x):
+    """주변 깊이 — 1~4 로 묶고 숫자가 아니면 2."""
+    try:
+        return max(1, min(4, int(x)))
+    except (TypeError, ValueError):
+        return 2
+
+
+def _지도_본문(project, s):
+    try:
+        with open(os.path.join(project, "docs", "plan", s["file"]), encoding="utf-8") as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
+def 연관_자료(project, cards, scenarios, 기능맵):
+    """프로젝트 하나의 점과 선 `{"점": {ID: {...}}, "선": [{"앞", "뒤", "종류", ("요소")}]}`. 파일을 고치지 않고 예외를 내지 않는다."""
+    점, 선, 봄 = {}, [], set()
+
+    def 더하기(id_, 종류, 이름, 상태="", 시나리오="", 기기="", 고리=""):
+        점.setdefault(id_, {"종류": 종류, "이름": 이름, "상태": 상태, "시나리오": 시나리오, "기기": 기기, "고리": 고리})
+
+    def 잇기(앞, 뒤, 종류, 요소=None):
+        if 앞 == 뒤 or 앞 not in 점 or 뒤 not in 점 or (앞, 뒤, 종류) in 봄:
+            return
+        봄.add((앞, 뒤, 종류))
+        선.append({"앞": 앞, "뒤": 뒤, "종류": 종류, **({"요소": list(요소 or [])} if 종류 == "요소" else {})})
+    for s in scenarios:
+        더하기("시나리오:" + s["번호"], "시나리오", "%s %s" % (s["번호"], s["오류"] or _취소선_뺌(s["이름"])), s["상태"], s["번호"], "", "plan/" + urllib.parse.quote(s["file"]))
+    for c in cards:
+        더하기("카드:" + c["file"], "카드", _취소선_뺌(c["title"]), c["상태"], c["시나리오"], c["기기"], urllib.parse.quote(c["file"]))
+    for 폴더 in ("analysis", "requirements"):
+        for 위, 밑, 파일 in os.walk(os.path.join(project, "docs", 폴더)):
+            밑.sort()
+            for f in sorted(파일):
+                if f.endswith((".md", ".txt")):
+                    rel = os.path.relpath(os.path.join(위, f), project).replace(os.sep, "/")
+                    더하기("문서:" + rel, "문서", rel)
+    for fid, row in 기능맵.get("줄", {}).items():
+        더하기("기능:" + fid, "기능", "%s %s" % (fid, row["칸"][1]), row["칸"][2])
+    try:
+        for p in precedence(project, cards, scenarios):
+            for a in p["화살표"]:
+                잇기("카드:" + a["앞"], "카드:" + a["뒤"], "선행")
+    except Exception:                                 # noqa: BLE001 — 선행 그림이 못 읽혀도 나머지 선은 그린다
+        pass
+    for c in cards:
+        for v in c["선행"]:
+            잇기("카드:%s.md" % v, "카드:" + c["file"], "선행")
+        if c["시나리오"]:
+            해당 = "시나리오:" + c["시나리오"]
+            if 해당 in 점:
+                if (해당, "카드:" + c["file"], "요소") not in 봄:
+                    잇기(해당, "카드:" + c["file"], "요소", c["요소"])
+        for f in c["기능"]:
+            잇기("카드:" + c["file"], "기능:" + f, "기능")
+    for s in scenarios:
+        if s["오류"]:
+            continue
+        나 = "시나리오:" + s["번호"]
+        본문 = _지도_본문(project, s)
+        for m in _지도_경로.finditer(본문):
+            경로 = m.group(0).rstrip(".:;")
+            조각 = 경로.split("/")
+            이름 = 조각[-1]
+            if not 이름.endswith((".md", ".txt")):
+                continue
+            if 조각[1] in ("analysis", "requirements"):
+                잇기(나, "문서:" + 경로, "인용")
+            elif len(조각) == 3 and 조각[1] == "backlog":
+                잇기(나, "카드:" + 이름, "인용")
+            elif (len(조각) == 3 and 조각[1] == "plan" and not _시나리오이름.match(이름)
+                  and not 이름.startswith(("끝보고-", "사람손-")) and os.path.isfile(os.path.join(project, 경로))):
+                더하기("문서:" + 경로, "문서", 경로)
+                잇기(나, "문서:" + 경로, "인용")
+        for m in _지도_번호.finditer(본문):
+            잇기(나, "시나리오:SC-" + m.group(1), "언급")
+    return {"점": 점, "선": 선}
+
+
+def _보이는(자료, 거르개, 가운데=None):
+    """거르개(`점종류`·`선종류`·`완료숨김`, 없으면 모두)를 건 점과 선. 가운데 점은 걸려도 남는다."""
+    g = 거르개 or {}
+    종류들, 선들, 숨김 = g.get("점종류"), g.get("선종류"), g.get("완료숨김")
+
+    def 남나(i):
+        p = 자료["점"][i]
+        return i == 가운데 or not ((종류들 is not None and p["종류"] not in 종류들) or (숨김 and p["종류"] == "카드" and p["상태"] == "완료"))
+    점 = {i: p for i, p in 자료["점"].items() if 남나(i)}
+    return {"점": 점, "선": [e for e in 자료["선"] if (선들 is None or e["종류"] in 선들) and e["앞"] in 점 and e["뒤"] in 점]}
+
+
+def 주변(자료, 가운데, 깊이, 거르개=None):
+    """가운데에서 선(방향 무시)을 깊이 번 이하로 따라 닿는 점과 그 사이 선. 거르개가 먼저 걸리고 남은 선으로만 이웃을 센다."""
+    if 가운데 not in 자료["점"]:
+        return {"점": {}, "선": []}
+    보임 = _보이는(자료, 거르개, 가운데)
+    이웃 = {}
+    for e in 보임["선"]:
+        이웃.setdefault(e["앞"], []).append(e["뒤"])
+        이웃.setdefault(e["뒤"], []).append(e["앞"])
+    닿음, 끝 = {가운데}, [가운데]
+    for _ in range(_깊이(깊이)):
+        다음 = []
+        for i in 끝:
+            for j in 이웃.get(i, ()):
+                if j not in 닿음:
+                    닿음.add(j)
+                    다음.append(j)
+        끝 = 다음
+    return {"점": {i: p for i, p in 보임["점"].items() if i in 닿음}, "선": [e for e in 보임["선"] if e["앞"] in 닿음 and e["뒤"] in 닿음]}
+
+
+def _지도_주소(기본, 인자):
+    """`기본?키=값&…` — 값만 퍼센트 부호로, 키는 그대로. 이 화면의 고리는 모두 여기서 만든다."""
+    return 기본 + ("?" + "&".join("%s=%s" % (k, urllib.parse.quote(str(v), safe="")) for k, v in 인자) if 인자 else "")
+
+
+def _화살촉(x1, y1, x2, y2, r):
+    """(x1,y1)→(x2,y2) 선의 뒤 끝 동그라미(반지름 r) 가장자리에 놓는 작은 삼각형 `points` 값."""
+    dx, dy = x2 - x1, y2 - y1
+    d = (dx * dx + dy * dy) ** 0.5 or 1.0
+    ux, uy = dx / d, dy / d
+    tx, ty = x2 - ux * r, y2 - uy * r
+    bx, by = tx - ux * 8, ty - uy * 8
+    return "%.1f,%.1f %.1f,%.1f %.1f,%.1f" % (tx, ty, bx - uy * 3.5, by + ux * 3.5, bx + uy * 3.5, by - ux * 3.5)
+
+
+def _원형(ids, cx, cy, R):
+    out = {}
+    for k, i in enumerate(ids):
+        a = 2 * math.pi * k / max(len(ids), 1) - math.pi / 2
+        out[i] = (cx + R * math.cos(a), cy + R * math.sin(a))
+    return out
+
+
+_지도_CSS = """.rmsvg { width:100%; border:1px solid var(--line); border-radius:8px; background:var(--panel); }
+.rm-c0 { fill:var(--blue); } .rm-c1 { fill:var(--orange); } .rm-c2 { fill:var(--teal); } .rm-c3 { fill:var(--gray); }
+.rm-st-teal { fill:var(--teal); } .rm-st-blue { fill:var(--blue); } .rm-st-ochre { fill:var(--ochre); } .rm-st-orange { fill:var(--orange); } .rm-st-gray { fill:var(--gray); }
+.rm-c4 { fill:var(--pj-0); } .rm-c5 { fill:var(--ochre); } .rm-c6 { fill:var(--pj-1); } .rm-c7 { fill:var(--pj-3); }
+.rmsvg line { stroke:var(--gray); stroke-width:1; opacity:.75; } .rmsvg line.d { stroke-dasharray:4 3; }
+.rmsvg polygon.ah { fill:var(--gray); } .rmsvg circle { stroke:var(--fg); stroke-width:.6; }
+.rmsvg .sel circle, .rmsvg .ctr circle { stroke-width:3; } .rmsvg text { font-size:10px; fill:var(--fg); pointer-events:none; }
+.rmsvg g.pt { cursor:pointer; }"""
+
+
+def _작은_지도(자료, 가운데, 주소):
+    """카드·시나리오 상세 아래 절 — 가운데 점과 깊이 1 이웃을 원형으로 놓은 스크립트 없는 그림과 지도 고리."""
+    esc = html.escape
+    부분 = 주변(자료, 가운데, 1)
+    if 가운데 not in 부분["점"]:
+        return ""
+    남 = sorted(i for i in 부분["점"] if i != 가운데)
+    자리 = {가운데: (180.0, 130.0), **_원형(남, 180.0, 130.0, 95.0)}
+    반지름 = lambda i: 9 if 부분["점"][i]["종류"] == "시나리오" else 6          # noqa: E731
+    색 = {"시나리오": 1, "카드": 0, "문서": 3, "기능": 2}
+    줄 = []
+    for e in 부분["선"]:
+        (x1, y1), (x2, y2) = 자리[e["앞"]], 자리[e["뒤"]]
+        줄.append('<line class="%s" x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f"/>' % ("d" if e["종류"] in ("인용", "언급") else "", x1, y1, x2, y2))
+        if e["종류"] == "선행":
+            줄.append('<polygon class="ah" points="%s"/>' % _화살촉(x1, y1, x2, y2, 반지름(e["뒤"])))
+    for i in [가운데] + 남:
+        p, (x, y) = 부분["점"][i], 자리[i]
+        줄.append('<g class="%s"><title>%s</title><circle cx="%.1f" cy="%.1f" r="%d" class="rm-c%d"/><text x="%.1f" y="%.1f" text-anchor="middle">%s</text></g>'
+                % ("ctr" if i == 가운데 else "pt", esc(p["이름"]), x, y, 반지름(i), 색[p["종류"]], x, y + 반지름(i) + 11, esc(p["이름"][:8])))
+    고리 = _지도_주소(주소 + "graph", [("범위", "주변"), ("점", 가운데), ("깊이", 1)])
+    return ('<h2>%s</h2><style>%s</style><svg class="rmsvg" viewBox="0 0 360 260" role="img" aria-label="%s">%s</svg>%s<p><a href="%s">%s 열기</a></p>'
+            % (esc(화면이름["graph"]), _지도_CSS, esc(화면이름["graph"], quote=True), "".join(줄),
+               "" if 남 else '<p class="meta">이어진 점 없음</p>', esc(고리, quote=True), esc(화면이름["graph"])))
+
+
+def _지도_절(item, cards, scenarios, 가운데):
+    try:
+        return _작은_지도(연관_자료(item["path"], cards, scenarios, read_featuremap(item["path"])), 가운데, _주소(item["name"]))
+    except Exception:                                  # noqa: BLE001 — 작은 지도가 막혀도 상세 화면은 그대로 나온다
+        return ""
+
+
+def _지도_상태(qs):
+    def 하나(k):
+        return (qs.get(k) or [""])[0]
+    return {"범위": "주변" if 하나("범위") == "주변" else "전체", "점": 하나("점"), "깊이": _깊이(하나("깊이") or None), "고름": 하나("고름"),
+            "거름": 하나("거름") == "1", "점종류": list(qs.get("점종류", [])), "선종류": list(qs.get("선종류", [])),
+            "색": 하나("색") if 하나("색") in _색_기준 else "상태", "완료숨김": 하나("완료숨김") == "1"}
+
+
+def _지도_인자(상태, 바꿈=None):
+    s = {**상태, **(바꿈 or {})}
+    out = []
+    if s["범위"] == "주변":
+        out += [("범위", "주변"), ("점", s["점"]), ("깊이", s["깊이"])]
+    if s["고름"]:
+        out.append(("고름", s["고름"]))
+    if s["거름"]:
+        out += [("거름", "1")] + [("점종류", x) for x in s["점종류"]] + [("선종류", x) for x in s["선종류"]]
+    if s["색"] != "상태":
+        out.append(("색", s["색"]))
+    if s["완료숨김"]:
+        out.append(("완료숨김", "1"))
+    return out
+
+
+def _지도_색값(p, 기준):
+    if 기준 == "시나리오":
+        return p["시나리오"] or "시나리오 없음"
+    if 기준 == "기기":
+        return _기기_글(p["기기"] or "기기 모름") if p["종류"] == "카드" else ""
+    return p["상태"]
+
+
+_지도_스크립트 = r"""(function () {
+  var MAX_ITER = 300, STOP_MOVE = 0.5, W = 800, H = 600, REP = 10, REST = 40, SPRING = 0.05, PULL = 0.02, DAMP = 0.8;
+  var data = JSON.parse(document.getElementById("relmap-data").textContent);
+  var svg = document.getElementById("relmap-svg"), status = document.getElementById("relmap-status");
+  var nodes = data.nodes, links = data.links, n = nodes.length, NS = "http://www.w3.org/2000/svg";
+  if (!n) { status.textContent = "자리 잡음 · 0 ms"; return; }
+  var gs = svg.querySelectorAll("g.pt"), ls = svg.querySelectorAll("line"), arrows = {};
+  Array.prototype.forEach.call(svg.querySelectorAll("polygon.ah"), function (h) { arrows[h.getAttribute("data-l")] = h; });
+  var px = [], py = [], vx = [], vy = [], i, j, k;
+  for (i = 0; i < n; i++) { px[i] = nodes[i].x; py[i] = nodes[i].y; vx[i] = 0; vy[i] = 0; }
+  if (n <= 60) {
+    for (i = 0; i < n; i++) {
+      var t = document.createElementNS(NS, "text");
+      t.setAttribute("x", 0); t.setAttribute("y", nodes[i].r + 11); t.setAttribute("text-anchor", "middle");
+      t.textContent = nodes[i].n.slice(0, 10); gs[i].appendChild(t);
+    }
+  }
+  function draw() {
+    for (i = 0; i < n; i++) gs[i].setAttribute("transform", "translate(" + px[i].toFixed(1) + " " + py[i].toFixed(1) + ")");
+    for (k = 0; k < links.length; k++) {
+      var a = links[k][0], b = links[k][1], l = ls[k];
+      l.setAttribute("x1", px[a].toFixed(1)); l.setAttribute("y1", py[a].toFixed(1));
+      l.setAttribute("x2", px[b].toFixed(1)); l.setAttribute("y2", py[b].toFixed(1));
+      var h = arrows[k];
+      if (h) {
+        var dx = px[b] - px[a], dy = py[b] - py[a], d = Math.sqrt(dx * dx + dy * dy) || 1, ux = dx / d, uy = dy / d;
+        var tx = px[b] - ux * nodes[b].r, ty = py[b] - uy * nodes[b].r, bx = tx - ux * 8, by = ty - uy * 8;
+        h.setAttribute("points", tx.toFixed(1) + "," + ty.toFixed(1) + " " + (bx - uy * 3.5).toFixed(1) + "," + (by + ux * 3.5).toFixed(1) +
+          " " + (bx + uy * 3.5).toFixed(1) + "," + (by - ux * 3.5).toFixed(1));
+      }
+    }
+  }
+  var fx = [], fy = [], iter = 0, start = performance.now(), held = -1;
+  function step() {
+    var dx, dy, d2, d, f, m, maxMove = 0;
+    for (i = 0; i < n; i++) { fx[i] = (W / 2 - px[i]) * PULL; fy[i] = (H / 2 - py[i]) * PULL; }
+    for (i = 0; i < n; i++) for (j = i + 1; j < n; j++) {
+      dx = px[i] - px[j]; dy = py[i] - py[j]; d2 = dx * dx + dy * dy;
+      if (d2 < 1) { dx = 1; dy = 0; d2 = 1; }
+      f = REP / d2; fx[i] += dx * f; fy[i] += dy * f; fx[j] -= dx * f; fy[j] -= dy * f;
+    }
+    for (k = 0; k < links.length; k++) {
+      var a = links[k][0], b = links[k][1];
+      dx = px[b] - px[a]; dy = py[b] - py[a]; d = Math.sqrt(dx * dx + dy * dy) || 1; f = (d - REST) * SPRING / d;
+      fx[a] += dx * f; fy[a] += dy * f; fx[b] -= dx * f; fy[b] -= dy * f;
+    }
+    for (i = 0; i < n; i++) {
+      if (i === held) continue;
+      vx[i] = (vx[i] + fx[i]) * DAMP; vy[i] = (vy[i] + fy[i]) * DAMP;
+      m = Math.sqrt(vx[i] * vx[i] + vy[i] * vy[i]);
+      if (m > 12) { vx[i] *= 12 / m; vy[i] *= 12 / m; m = 12; }
+      px[i] = Math.min(W - 20, Math.max(20, px[i] + vx[i])); py[i] = Math.min(H - 20, Math.max(20, py[i] + vy[i])); if (m > maxMove) maxMove = m;
+    }
+    iter++;
+    return maxMove;
+  }
+  function settle() {
+    var moved = 1, c = 0;
+    while (c++ < 10 && iter < MAX_ITER && moved >= STOP_MOVE) moved = step();
+    draw();
+    if (iter < MAX_ITER && moved >= STOP_MOVE) requestAnimationFrame(settle);
+    else status.textContent = "자리 잡음 · " + Math.round(performance.now() - start) + " ms";
+  }
+  draw(); requestAnimationFrame(settle);
+  var anchors = {};
+  Array.prototype.forEach.call(document.querySelectorAll("a[data-pid]"), function (a) { anchors[a.getAttribute("data-pid")] = a; });
+  function go(idx, center) { var a = anchors[nodes[idx].id]; if (a) location.href = a.getAttribute(center ? "data-ctr" : "href"); }
+  var vb = { x: 0, y: 0, w: W, h: H }, pan = null, moved = 0, timer = null, lastHit = -1;
+  function setView() { svg.setAttribute("viewBox", vb.x + " " + vb.y + " " + vb.w + " " + vb.h); }
+  function at(e) { var r = svg.getBoundingClientRect(); return [vb.x + (e.clientX - r.left) * vb.w / r.width, vb.y + (e.clientY - r.top) * vb.h / r.height]; }
+  function hit(e) { var g = e.target.closest ? e.target.closest("g.pt") : null; return g ? Array.prototype.indexOf.call(gs, g) : -1; }
+  svg.addEventListener("pointerdown", function (e) {
+    moved = 0; held = hit(e); pan = [e.clientX, e.clientY]; svg.setPointerCapture(e.pointerId);
+  });
+  svg.addEventListener("pointermove", function (e) {
+    if (!pan) return;
+    var r = svg.getBoundingClientRect(), dx = e.clientX - pan[0], dy = e.clientY - pan[1];
+    moved += Math.abs(dx) + Math.abs(dy); pan = [e.clientX, e.clientY];
+    if (held >= 0) { var p = at(e); px[held] = p[0]; py[held] = p[1]; vx[held] = 0; vy[held] = 0; draw(); }
+    else { vb.x -= dx * vb.w / r.width; vb.y -= dy * vb.h / r.height; setView(); }
+  });
+  svg.addEventListener("pointerup", function (e) {
+    var h = held; pan = null; held = -1;
+    if (h < 0 || moved > 4) return;
+    if (timer && lastHit === h) { clearTimeout(timer); timer = null; go(h, true); return; }
+    lastHit = h; timer = setTimeout(function () { timer = null; go(h, false); }, 260);
+  });
+  svg.addEventListener("wheel", function (e) {
+    e.preventDefault();
+    var p = at(e), z = e.deltaY < 0 ? 0.9 : 1.1, w = Math.min(Math.max(vb.w * z, 80), 6000), s = w / vb.w;
+    vb.x = p[0] - (p[0] - vb.x) * s; vb.y = p[1] - (p[1] - vb.y) * s; vb.w = w; vb.h = vb.h * s; setView();
+  }, { passive: false });
+})();"""
+
+
+def render_relmap(item, items, 자료, qs):
+    """`/p/<이름>/graph` — 범위 탭·거르개·그림·점 목록·고른 점 상자. 범위·깊이·가운데·고름·거르개·색은 모두 주소 인자이고 여기서 그대로 그린다."""
+    esc = html.escape
+    상태 = _지도_상태(qs)
+    기본 = _주소(item["name"]) + "graph"
+    거르개 = {"점종류": set(상태["점종류"]) if 상태["거름"] else None, "선종류": set(상태["선종류"]) if 상태["거름"] else None, "완료숨김": 상태["완료숨김"]}
+    없음글 = ""
+    if 상태["범위"] == "주변":
+        보임 = 주변(자료, 상태["점"], 상태["깊이"], 거르개)
+        if 상태["점"] not in 자료["점"]:
+            없음글 = "그 점이 없다 — %s" % 상태["점"]
+    else:
+        보임 = _보이는(자료, 거르개)
+        if not 자료["점"]:
+            없음글 = "점이 없다 — 카드·시나리오·문서가 하나도 없다"
+    ids = sorted(보임["점"], key=lambda i: (_점_종류.index(보임["점"][i]["종류"]), i))
+    주소_ = lambda 바꿈: esc(_지도_주소(기본, _지도_인자(상태, 바꿈)), quote=True)      # noqa: E731
+
+    # 탭
+    가운데이름 = 자료["점"][상태["점"]]["이름"] if 상태["점"] in 자료["점"] else 상태["점"]
+    탭 = ['<a href="%s"%s>프로젝트 전체</a>' % (주소_({"범위": "전체"}), ' aria-current="page"' if 상태["범위"] == "전체" else "")]
+    if 상태["범위"] == "주변":
+        탭.append('<a href="%s" aria-current="page">%s 주변</a>' % (주소_({}), esc(가운데이름)))
+        탭 += ['<a class="dp" href="%s"%s>깊이 %d</a>' % (주소_({"깊이": n}), ' aria-current="true"' if n == 상태["깊이"] else "", n) for n in range(1, 5)]
+
+    # 왼쪽 거르개
+    def 켬(값, 종류들):
+        return not 상태["거름"] or 값 in 종류들
+    기능있음 = any(p["종류"] == "기능" for p in 자료["점"].values())
+    점수 = collections.Counter(p["종류"] for p in 자료["점"].values())
+    선수 = collections.Counter(e["종류"] for e in 자료["선"])
+    점칸 = []
+    for k in _점_종류:
+        글 = "기능맵 기능" if k == "기능" else k
+        if k == "기능" and not 기능있음:
+            점칸.append('<span class="meta">기능맵 기능 (없음)</span>')
+        else:
+            점칸.append('<label><input type="checkbox" name="점종류" value="%s"%s> %s %d</label>' % (k, " checked" if 켬(k, 상태["점종류"]) else "", esc(글), 점수[k]))
+    선칸 = ['<label><input type="checkbox" name="선종류" value="%s"%s> %s %d</label>' % (k, " checked" if 켬(k, 상태["선종류"]) else "", esc(_선_글[k]), 선수[k])
+          for k in _선_글]
+    색칸 = ['<label><input type="radio" name="색" value="%s"%s> %s</label>' % (k, " checked" if 상태["색"] == k else "", k) for k in _색_기준]
+    숨은 = "".join('<input type="hidden" name="%s" value="%s">' % (k, esc(str(v), quote=True)) for k, v in
+                  [("범위", "주변"), ("점", 상태["점"]), ("깊이", 상태["깊이"])] * (상태["범위"] == "주변") + [("고름", 상태["고름"])] * bool(상태["고름"]))
+    왼쪽 = ('<form class="rm-left" method="get" action="%s">%s<input type="hidden" name="거름" value="1">'
+          '<fieldset><legend>점 종류</legend>%s</fieldset><fieldset><legend>선 종류</legend>%s</fieldset>'
+          '<fieldset><legend>색 기준</legend>%s</fieldset><label><input type="checkbox" name="완료숨김" value="1"%s> 완료 카드 숨기기</label>'
+          '<button type="submit">적용</button></form>'
+          % (esc(기본, quote=True), 숨은, "".join(점칸), "".join(선칸), "".join(색칸), " checked" if 상태["완료숨김"] else ""))
+
+    # 가운데 그림
+    값들 = {i: _지도_색값(보임["점"][i], 상태["색"]) for i in ids}
+    색순서 = {v: k % _지도_색들 for k, v in enumerate(sorted({v for v in 값들.values() if v}))}
+    자리 = _원형(ids, 400.0, 300.0, 230.0)
+    반지름 = lambda i: 9 if 보임["점"][i]["종류"] == "시나리오" else 5 if 보임["점"][i]["종류"] == "문서" else 6    # noqa: E731
+    번호 = {i: k for k, i in enumerate(ids)}
+    선그림, 화살 = [], []
+    for k, e in enumerate(보임["선"]):
+        (x1, y1), (x2, y2) = 자리[e["앞"]], 자리[e["뒤"]]
+        선그림.append('<line class="%s" x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f"/>' % ("d" if e["종류"] in ("인용", "언급") else "", x1, y1, x2, y2))
+        if e["종류"] == "선행":
+            화살.append('<polygon class="ah" data-l="%d" points="%s"/>' % (k, _화살촉(x1, y1, x2, y2, 반지름(e["뒤"]))))
+    점색 = (lambda v: "rm-st-" + _배지_색(v)) if 상태["색"] == "상태" else (lambda v: "rm-c%d" % 색순서.get(v, 3))   # noqa: E731
+    점그림 = []
+    for i in ids:
+        p, (x, y) = 보임["점"][i], 자리[i]
+        cls = "pt k-%s%s%s" % (p["종류"], " sel" if i == 상태["고름"] else "", " ctr" if 상태["범위"] == "주변" and i == 상태["점"] else "")
+        점그림.append('<g class="%s" data-id="%s" data-색="%s" transform="translate(%.1f %.1f)"><title>%s</title><circle r="%d" class="%s"/></g>'
+                    % (cls, esc(i, quote=True), esc(값들[i], quote=True), x, y, esc(p["이름"]), 반지름(i), 점색(값들[i])))
+    데이터 = json.dumps({"nodes": [{"id": i, "n": 보임["점"][i]["이름"], "x": round(자리[i][0], 1), "y": round(자리[i][1], 1), "r": 반지름(i)} for i in ids],
+                       "links": [[번호[e["앞"]], 번호[e["뒤"]], 1 if e["종류"] == "선행" else 0] for e in 보임["선"]]},
+                      ensure_ascii=False).replace("<", "\\u003c")
+    범례 = "".join('<span class="lgd"><svg width="10" height="10"><circle cx="5" cy="5" r="4" class="%s"/></svg> %s</span>' % (점색(v), esc(v))
+                 for v in 색순서)
+    그림 = ('<p class="rm-cnt">보이는 점 %d · 선 %d (프로젝트 전체 점 %d · 선 %d)</p><p class="meta" id="relmap-status">자리 잡는 중</p>%s'
+          '<svg id="relmap-svg" class="rmsvg" viewBox="0 0 800 600" role="img" aria-label="%s" style="height:560px;touch-action:none">%s%s%s</svg>'
+          '<div class="rm-lg">%s</div>'
+          % (len(보임["점"]), len(보임["선"]), len(자료["점"]), len(자료["선"]), '<p class="meta">%s</p>' % esc(없음글) if 없음글 else "",
+             esc(화면이름["graph"], quote=True), "".join(선그림), "".join(화살), "".join(점그림), 범례))
+
+    # 점 목록 — 키보드로도 점을 고를 수 있다
+    목록 = "".join('<li><a href="%s" data-pid="%s" data-ctr="%s">%s · %s</a></li>'
+                 % (주소_({"고름": i}), esc(i, quote=True), 주소_({"범위": "주변", "점": i, "깊이": 1, "고름": i}), esc(보임["점"][i]["종류"]), esc(보임["점"][i]["이름"]))
+                 for i in ids)
+
+    # 오른쪽 — 고른 점
+    고름 = 상태["고름"]
+    if not 고름:
+        오른쪽 = '<p class="meta">점을 고르면 들어오는 선·나가는 선이 보인다</p>'
+    elif 고름 not in 자료["점"]:
+        오른쪽 = '<p class="meta">그 점이 없다 — %s</p>' % esc(고름)
+    else:
+        p = 자료["점"][고름]
+
+        def 줄(e, 방향):
+            다른 = e["뒤"] if 방향 == "→" else e["앞"]
+            return ('<li>%s %s <a href="%s">%s</a>%s</li>'
+                    % (esc(_선_글[e["종류"]]), 방향, 주소_({"고름": 다른}), esc(자료["점"][다른]["이름"]), esc(" · " + ", ".join(e["요소"])) if e.get("요소") else ""))
+        들 = [줄(e, "←") for e in 자료["선"] if e["뒤"] == 고름]
+        나 = [줄(e, "→") for e in 자료["선"] if e["앞"] == 고름]
+        열기 = ('<p><a href="%s">카드 상세 열기</a></p>' % esc(_주소(item["name"]) + p["고리"], quote=True)) if p["고리"] else \
+            '<p class="meta">%s</p>' % esc(고름[len(p["종류"]) + 1:])
+        오른쪽 = ('<h3>%s</h3><p class="meta">%s · %s</p><h4>들어오는 선 %d</h4><ul>%s</ul><h4>나가는 선 %d</h4><ul>%s</ul>%s<p><a href="%s">이 점을 가운데로</a></p>'
+               % (esc(p["이름"]), esc(p["종류"]), esc(p["상태"] or "상태 없음"), len(들), "".join(들) or "<li>없음</li>", len(나), "".join(나) or "<li>없음</li>",
+                  열기, 주소_({"범위": "주변", "점": 고름, "깊이": 1, "고름": 고름})))
+    본문 = ('<style>%s .rm { font-size:14px; } .rm h1 span { font-size:13px; font-weight:400; color:var(--dim); margin-left:8px; }'
+          ' .rm-tabs { display:flex; flex-wrap:wrap; gap:4px; margin:0 0 12px; } .rm-tabs a { padding:4px 12px; border-radius:6px; }'
+          ' .rm-tabs a[aria-current] { background:var(--soft); color:var(--fg); font-weight:600; }'
+          ' .rm-grid { display:flex; gap:16px; align-items:flex-start; } .rm-left { flex:0 0 190px; display:flex; flex-direction:column; gap:8px; }'
+          ' .rm-left fieldset { display:flex; flex-direction:column; gap:4px; border:1px solid var(--line); border-radius:6px; }'
+          ' .rm-mid { flex:1; min-width:0; } .rm-right { flex:0 0 260px; } .plist { columns:2; font-size:13px; margin:12px 0; }'
+          ' .lgd { margin-right:10px; font-size:12px; }</style>'
+          '<div class="rm"><p class="crumb"><a href="/">%s</a> / <a href="%s">%s</a> / %s</p><h1>%s<span>%s</span></h1><div class="rm-tabs">%s</div>'
+          '<div class="rm-grid">%s<div class="rm-mid">%s<ul class="plist">%s</ul></div><aside class="rm-right">%s</aside></div></div>'
+          '<script type="application/json" id="relmap-data">%s</script><script>%s</script>'
+          % (_지도_CSS, esc(화면이름["home"]), esc(_주소(item["name"]), quote=True), esc(item["name"]), esc(화면이름["graph"]), esc(화면이름["graph"]), esc(item["name"]),
+             "".join(탭), 왼쪽, 그림, 목록, 오른쪽, 데이터, _지도_스크립트))
+    return _기능_틀() % {"name": esc("%s · %s" % (화면이름["graph"], item["name"])), "body": 본문}
+
+
 def render_card_detail(item, card, cards, scenarios, history, 머리말=None, 중앙값=None, 검토=None, 웹=""):
     """카드 상세 HTML 문자열. 예외 없이 문자열을 돌려준다. 값을 못 읽은 자리는 이유를 적고 나머지는 그대로 낸다.
     위쪽은 목업(머리·요약·단계 흐름·판정과 지적·사람이 볼 것), 아래쪽은 지금까지의 절이다. 새 인자가 비면 중앙값 없음·판정 기록 없음·원격 없음."""
@@ -3637,7 +4956,7 @@ def render_card_detail(item, card, cards, scenarios, history, 머리말=None, �
         fm = {}
     중앙값 = 중앙값 or {"단계": {}, "비용": None, "표본": 0, "오류": ""}
     h = history
-    위 = [_머리_html(card, h, fm, 웹), 승격_폼(item["name"], card), _요약_html(card, cards, h, 중앙값), _흐름_html(h, 중앙값),
+    위 = [_머리_html(card, h, fm, 웹, scenarios, cards, _주소(item["name"]), item["name"]), 승격_폼(item["name"], card), _요약_html(card, cards, h, 중앙값), _흐름_html(h, 중앙값),
          '<div class="cols">%s%s</div>' % (_판정_html(card, 검토), _사람_html(card, 검토))]
     if "출처" in card:
         parts.append("<p>출처: %s · 실행 기기 %s</p>" % (esc(card["출처"].replace("이 기계", "이 기기")), esc(_기기_글(card["도는 기계"]))))
@@ -3670,8 +4989,9 @@ def render_card_detail(item, card, cards, scenarios, history, 머리말=None, �
     parts.append("<h2>커밋</h2>")
     parts.append("<p>%s</p>" % esc(h["오류"]) if h["오류"] else
                  _표_html(("때", "단계", "제목"), h["커밋"]) if h["커밋"] else "<p>커밋 없음</p>")
-    parts.append(_시나리오_절(card, cards, scenarios))
+    parts.append(_시나리오_절(card, cards, scenarios, _주소(item["name"])))
     parts.append(_기능_절(card, read_featuremap(item["path"])))
+    parts.append(_지도_절(item, cards, scenarios, "카드:" + card["file"]))
     return CARD_TEMPLATE % {"name": esc(card["title"]), "head": "\n".join(위), "body": "\n".join(parts)}
 
 
@@ -4293,7 +5613,7 @@ def collect_feed(items, rows, 거르개, now):
                 raise OSError(row["까닭"])
             끝 = (REMOTE.get(os.path.abspath(item["path"])) or {}).get("끝")
             맵 = {c["file"]: c["도는 기계"] for c in row["카드"]}
-            줄 += [{**x, "프로젝트": item["name"]} for x in read_feed(item["path"], 끝, 맵)]
+            줄 += [{**x, "프로젝트": item["name"], "카드있음": x["카드"] in 맵} for x in read_feed(item["path"], 끝, 맵)]
         except Exception:                              # 한 프로젝트의 실패가 다른 프로젝트 줄을 막지 않는다
             못.append(item["name"])
     if 거르개.get("기계"):
@@ -4796,7 +6116,7 @@ def render_timeline(data, 시작, 끝, now, 까닭, 고른="", 카드="", 프로
                 if 카드 and 카드 in ("%s:%s" % (p["프로젝트"], a["앞"]), "%s:%s" % (p["프로젝트"], a["뒤"])) and 앞 in shown and 뒤 in shown and (앞, 뒤, a["종류"]) not in drawn:
                     drawn.add((앞, 뒤, a["종류"]))
                     edges.append('<path class="tl-edge tl-%s" data-from="%s" data-to="%s"></path>' % (a["종류"], esc(앞, quote=True), esc(뒤, quote=True)))
-        graph.append('<div class="tl-aside"><h3 class="tl-name">아직</h3>%s</div><svg class="tl-arrows">%s</svg>' % ("".join(waits) or "아직 없음", "".join(edges)))
+        graph.append(('<div class="tl-aside"><h3 class="tl-name">아직</h3>%s</div>' % "".join(waits) if waits else "") + '<svg class="tl-arrows">%s</svg>' % "".join(edges))
     parts.append('<div class="tl-graph">%s</div>' % "".join(graph))
     small = "".join('<span class="tl-dot tl-small" style="left:%.2f%%" title="%s"></span>' % (pct(t), esc("%s %s" % (p, s), quote=True))
                     for t, p, s in data["작은 수정"] if 시작 <= t < 끝 and ok(p))
@@ -5116,10 +6436,20 @@ def _줄_제목(x):
     return 앞 + (("%s 지적이 %s 에서 되풀이" % (종류, 파일)) if 종류 else ("%s 에서 지적이 되풀이" % 파일))
 
 
+def _빈_지적(x):
+    """「열쇠 단위: 없음 · 해당 없음」 — 콜론 뒤 값이 「없음」·「해당 없음」뿐인 지적."""
+    return all(t.strip() in ("없음", "해당 없음") for t in _정리(x["원문"]).rpartition(":")[2].split("·"))
+
+
+def 개선_후보(항목들):
+    """개선 후보로 세는 항목 — 측정 추세(사용량·품질의 몫)와 빈 지적은 뺀다. 측정 추세 접힘은 원 항목을 따로 읽는다."""
+    return [x for x in 항목들 if x["종류"] != "측정 추세" and not _빈_지적(x)]
+
+
 def group_improvements(항목들, 정렬="되풀이"):
     """같은 묶음 글(되풀이 신호 두 꼴은 단계·종류·파일, 나머지는 공백을 정리한 원문)인 항목끼리 한 줄로. 횟수는 서로 다른 카드 수. 정렬 「되풀이」 는 횟수 큰 순, 「최근」 은 마지막 때가 늦은 순(같으면 횟수 큰 순)."""
     묶음 = {}
-    for x in 항목들:
+    for x in 개선_후보(항목들):
         묶음.setdefault(묶음_글(x), []).append(x)
     rows = [{"원문": _정리(v[0]["원문"]), "제목": _줄_제목(v[0]), "열쇠": 줄_열쇠(k), "횟수": len({x["카드"] for x in v}), "카드들": sorted({x["카드"] for x in v}), "낱낱": v,
              "종류들": list(dict.fromkeys(x["종류"] for x in v)), "단계들": sorted({x["단계"] for x in v if x["단계"]}),
@@ -5311,16 +6641,17 @@ def render_improve(item, 결과, qs, 까닭, 쓰기=None):
     항목 = 결과["항목"]
     전체 = 결과.get("전체항목", 항목)
     줄들 = group_improvements(항목, "최근" if v("sort") == "최근" else "되풀이")
-    실행수 = len({(x["카드"], x["커밋"] or x["경로"]) for x in 항목})
+    후보 = 개선_후보(항목)
+    실행수 = len({(x["카드"], x["커밋"] or x["경로"]) for x in 후보})
     parts.append('<style>%s</style><div class="개선"><div class="본">' % _개선_CSS)
     parts.append('<header class="머리"><a href="/p/%s/board.html">%s</a><span aria-hidden="true">/</span><h1>%s</h1>'
                  '<span class="작은">%d 실행에서 모은 지적 %d건 → 같은 지적끼리 묶어 %d줄</span></header>'
-                 % (urllib.parse.quote(name, safe=""), esc(name), esc(화면이름["improve"]), 실행수, len(항목), len(줄들)))
+                 % (urllib.parse.quote(name, safe=""), esc(name), esc(화면이름["improve"]), 실행수, len(후보), len(줄들)))
     읽음 = ["이력을 읽지 못함" if 결과["이력오류"] else "이력 소각 커밋 %d건" % 결과["소각수"]]
     읽음 += ["신호 폴더 %s %s" % (p, "있음" if ok else "없음") for p, ok in 결과["신호"]]
     상태글, 원격까닭 = 결과["원격"]
     읽음.append(상태글 + (" (%s)" % 원격까닭 if 원격까닭 else ""))
-    parts.append('<p class="작은">읽은 것 — %s</p>' % esc(" · ".join(읽음)))
+    parts.append('<details class="도움말"><summary>도움말</summary><p class="작은">읽은 것 — %s</p></details>' % esc(" · ".join(읽음)))
     if 결과["이력오류"] and 결과["이력오류"] != "이력을 읽지 못함":
         parts.append('<p class="작은">%s</p>' % esc(결과["이력오류"]))
     if 결과.get("작업목록오류"):
@@ -5454,6 +6785,34 @@ def improve_page(item, qs, items=None, 쓰기=None):
     항목, 까닭 = filter_improvements(결과["항목"], qs)
     return render_improve(item, dict(결과, 항목=항목, 전체항목=결과["항목"], 전체수=전체, 작업목록오류=오류), qs, 까닭,
                           dict(쓰기 or {}, 프로젝트들=[p["name"] for p in items]))
+
+
+def improve_all_page(items):
+    """`/improve` — 보는 목록 모든 프로젝트의 개선 후보를 구역 하나씩 읽기만 한다(카드로 만들기는 프로젝트 화면). 한 프로젝트를 못 읽어도 그 구역에만 까닭을 적는다."""
+    esc = html.escape
+    구역 = []
+    for item in items:
+        name = item["name"]
+        머리 = '<h2><a href="/p/%s/improve">%s</a>' % (urllib.parse.quote(name, safe=""), esc(name))
+        try:
+            결과, _ = _개선_읽기(item, items)
+            이력오류 = 결과["이력오류"]
+            줄들 = [] if 이력오류 else group_improvements(결과["항목"])
+        except Exception as e:                      # noqa: BLE001 — 한 프로젝트가 실패해도 다른 구역은 그대로
+            이력오류, 줄들, 결과 = str(e) or "이력", [], {"항목": []}
+        if 이력오류:
+            본 = '<p class="why">읽지 못함 — %s</p>' % esc(이력오류)
+        elif not 줄들:
+            본 = "<p>모은 지적 없음</p>"
+        else:
+            머리 += ' <span class="작은">지적 %d건 → %d줄</span>' % (len(개선_후보(결과["항목"])), len(줄들))
+            본 = "<ol>%s</ol>" % "".join(
+                '<li><a href="/p/%s/improve?g=%s">%s</a> <span class="imp-n">%d</span></li>'
+                % (urllib.parse.quote(name, safe=""), esc(r["열쇠"], quote=True), esc(r["제목"].splitlines()[0] if r["제목"] else ""), r["횟수"])
+                for r in 줄들[:개선_쪽])
+        구역.append('<section class="imp-p" data-p="%s">%s</h2>%s</section>' % (esc(name, quote=True), 머리, 본))
+    body = "\n".join(["<p>카드로 만들기는 프로젝트 화면에서</p>"] + (구역 or ["<p>보는 프로젝트 없음</p>"]))
+    return FILE_TEMPLATE % {"name": "%s — 모든 프로젝트" % 화면이름["improve"], "body": body}
 
 
 # ── 보드가 파일을 쓰는 단 하나의 길 — 개선 거리를 카드로 (ISSUE-sc02-e18-make-card-2026-11-20) ──
@@ -5918,6 +7277,16 @@ class 보드서버(작업파일서버):
             return
         with open(path, encoding="utf-8", errors="replace") as f:
             text = f.read()
+        if 폴더 == "plan" and _시나리오이름.match(name) and not (urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("원본") or [""])[0]:
+            try:                                          # 정리 화면 — 읽지 못한 시나리오이거나 그리기가 실패하면 아래 원문 그리기로 간다
+                cards, scenarios, _, _ = _읽기(item, 합치기=True)
+                s = next((x for x in scenarios if x["file"] == name), None)
+                page = render_scenario(item, cards, scenarios, s, text) if s and not s["오류"] else None
+            except Exception:                             # noqa: BLE001
+                page = None
+            if page is not None:
+                self._그리기(page)
+                return
         try:
             shown = 본문_그리기(text)
         except Exception:                                # 그리기가 무엇으로 실패하든 원문이 보인다
@@ -5946,10 +7315,13 @@ class 보드서버(작업파일서버):
             else:
                 self._그리기(render_search(qs, 결과, 까닭, 걸린, [p["name"] for p in items]))
             return
+        if path == "/improve":
+            self._그리기(improve_all_page(items))
+            return
         if path == "/cards":
             보기 = (urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("보기") or [""])[0]
             if 보기 not in 카드_보기:
-                self._그리기(render_cards(보기, [], ["보기는 진행·대기·병합·멈춤 중 하나"]), status=404)
+                self._그리기(render_cards(보기, [], ["보기는 진행·대기·병합·멈춤·보류 중 하나"]), status=404)
                 return
             rows = [project_row(p) for p in items]
             병합줄, 모름 = _이번주_병합(items, dt.date.today()) if 보기 == "병합" else (None, 0)
@@ -5961,6 +7333,11 @@ class 보드서버(작업파일서버):
             qs = _비용품질_인자(qs)                                  # period 가 이기고, 아무것도 없으면 이번 주 — 읽기에는 날짜로 풀어 넘겨 캐시 열쇠에 날짜가 든다
             결과, 까닭 = _잠깐저장("signals", items, qs, lambda: read_signals(items, qs))
             self._그리기(render_signals(qs, 결과, 까닭))
+            return
+        if path == "/retro":
+            qs = _비용품질_인자(urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query))
+            자료, 까닭 = _잠깐저장("retro", items, qs, lambda: read_retro(items, qs))
+            self._그리기(render_retro(qs, 자료, 까닭))
             return
         if path == "/timeline":
             시작, 끝, 까닭 = timeline_period(urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query), dt.date.today(), 2)
@@ -6013,6 +7390,23 @@ class 보드서버(작업파일서버):
                  % (html.escape(" · ".join("%s %d" % (c, n) for c, n in 행["수"].items())), 행["차례 수"], html.escape(행["마지막 움직임"])))
             page = page.replace("</body>", '<details class="extra"><summary>칸별 수 · 기기 현황 · 최근 활동</summary>%s</details>' % (줄 + 기계 + feed) + "</body>", 1)
             self._그리기(page)
+            return
+        if sub == "features":
+            try:
+                cards, scenarios, _, _ = _읽기(item, 합치기=True)
+            except OSError as e:
+                self.send_error(500, "Internal Error", str(e))
+                return
+            self._그리기(render_features(item, items, cards, scenarios))
+            return
+        if sub == "graph":
+            try:
+                cards, scenarios, _, _ = _읽기(item, 합치기=True)
+            except OSError as e:
+                self.send_error(500, "Internal Error", str(e))
+                return
+            self._그리기(render_relmap(item, items, 연관_자료(item["path"], cards, scenarios, read_featuremap(item["path"])),
+                                       urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)))
             return
         if sub == "improve":
             self._그리기(improve_page(item, urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query), items))

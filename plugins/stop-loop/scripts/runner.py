@@ -947,7 +947,7 @@ def backlog_set(**fields):
 
 # ── 카드 머리말 원격 커밋 (ISSUE-sc02-e2-card-push-2026-11-20) ──────────────
 # 기계가 고치는 머리말 열쇠. 카드 본문과 사람이 쓰는 열쇠(기기·시나리오 …)는 올리지 않는다.
-CARD_KEYS = ("상태", "단계", "시작", "누적", "멈춘이유", "차례", "갱신", "재인계", "돈기계")
+CARD_KEYS = ("상태", "단계", "시작", "누적", "멈춘이유", "멈춘종류", "차례", "갱신", "재인계", "돈기계")
 # 저장소 밖 결과 폴더. 가져오기만 해서는 꺼져 있다 — 맨 아래 진입점 블록이 명령으로 띄울 때만 켠다.
 CARD_PUSH_DIR = None
 CARD_GIT_TIMEOUT = 20          # 원격 명령 한 번의 상한(초) — 머리말 쓰기가 실행을 오래 붙잡지 않게
@@ -1387,6 +1387,32 @@ def gate_kind_07(probs):
     return "기능맵" if all(p.startswith("기능맵:") for p in probs) else "시험 증거"
 
 
+# 멈춤 기록의 `detail` 앞머리 → 멈춘 종류 (ISSUE-wf-retro-records-2026-11-24). 앞머리는 멈춤 자리의 글 그대로다.
+STOP_KIND_RULES = (
+    ("검증자가 기존 파일 수정", "범위 밖 파일 변경"),
+    ("검증자 세션이 남긴 추적 파일 변경", "범위 밖 파일 변경"),
+    ("이력 재작성", "범위 밖 파일 변경"),
+    ("틀의 절이 비었다", "산출물 형식 오류"),
+    ("04 범위 통제 중단", "사람 결정"),
+    ("사람 결정이 남은 뒤 07 이 다시 정할 것을 적었다", "사람 결정"),
+    ("기준 가지에서도 실패하는 검사", "기준 가지 실패"),
+)
+
+
+def stop_kind(breaker):
+    """멈춤 기록 → 「일시적 실패」·「범위 밖 파일 변경」·「산출물 형식 오류」·「사람 결정」·「기준 가지 실패」·「기타」.
+    순서: 기록이 직접 실은 `stopKind` → `kind` → `detail` 앞머리. 어디에도 안 맞으면 「기타」."""
+    b = breaker or {}
+    if b.get("stopKind"):
+        return b["stopKind"]
+    if b.get("kind") == "timeout":
+        return "일시적 실패"
+    if b.get("kind") == "verdict-unreadable":
+        return "산출물 형식 오류"
+    detail = str(b.get("detail") or "")
+    return next((k for p, k in STOP_KIND_RULES if detail.startswith(p)), "기타")
+
+
 def fire(state, event, guards, events_path, turn=None):
     """전이표를 통해서만 상태를 바꾼다. (성공 여부, 막은 guard).
 
@@ -1416,12 +1442,15 @@ def fire(state, event, guards, events_path, turn=None):
         if nxt == "blocked":
             b = state.get("breaker") or {}
             extra["멈춘이유"] = b.get("detail") or b.get("kind") or "멈춤"
+            extra["멈춘종류"] = stop_kind(b)
             _log_add(state, "stops", {"stage": b.get("stage"), "at": now,
                                       "kind": b.get("kind") or event,
                                       "reason": extra["멈춘이유"]})
         if nxt in ("review", "closed"):
             extra["단계"] = ""
             extra["멈춘이유"] = ""
+            if backlog_get("멈춘종류"):     # 없던 카드에 빈 줄을 새로 만들지 않는다
+                extra["멈춘종류"] = ""
         # `차례: 러너` = 멈춤·검토지만 사람이 움직일 차례가 아니다(보드가 사람 차례에서 뺀다).
         # 요청한 전이(turn)만 쓰고, 그 밖의 전이는 값이 있을 때만 비운다 — 상태와 같은 쓰기 한 번.
         if turn is not None:
@@ -3757,7 +3786,8 @@ def stage_handoff(project, wd, issue, issue_id, state, models, events, outp, con
                 f.write("- %s\n" % x)
         stoploop.append_event(events, {"stage": "10", "gate": "handoff", "problems": problems})
         state["stages"]["10"] = {"status": "failed", "reason": reason}
-        state["breaker"] = {"kind": "dod-miss", "stage": "10", "detail": detail or problems[0]}
+        state["breaker"] = {"kind": "dod-miss", "stage": "10", "detail": detail or problems[0],
+                            **({"stopKind": "일시적 실패"} if result == "remote-fail" else {})}
         fire(state, "BREAK", {}, events, **({"turn": turn} if turn else {}))
         save_state(statef, state)
         print("\n중단 — %s. %s (10-merge.md)." % (
@@ -3997,7 +4027,8 @@ def main(argv):
                 LIVE_DIR, "%s__%s.log" % (_status_ctx["repo"], issue_id))
         fire(state, "PICK", {"can_pick": True}, events)
         device = device_name()
-        backlog_set(멈춘이유="", **({"돈기계": device} if device else {}))   # 시작은 PICK 전이가 찍는다
+        backlog_set(멈춘이유="", **({"멈춘종류": ""} if backlog_get("멈춘종류") else {}),
+                    **({"돈기계": device} if device else {}))   # 시작은 PICK 전이가 찍는다
         mark = state.get("verifierTree") if a.resume else None
         if mark:
             # 검증자 세션이 비정상으로 끝난 뒤 이어받는다 — 그 세션이 고친 추적 파일이 남았으면
