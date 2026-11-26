@@ -2004,7 +2004,7 @@ def read_remote(project):
         if r.returncode != 0:
             return _그림_실패(_끝줄(r))
         tip = heads[base]
-        r = _원격_git(project, "ls-tree", "--name-only", tip, "--", "docs/backlog/")
+        r = _원격_git(project, "-c", "core.quotepath=false", "ls-tree", "--name-only", tip, "--", "docs/backlog/")
         if r.returncode != 0:
             return _그림_실패(_끝줄(r))
         cards = {}
@@ -2925,7 +2925,7 @@ def _전체_log(project, *뒤, 앞=()):
 
 def _소각_읽기(project, sha):
     """소각 커밋이 지운 `state.json` 의 metrics. (metrics, None) 또는 (None, 까닭). 예외를 내지 않는다."""
-    r = _git_읽기(project, "diff-tree", "--no-commit-id", "-r", "--diff-filter=D", "--name-only", sha)
+    r = _git_읽기(project, "-c", "core.quotepath=false", "diff-tree", "--no-commit-id", "-r", "--diff-filter=D", "--name-only", sha)
     paths = [x for x in r.stdout.splitlines() if re.fullmatch(r"\.workflow/[^/]+/state\.json", x)]
     if not paths:
         return None, "소각 커밋이 지운 파일에 state.json 없음"
@@ -5106,7 +5106,7 @@ def _커밋들(project):
 
 def _소각_인계(project):
     """소각 커밋이 지운 인계 문서 {폴더 이름: 지워지기 전 글} — 같은 폴더가 여럿이면 가장 최근 것."""
-    r = _git_읽기(project, "log", "--all", "--diff-filter=D", "-p", "--format=\x1e%H", "--", ".workflow/*/10-handoff.md")
+    r = _git_읽기(project, "-c", "core.quotepath=false", "log", "--all", "--diff-filter=D", "-p", "--format=\x1e%H", "--", ".workflow/*/10-handoff.md")
     out = {}
     if r.returncode != 0:
         return out
@@ -5613,7 +5613,7 @@ def read_feed(project, 끝, 기계맵):
     단계 커밋(`Loop-Stage`)은 `Loop-Verdict` 가 통과·반려일 때만, 머리말 커밋(`Loop-Card` 만)은 카드 파일의 `멈춘이유:` 가
     빈 값에서 채워지면 「멈춤」, 아니면 `상태:` 가 바뀌면 「상태 → 새 값」. 기계는 `기계맵`(카드 파일 → 도는 기계), 모르면 「기기 모름」."""
     def git(*args):
-        r = subprocess.run(["git", "-C", project, *args], capture_output=True, text=True, timeout=30)
+        r = subprocess.run(["git", "-C", project, "-c", "core.quotepath=false", *args], capture_output=True, text=True, timeout=30)
         if r.returncode != 0 and 끝 and args[0] == "log" and 끝 in args:      # 원격 끝 객체가 이 기계에 없으면 이 기계 참조만 읽는다
             return git(*[a for a in args if a != 끝])
         if r.returncode != 0:
@@ -7053,7 +7053,7 @@ def 카드_올리기(project, 파일이름, 글="", 승격=False, 잇기=None):
             r = _원격_git(project, "fetch", "-q", "--no-write-fetch-head", url, "refs/heads/" + base, env=env)
             if r.returncode:
                 return 끝("올리지 못함", _끝줄(r))
-            r = _원격_git(project, "ls-tree", "--name-only", tip, "--", rel)
+            r = _원격_git(project, "-c", "core.quotepath=false", "ls-tree", "--name-only", tip, "--", rel)
             if r.returncode:
                 return 끝("올리지 못함", _끝줄(r))
             내용 = None
