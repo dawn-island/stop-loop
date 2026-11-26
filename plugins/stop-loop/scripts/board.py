@@ -1255,6 +1255,7 @@ nav.side .n.hot { color:var(--orange); font-weight:600; }
 nav.side .pn { flex-grow:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 nav.side .sbox { margin-top:auto; padding:10px; border:1px solid var(--line); border-radius:8px; background:var(--panel);
   font-size:12px; color:var(--dim); display:flex; flex-direction:column; gap:4px; }
+nav.side .sbox .warn { color:var(--orange); font-weight:600; }
 .dot-orange, .dot-blue, .dot-gray, .dot-teal, .dot-ochre { display:inline-block; width:8px; height:8px; flex-shrink:0; border-radius:var(--r-pill); }
 .dot-orange { background:var(--orange); } .dot-blue { background:var(--blue); } .dot-gray { background:var(--gray); } .dot-teal { background:var(--teal); } .dot-ochre { background:var(--ochre); }
 nav.side .sub { display:flex; flex-direction:column; gap:2px; padding-left:18px; }
@@ -1878,6 +1879,7 @@ REMOTE_GIT_TIMEOUT = 20    # 원격 git 호출 한 번의 상한(초) — 러너
 REMOTE_FETCH_TIMEOUT = 90  # 읽기(`read_remote`)의 `fetch` 한 줄만의 상한(초). 큰 저장소는 20초를 넘긴다. 쓰기 경로는 20 그대로
 CARD_PUSH_DIR = os.path.expanduser("~/.stop-loop/card-push")   # 러너가 올리기 결과를 쓰는 폴더. 보드는 읽기만 한다
 REMOTE = {}                # {프로젝트 절대 경로: 그림}
+REMOTE_STALE_SEC = 300     # 마지막 성공 때가 이보다 오래면 사이드바가 「5분 넘게 못 받음」 경고를 낸다
 
 # ── 읽기 계산을 잠깐 저장한다 (ISSUE-ui-0-server-threads-2026-11-22) ──
 # 열쇠 = 화면 종류 + 인자 + 보는 프로젝트마다 (원격 끝, 로컬 `git rev-parse --all`). 하나라도 바뀌면 다시 계산한다.
@@ -2043,7 +2045,10 @@ def refresh_remote(items):
             pic = _그림_실패(str(e) or type(e).__name__)
         old = REMOTE.get(key)
         if pic["오류"] and old and not old["없음"]:
-            pic = {**old, "오류": pic["오류"], "시도": pic.get("시도")}
+            pic = {**old, "오류": pic["오류"], "시도": pic.get("시도")}       # `앞카드수` 도 old 에서 이어진다
+        elif not pic["오류"] and not pic["없음"] and not pic["카드"]:
+            # 오류 없이 0장이면 앞서 읽은 카드 수를 남겨 「원격 카드를 읽지 못함」 경고의 근거로 쓴다. 카드가 읽히면 새 그림에 이 키가 없어 경고가 풀린다
+            pic = {**pic, "앞카드수": len((old or {}).get("카드") or {}) or (old or {}).get("앞카드수", 0)}
         REMOTE[key] = pic
 
 
@@ -2067,12 +2072,18 @@ def 미리_계산(items):
     try:
         시작 = time.monotonic()
         qs = _비용품질_인자({})
+        새로, 건너뜀 = 0, 0
         for 이름, 읽기 in (("signals", read_signals), ("retro", read_retro)):
             try:
+                열쇠 = _열쇠(이름, items, qs)
+                if 열쇠 is not None and 열쇠 in _저장소:
+                    건너뜀 += 1
+                else:
+                    새로 += 1
                 _잠깐저장(이름, items, qs, lambda 읽기=읽기: 읽기(items, qs))
             except Exception:                        # noqa: BLE001 — 한쪽이 터져도 다른 쪽은 이어 돈다
                 pass
-        print("비용·품질 미리 계산 끝 (%d초)" % round(time.monotonic() - 시작), flush=True)
+        print("비용·품질 미리 계산 끝 (%d초) · 새로 계산 %d건 · 건너뜀 %d건" % (round(time.monotonic() - 시작), 새로, 건너뜀), flush=True)
     except Exception:                                # noqa: BLE001 — 미리 계산이 상주를 죽이지 않는다. 화면 요청은 직접 계산한다
         pass
     finally:
@@ -2164,12 +2175,22 @@ def _원격_문구(item, cards):
             시도 = pic.get("시도")
             if 시도:
                 out.append("읽은 적 없음 · 마지막 시도 " + 시도.strftime("%H:%M" if 시도.date() == dt.date.today() else "%Y-%m-%d %H:%M"))
+        if when:                                     # 마지막으로 받은 때 — 실패해도 그 때로 센다. 오래되면(상주 바퀴가 멈춘 경우도) 경고
+            초 = (dt.datetime.now() - when).total_seconds()
+            out.append("원격 기준 %d분 전" % max(0, int(초 // 60)) + (" — 5분 넘게 못 받음" if 초 > REMOTE_STALE_SEC else ""))
+        if not pic["오류"] and not pic["카드"] and (any(c.get("출처") != "원격" for c in cards) or pic.get("앞카드수", 0) > 0):
+            out.append("원격 카드를 읽지 못함 — 이 기기 사본 기준으로 보임")
     밀림, 거부 = _올리기_결과(item, cards)
     if 밀림:
         out.append("올리지 못한 고침 있음 (%d장)" % 밀림)
     if 거부:
         out.append("진행이 다른 기기에 보이지 않음 — 올리기 거부")
     return out
+
+
+def _원격_경고줄(x):
+    """사이드바 원격 줄 가운데 경고색으로 그릴 것 — 받기 실패·5분 초과·원격 0장."""
+    return x.startswith(("원격 저장소를 아직 못 읽음", "읽은 적 없음")) or "5분 넘게 못 받음" in x or x.startswith("원격 카드를 읽지 못함")
 
 
 def _읽기(item, 합치기=False):
@@ -2577,13 +2598,13 @@ def render_shell(items, rows, turns, path):
         가장 = min(때들) if 때들 else None
         원격 = ["원격 읽음 %s" % (가장.strftime("%H:%M" if 가장.date() == dt.date.today() else "%Y-%m-%d %H:%M") if 가장 else "—")]
         # 못 읽은 프로젝트는 자기 마지막 읽은 시각(「원격 읽음」)을 걸러내지 않는다 — 위의 전체 시각이 다른 프로젝트 것이어도 가려지지 않게
-        원격 += ["%s · %s" % (i["name"], x) for i, r in zip(items, rows) for x in r.get("원격", [])
+        원격 += [("%s · %s" % (i["name"], x), _원격_경고줄(x)) for i, r in zip(items, rows) for x in r.get("원격", [])
                if not x.startswith("원격 읽음") or any(y.startswith("원격 저장소를 아직 못 읽음") for y in r.get("원격", []))]
         상자 = ["러너 %s / 상한 %d" % (러너, max_parallel_read())] + 원격 + ["stop-loop %s" % (plugin_version_read() or "—")]
         return ((_사이드바_머리 % esc(이기계 or "—")) + '<div class="grp">%s</div>' % "".join(링크)
                 + '<div class="grp"><span class="gh">프로젝트</span>%s<span class="gh">숫자는 진행 중 · 막힘</span></div>' % ("".join(프로젝트) or '<span class="nolink">보는 프로젝트 없음</span>')
                 + '<div class="grp"><span class="gh">분석</span>%s</div>' % "".join(분석)
-                + '<div class="sbox">%s</div></nav>' % "".join("<span>%s</span>" % esc(x) for x in 상자))
+                + '<div class="sbox">%s</div></nav>' % "".join('<span class="warn">%s</span>' % esc(x[0]) if isinstance(x, tuple) and x[1] else "<span>%s</span>" % esc(x[0] if isinstance(x, tuple) else x) for x in 상자))
     except Exception:
         return 최소_사이드바(path)
 
