@@ -167,7 +167,13 @@ LIVE_DIR = os.path.expanduser("~/.stop-loop/live")
 def last_live_line(backlog, file):
     """진행 카드의 실시간 줄 파일에서 맨 끝 한 줄. 없거나 못 읽으면 빈 문자열."""
     try:
-        repo = os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(backlog))))
+        return _실시간_줄(os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(backlog)))), file)
+    except TypeError:
+        return ""
+
+
+def _실시간_줄(repo, file):
+    try:
         name = "%s__%s.log" % (repo, os.path.splitext(file)[0])
         with open(os.path.join(LIVE_DIR, name), "rb") as f:
             f.seek(0, os.SEEK_END)
@@ -296,6 +302,10 @@ def human_minutes(path):
             lines = f.read().splitlines()
     except (OSError, UnicodeDecodeError):
         return None
+    return _사람분_줄들(lines)
+
+
+def _사람분_줄들(lines):
     inside = False
     for l in lines:
         if l.startswith("## "):
@@ -333,8 +343,7 @@ def read_scenarios(plan_dir):
         m = _시나리오이름.match(os.path.basename(path))
         if not m:
             continue
-        s = {"번호": m.group(1), "이름": "", "상태": "상태 모름", "요소": set(), "카드아님": set(), "오류": "", "남은질문": [],
-             "file": os.path.basename(path), "완료기준": {}, "없어짐": set(), "요소이름": {}, "선행": {}}
+        s = _시나리오_빈것(m.group(1), os.path.basename(path))
         try:
             with open(path, encoding="utf-8") as f:
                 lines = f.read().splitlines()
@@ -342,42 +351,93 @@ def read_scenarios(plan_dir):
             s["오류"] = "시나리오 파일을 읽지 못했다"
             out.append(s)
             continue
-        head = next((l[2:].strip() for l in lines if l.startswith("# ")), "")
-        s["이름"] = head[len(s["번호"]):].strip() if head.startswith(s["번호"] + " ") else head
-        in_elements = ask = in_criteria = False
-        pre_col = None                                  # 요소 표 머리에서 찾은 「선행」 칸 자리
-        for i, l in enumerate(lines):
-            if l.startswith("## "):
-                in_elements = l[3:].strip() == "요소"
-                in_criteria = l[3:].strip() in _기준절
-                ask = l[3:].strip() == "확인 필요"
-                continue
-            if ask:     # 질문 = 표 데이터 줄(머리줄·구분줄·자리표시·빈 칸 줄 뺀 것)과 `- ` 목록 줄
-                c = _칸(l) if l.strip().startswith("|") else []
-                if l.startswith("- ") and l[2:].strip():
-                    s["남은질문"].append(l[2:].strip())
-                elif (c and not _표_구분줄.match(l) and "{" not in l and any(c)
-                      and not (i + 1 < len(lines) and _표_구분줄.match(lines[i + 1]))):
-                    s["남은질문"].append(" · ".join(x for x in c if x))
-            cells = _칸(l) if l.strip().startswith("|") else []
-            if len(cells) >= 2 and cells[0] == "상태":
-                s["상태"] = next((w for w in _시나리오상태 if cells[1].startswith(w)), cells[1])
-            elif in_elements and cells and "선행" in cells:
-                pre_col = cells.index("선행")
-            elif in_elements and cells and re.fullmatch(r"E-\d+", cells[0]):
-                s["요소"].add(cells[0])
-                s["요소이름"][cells[0]] = cells[1] if len(cells) > 1 else ""
-                cell = cells[pre_col] if pre_col is not None and pre_col < len(cells) else ""
-                s["선행"][cells[0]] = [(m.group(1), "겹침" if m.group(2) else "결과물")
-                                      for m in re.finditer(r"(E-\d+)(\s*\(겹침\))?", cell)]
-                if any("(카드 아님)" in x for x in cells[1:]):
-                    s["카드아님"].add(cells[0])
-                if any(x.startswith("없어짐") for x in cells[1:]):
-                    s["없어짐"].add(cells[0])
-            elif in_criteria and len(cells) >= 2 and re.fullmatch(r"AC-\d+", cells[0]):
-                s["완료기준"][cells[0]] = cells[1]
+        _시나리오_풀기(s, lines)
         out.append(s)
     return sorted(out, key=lambda s: s["번호"])
+
+
+_시나리오_저장 = {}                                    # {(프로젝트, 원격 끝): 시나리오 목록} — 끝이 같으면 거울을 다시 읽지 않는다
+
+
+def _거울_시나리오(project):
+    """거울 끝의 `docs/plan/SC-*.md` 로 만든 시나리오 목록. 거울에서 못 읽으면 None."""
+    pic = REMOTE.get(os.path.abspath(project)) or {}
+    mirror = _거울_경로(project)
+    if pic.get("없음") or not pic.get("끝") or not os.path.isdir(mirror):
+        return None
+    열쇠 = (os.path.abspath(project), pic["끝"])
+    if 열쇠 in _시나리오_저장:
+        return copy.deepcopy(_시나리오_저장[열쇠])
+    try:
+        r = subprocess.run(["git", "-C", mirror, "-c", "core.quotepath=false", "ls-tree", "-z", "--name-only", pic["끝"], "--", "docs/plan/"],
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            return None
+        names = [n for n in sorted(os.path.basename(x) for x in r.stdout.split("\0") if x) if _시나리오이름.match(n)]
+        글들 = _묶음_읽기(mirror, ["%s:docs/plan/%s" % (pic["끝"], n) for n in names])
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    out = []
+    for n in names:
+        s = _시나리오_빈것(_시나리오이름.match(n).group(1), n)
+        text = 글들.get("%s:docs/plan/%s" % (pic["끝"], n))
+        if text is None:
+            s["오류"] = "시나리오 파일을 읽지 못했다"
+        else:
+            _시나리오_풀기(s, text.splitlines())
+        out.append(s)
+    out = sorted(out, key=lambda s: s["번호"])
+    _시나리오_저장[열쇠] = copy.deepcopy(out)
+    return out
+
+
+def 시나리오들(project):
+    """프로젝트의 시나리오 목록 — 그림에 끝이 있고 거울에서 읽히면 거울 끝의 것, 아니면 작업 사본 `docs/plan/` 의 것."""
+    got = _거울_시나리오(project)
+    return got if got is not None else read_scenarios(os.path.join(project, "docs", "plan"))
+
+
+def _시나리오_빈것(번호, file):
+    return {"번호": 번호, "이름": "", "상태": "상태 모름", "요소": set(), "카드아님": set(), "오류": "", "남은질문": [],
+            "file": file, "완료기준": {}, "없어짐": set(), "요소이름": {}, "선행": {}}
+
+
+def _시나리오_풀기(s, lines):
+    """시나리오 글 줄들을 읽어 `s`(`_시나리오_빈것`)를 채운다 — 파일에서 읽든 거울에서 읽든 같은 사전이 된다."""
+    head = next((l[2:].strip() for l in lines if l.startswith("# ")), "")
+    s["이름"] = head[len(s["번호"]):].strip() if head.startswith(s["번호"] + " ") else head
+    in_elements = ask = in_criteria = False
+    pre_col = None                                  # 요소 표 머리에서 찾은 「선행」 칸 자리
+    for i, l in enumerate(lines):
+        if l.startswith("## "):
+            in_elements = l[3:].strip() == "요소"
+            in_criteria = l[3:].strip() in _기준절
+            ask = l[3:].strip() == "확인 필요"
+            continue
+        if ask:     # 질문 = 표 데이터 줄(머리줄·구분줄·자리표시·빈 칸 줄 뺀 것)과 `- ` 목록 줄
+            c = _칸(l) if l.strip().startswith("|") else []
+            if l.startswith("- ") and l[2:].strip():
+                s["남은질문"].append(l[2:].strip())
+            elif (c and not _표_구분줄.match(l) and "{" not in l and any(c)
+                  and not (i + 1 < len(lines) and _표_구분줄.match(lines[i + 1]))):
+                s["남은질문"].append(" · ".join(x for x in c if x))
+        cells = _칸(l) if l.strip().startswith("|") else []
+        if len(cells) >= 2 and cells[0] == "상태":
+            s["상태"] = next((w for w in _시나리오상태 if cells[1].startswith(w)), cells[1])
+        elif in_elements and cells and "선행" in cells:
+            pre_col = cells.index("선행")
+        elif in_elements and cells and re.fullmatch(r"E-\d+", cells[0]):
+            s["요소"].add(cells[0])
+            s["요소이름"][cells[0]] = cells[1] if len(cells) > 1 else ""
+            cell = cells[pre_col] if pre_col is not None and pre_col < len(cells) else ""
+            s["선행"][cells[0]] = [(m.group(1), "겹침" if m.group(2) else "결과물")
+                                  for m in re.finditer(r"(E-\d+)(\s*\(겹침\))?", cell)]
+            if any("(카드 아님)" in x for x in cells[1:]):
+                s["카드아님"].add(cells[0])
+            if any(x.startswith("없어짐") for x in cells[1:]):
+                s["없어짐"].add(cells[0])
+        elif in_criteria and len(cells) >= 2 and re.fullmatch(r"AC-\d+", cells[0]):
+            s["완료기준"][cells[0]] = cells[1]
 
 
 def card_marks(cards, scenarios):
@@ -857,9 +917,9 @@ def notify(title, body):
         return False
 
 
-def record_resolved(project, turn):
-    """해소된 항목 한 줄을 `docs/plan/사람손-<SC-nn>.md` 끝에 덧붙인다. 실패하면 OSError."""
-    plan = os.path.join(project, "docs", "plan")
+def record_resolved(project, turn, 자리=None):
+    """해소된 항목 한 줄을 `사람손-<SC-nn>.md` 끝에 덧붙인다. `자리` 가 없으면 사본 `docs/plan/`(배차가 부르는 모양), 있으면 그 폴더. 실패하면 OSError."""
+    plan = 자리 or os.path.join(project, "docs", "plan")
     os.makedirs(plan, exist_ok=True)
     path = os.path.join(plan, "사람손-%s.md" % turn["시나리오"])
     head = ""
@@ -868,7 +928,7 @@ def record_resolved(project, turn):
                 % turn["시나리오"])
     셈 = turn.get("셈", "사람 손")
     if turn["종류"] == "완료 선언":      # 선언했을 때만 끝. 고치러 간 것(확정 그대로·카드가 늘어 내려감)은 사람 손
-        now = [s for s in read_scenarios(plan) if s["번호"] == turn["시나리오"]]
+        now = [s for s in 시나리오들(project) if s["번호"] == turn["시나리오"]]
         셈 = "끝" if now and now[0]["상태"] == "완료" else "사람 손"
     what = turn["열어 볼 곳"] if turn["종류"] != "완료 선언" else turn["시나리오"]
     row = "- %s · %s · %s · %s — %s · 생긴 때 %s\n" % (
@@ -897,7 +957,7 @@ def sync_turns(project, turns, 조용히=False, 기록=True):
             continue
         try:
             if 기록 and t.get("시나리오") and not t.get("원격"):
-                record_resolved(project, t)
+                record_resolved(project, t, os.path.join(RESOLVED_DIR, _폴더이름(project)))   # 보드는 사본에 쓰지 않는다
         except OSError as e:
             print("사람 손 기록 실패 (다음 바퀴에 다시): %s" % e)
             keep[k] = t
@@ -966,7 +1026,7 @@ def render_text(cards, scenarios=()):
 
 def 승격_폼(project, c):
     """시나리오에 안 묶인 아이디어 카드에만 「대기로 올리기」 폼(확인 창 인라인). 카드 링크 `<a>` 안에는 폼을 못 넣으므로 밖에 둔다."""
-    if c["상태"] != "아이디어" or c["시나리오"] or c.get("출처") == "원격":
+    if c["상태"] != "아이디어" or c["시나리오"] or c.get("원격만"):       # 이 기기 사본에 파일이 없는 카드(다른 기기가 만든 것)는 단추가 고칠 파일이 없다
         return ""
     물음 = html.escape("return confirm(%s)" % json.dumps(
         "「%s」 카드를 %s 프로젝트의 대기로 올린다. 올리겠습니까?" % (c["title"], project), ensure_ascii=False), quote=True)
@@ -1079,7 +1139,9 @@ def render_html(cards, project, every=0, scenarios=(), turns=(), plan_dir=None, 
         why = "".join('<p class="why">%s</p>' % esc(m) for m in marks[c["file"]] + list(c.get("원격표시", [])))
         if _넘김(cards, c, now):
             why += '<p class="why">예상 넘김</p>'
-        src = ('<p class="meta">실행 기기 %s · %s 기록</p>' % (esc(_기기_글(c["도는 기계"])), esc(c["출처"].replace("이 기계", "이 기기"))) if "출처" in c else "")
+        소식 = c.get("소식때")
+        소식글 = " · 마지막 소식 %d분 전" % max(0, int((now - 소식).total_seconds() // 60)) if 소식 else ""    # 다른 기기가 돌리는 진행 카드 — 원격 머리말이 마지막으로 바뀐 때
+        src = ('<p class="meta">실행 기기 %s · %s 기록%s</p>' % (esc(_기기_글(c["도는 기계"])), esc(c["출처"].replace("이 기계", "이 기기")), esc(소식글)) if "출처" in c else "")
         live = ('<p class="live">%s</p>' % esc(c["마지막줄"])) if c["마지막줄"] else ""
         pk = ('<template class="pk"><h2>%s</h2><p class="bg">%s</p><dl><dt>걸린 시간</dt><dd>%s · 예상 %s</dd><dt>비용</dt><dd>—</dd>'
               '<dt>기다리는 것</dt><dd>%s</dd><dt>고치는 파일</dt><dd>—</dd></dl>%s%s%s%s%s<a class="open" href="%s">상세 열기</a></template>'
@@ -1880,6 +1942,33 @@ REMOTE_FETCH_TIMEOUT = 90  # 읽기(`read_remote`)의 `fetch` 한 줄만의 상�
 CARD_PUSH_DIR = os.path.expanduser("~/.stop-loop/card-push")   # 러너가 올리기 결과를 쓰는 폴더. 보드는 읽기만 한다
 REMOTE = {}                # {프로젝트 절대 경로: 그림}
 REMOTE_STALE_SEC = 300     # 마지막 성공 때가 이보다 오래면 사이드바가 「5분 넘게 못 받음」 경고를 낸다
+REMOTE_CLONE_TIMEOUT = 900  # 거울을 처음 만드는 `clone` 의 상한(초) — 사본 객체를 복사하므로 큰 저장소도 내려받지는 않는다
+
+# ── 보드의 원격 출처: 거울 · 그림 파일 · 사람 손 기록 자리 (ISSUE-board-remote-b-mirror-2026-11-26) ──
+# 거울 = 프로젝트마다 보드 전용 bare 저장소. 원격 기준 가지를 `refs/remotes/origin/<가지>` 로 받아 둔다. 작업 사본에는 쓰지 않는다.
+# 그림 파일 = `REMOTE` 의 그림을 프로젝트마다 파일로 남긴 것 — 다시 띄우면 첫 원격 확인 전에도 이것으로 시작한다.
+# 이름은 프로젝트 폴더 이름(basename)이다 — `HUMAN_DIR` 저장 이름과 같은 규칙이라 보는 목록 안에서 겹치지 않는다고 본다.
+MIRROR_DIR = os.path.expanduser("~/.stop-loop/mirrors")
+CACHE_DIR = os.path.expanduser("~/.stop-loop/board-cache")
+RESOLVED_DIR = os.path.expanduser("~/.stop-loop/human-resolved")
+
+
+def _폴더이름(project):
+    return os.path.basename(os.path.abspath(project))
+
+
+def _거울_경로(project):
+    return os.path.join(MIRROR_DIR, _폴더이름(project) + ".git")
+
+
+def _끝_있음(project):
+    """원격 그림에 끝이 있는 프로젝트(한 번이라도 읽었거나 그림 파일에서 불러옴) — 카드·시나리오·이력의 출처가 거울이다."""
+    return bool((REMOTE.get(os.path.abspath(project)) or {}).get("끝"))
+
+
+def _읽을_저장소(project):
+    """이력을 읽는 git 의 대상 — 그림에 끝이 있고 거울이 있으면 거울, 아니면 작업 사본. 거울 자신을 넘기면 그대로 돌려준다."""
+    return _거울_경로(project) if _끝_있음(project) and os.path.isdir(_거울_경로(project)) else project
 
 # ── 읽기 계산을 잠깐 저장한다 (ISSUE-ui-0-server-threads-2026-11-22) ──
 # 열쇠 = 화면 종류 + 인자 + 보는 프로젝트마다 (원격 끝, 로컬 `git rev-parse --all`). 하나라도 바뀌면 다시 계산한다.
@@ -1898,6 +1987,9 @@ def _열쇠(이름, items, 인자):
     for item in items:
         그림 = REMOTE.get(os.path.abspath(item["path"])) or {}
         끝 = (그림.get("끝") or "", 그림.get("오류") or "", bool(그림.get("없음")))   # 끝이 없으면 로컬 해시만 열쇠에 든다. 오류·없음은 결과 문구에 들어간다
+        if 그림.get("끝") and os.path.isdir(_거울_경로(item["path"])):    # 거울에서 읽는 프로젝트는 원격 끝이 열쇠다 — 사본 해시를 부르지 않는다
+            조각.append((item["path"], 끝, ""))
+            continue
         try:
             r = subprocess.run(["git", "-C", item["path"], "rev-parse", "--all"], capture_output=True, text=True, timeout=10)
         except (OSError, subprocess.SubprocessError):
@@ -1966,11 +2058,40 @@ def _그림_실패(why):
     return {"없음": False, "때": None, "카드": {}, "오류": why, "시도": dt.datetime.now()}
 
 
+def _거울_만들기(project, url, base, env):
+    """거울(`MIRROR_DIR/<이름>.git`)이 없을 때 만든다 — 사본 객체를 참조해 복사하고(`--reference` + `--dissociate`) 모자란 것만 원격에서 받는다.
+    끝나면 거울이 사본을 가리키는 연결(alternates)은 남지 않는다. 실패하면 반쯤 만든 폴더를 지우고 까닭을 돌려준다(성공이면 빈 글)."""
+    mirror = _거울_경로(project)
+    tmp = mirror + ".만드는중"
+    shutil.rmtree(tmp, ignore_errors=True)
+    try:
+        os.makedirs(MIRROR_DIR, exist_ok=True)
+        r = _원격_git(project, "clone", "-q", "--bare", "--single-branch", "--branch", base, "--reference", project,
+                     "--dissociate", url, tmp, env=env, timeout=REMOTE_CLONE_TIMEOUT)
+        if r.returncode != 0:
+            return _끝줄(r)
+        os.replace(tmp, mirror)
+        return ""
+    except OSError as e:
+        return str(e)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _거울_끝(mirror, base):
+    """거울 이름표 `refs/remotes/origin/<가지>` 의 끝. 없으면 빈 글."""
+    if not os.path.isdir(mirror):
+        return ""
+    r = _원격_git(mirror, "rev-parse", "--verify", "-q", "refs/remotes/origin/" + base)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
 def read_remote(project):
     """프로젝트 원격(origin)의 기준 가지에 있는 `docs/backlog/*.md` 의 머리말과 제목 — 그림 하나. 예외를 내지 않는다.
 
-    주소로 직접 받고(`fetch <주소> <가지>`, FETCH_HEAD 를 쓰지 않음) 객체만 얻으므로 작업 사본의 파일·색인·
-    `origin/*` 참조는 그대로다."""
+    원격 끝(`ls-remote` 한 번)이 앞서 읽은 그림·거울 이름표의 끝과 같으면 아무것도 받지도 읽지도 않고 때만 새로 한다.
+    다르면 보드 전용 거울로 받는다(`fetch <주소> +refs/heads/<가지>:refs/remotes/origin/<가지>`). 작업 사본은 거울을 처음 만들 때
+    객체를 참조해 복사할 뿐 파일·색인·참조·객체를 바꾸지 않는다."""
     try:
         if not os.path.exists(os.path.join(project, ".git")):
             return _그림_없음()
@@ -2001,34 +2122,44 @@ def read_remote(project):
         base = next((x for x in ("develop", "main", "master") if x in heads), None)
         if base is None:
             return _그림_실패("원격에 기준 가지가 없다")
-        r = _원격_git(project, "fetch", "-q", "--no-write-fetch-head", url, "refs/heads/" + base, env=env,
-                     timeout=REMOTE_FETCH_TIMEOUT)
-        if r.returncode != 0:
-            return _그림_실패(_끝줄(r))
         tip = heads[base]
-        r = _원격_git(project, "-c", "core.quotepath=false", "ls-tree", "--name-only", tip, "--", "docs/backlog/")
+        mirror = _거울_경로(project)
+        old = REMOTE.get(os.path.abspath(project))
+        if (old and not old.get("없음") and old.get("끝") == tip and old.get("가지") == base
+                and _거울_끝(mirror, base) == tip):
+            return {**{k: v for k, v in old.items() if k != "시도"}, "때": dt.datetime.now(), "오류": ""}        # 끝이 같다 — 받기·카드 읽기·커밋 때 읽기를 하지 않는다
+        if not os.path.isdir(mirror):
+            why = _거울_만들기(project, url, base, env)
+            if why:
+                return _그림_실패(why)
+        r = _원격_git(mirror, "fetch", "-q", "--no-write-fetch-head", url, "+refs/heads/%s:refs/remotes/origin/%s" % (base, base),
+                     env=env, timeout=REMOTE_FETCH_TIMEOUT)
         if r.returncode != 0:
             return _그림_실패(_끝줄(r))
+        r = _원격_git(mirror, "ls-tree", "-z", "--name-only", tip, "--", "docs/backlog/")
+        if r.returncode != 0:
+            return _그림_실패(_끝줄(r))
+        names = [n for n in sorted(os.path.basename(x) for x in r.stdout.split("\0") if x) if n.endswith(".md") and not n.startswith("_")]
+        글들 = _묶음_읽기(mirror, ["%s:docs/backlog/%s" % (tip, n) for n in names])
         cards = {}
-        for name in sorted(os.path.basename(x) for x in r.stdout.splitlines()):
-            if not name.endswith(".md") or name.startswith("_"):
+        for name in names:
+            text = 글들.get("%s:docs/backlog/%s" % (tip, name))
+            if text is None:
+                cards[name] = {"머리말": None, "title": name, "사람분": None, "커밋때": None}
                 continue
-            shown = _원격_git(project, "show", "%s:./docs/backlog/%s" % (tip, name))
-            if shown.returncode != 0:
-                cards[name] = {"머리말": None, "title": name, "커밋때": None}
-                continue
-            head = next((x[2:].strip() for x in shown.stdout.splitlines() if x.startswith("# ")), name)
-            fm = remote_front_matter(shown.stdout)
-            cards[name] = {"머리말": fm, "title": head,
-                           "커밋때": _커밋때(project, tip, name) if fm and fm.get("상태") == "진행" else None}
-        return {"없음": False, "때": dt.datetime.now(), "카드": cards, "오류": "", "끝": tip}
+            head = next((x[2:].strip() for x in text.splitlines() if x.startswith("# ")), name)
+            fm = remote_front_matter(text)
+            cards[name] = {"머리말": fm, "title": head, "사람분": _사람분_줄들(text.splitlines()),
+                           "커밋때": _커밋때(mirror, tip, name) if fm and fm.get("상태") == "진행" else None}
+        return {"없음": False, "때": dt.datetime.now(), "카드": cards, "오류": "", "끝": tip, "가지": base,
+                "끝때": _커밋때(mirror, tip, None), "저장소": _폴더이름(project)}
     except Exception as e:                           # 읽기가 무엇으로 실패하든 화면은 이 기계 것을 보인다
         return _그림_실패(str(e) or type(e).__name__)
 
 
 def _커밋때(project, tip, name):
-    """원격 기준 가지 끝에서 그 카드 파일을 마지막으로 고친 커밋의 때. 못 읽으면 None."""
-    r = _원격_git(project, "log", "-1", "--format=%ct", tip, "--", "docs/backlog/" + name)
+    """원격 기준 가지 끝에서 그 카드 파일을 마지막으로 고친 커밋의 때(`name` 이 None 이면 끝 커밋 자신의 때). 못 읽으면 None."""
+    r = _원격_git(project, "log", "-1", "--format=%ct", tip, *(("--", "docs/backlog/" + name) if name else ()))
     try:
         return dt.datetime.fromtimestamp(int(r.stdout.strip())) if r.returncode == 0 else None
     except ValueError:
@@ -2050,6 +2181,68 @@ def refresh_remote(items):
             # 오류 없이 0장이면 앞서 읽은 카드 수를 남겨 「원격 카드를 읽지 못함」 경고의 근거로 쓴다. 카드가 읽히면 새 그림에 이 키가 없어 경고가 풀린다
             pic = {**pic, "앞카드수": len((old or {}).get("카드") or {}) or (old or {}).get("앞카드수", 0)}
         REMOTE[key] = pic
+        _그림_저장(item["path"], pic)
+
+
+def _시각_글(t):
+    return t.isoformat(timespec="seconds") if isinstance(t, dt.datetime) else None
+
+
+def _시각_풀기(v):
+    return dt.datetime.fromisoformat(v) if isinstance(v, str) and v else None
+
+
+def _그림_파일(project):
+    return os.path.join(CACHE_DIR, _폴더이름(project) + ".json")
+
+
+def _그림_저장(project, pic):
+    """그림을 `CACHE_DIR/<이름>.json` 에 남긴다 — 끝을 한 번이라도 읽은 프로젝트만. 쓰기 실패는 화면에 영향이 없고 다음 바퀴에 다시 쓴다."""
+    if pic.get("없음") or not pic.get("끝"):
+        return
+    data = {"끝": pic["끝"], "가지": pic.get("가지", ""), "끝때": _시각_글(pic.get("끝때")), "때": _시각_글(pic.get("때")),
+            "시도": _시각_글(pic.get("시도") or pic.get("때")), "오류": pic.get("오류", ""), "앞카드수": pic.get("앞카드수", 0),
+            "카드": {n: {"머리말": c.get("머리말"), "title": c.get("title", n), "사람분": c.get("사람분"), "커밋때": _시각_글(c.get("커밋때"))}
+                   for n, c in (pic.get("카드") or {}).items()}}
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        path = _그림_파일(project)
+        with open(path + ".쓰는중", "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(path + ".쓰는중", path)
+    except OSError as e:
+        print("원격 그림 파일 저장 실패 (다음 바퀴에 다시): %s" % e, flush=True)
+
+
+def _그림_풀기(data, 저장소=""):
+    cards = {}
+    for n, c in data["카드"].items():
+        fm = c.get("머리말")
+        if fm is not None and not isinstance(fm, dict):
+            raise ValueError("머리말")
+        cards[n] = {"머리말": fm, "title": str(c.get("title", n)), "사람분": c.get("사람분"), "커밋때": _시각_풀기(c.get("커밋때"))}
+    if not isinstance(data["끝"], str) or not data["끝"]:
+        raise ValueError("끝")
+    pic = {"없음": False, "때": _시각_풀기(data.get("때")), "카드": cards, "오류": str(data.get("오류", "")), "끝": data["끝"],
+           "가지": str(data.get("가지", "")), "끝때": _시각_풀기(data.get("끝때")), "앞카드수": int(data.get("앞카드수", 0) or 0), "저장소": 저장소}
+    시도 = _시각_풀기(data.get("시도"))
+    if 시도:
+        pic["시도"] = 시도
+    return pic
+
+
+def 원격_불러오기(items):
+    """보는 목록 프로젝트마다 그림 파일을 읽어 `REMOTE` 에 아직 없는 프로젝트만 채운다. git 을 부르지 않고 예외도 내지 않는다.
+    파일이 없거나 깨졌으면 그 프로젝트는 비워 둔다(「원격 읽는 중」)."""
+    for item in items:
+        key = os.path.abspath(item["path"])
+        if key in REMOTE:
+            continue
+        try:
+            with open(_그림_파일(item["path"]), encoding="utf-8") as f:
+                REMOTE[key] = _그림_풀기(json.load(f), _폴더이름(item["path"]))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            continue
 
 
 def _비용품질_인자(qs):
@@ -2116,6 +2309,22 @@ def merge_cards(cards, 그림, 이기계):
     remote = {} if not 그림 or 그림.get("없음") else 그림.get("카드") or {}
     이기계 = _기기_이름(이기계)
     mine = {c["file"]: c for c in cards}
+    if remote and 그림.get("끝"):                      # 거울에서 읽은 그림 — 카드 상태의 출처는 원격 하나다. 사본 카드는 상태를 못 바꾼다
+        out = []
+        for name in sorted(remote):
+            rem = remote[name]
+            fm = rem["머리말"]
+            run = next((v for v in (_기기_이름(x) for x in ((fm or {}).get("돈기계"), (fm or {}).get("기기"))) if v), "")
+            c = _카드_만들기(name, rem["title"], fm or {}, 사람분=rem.get("사람분"))
+            if c["상태"] == "진행" and run and 이기계 and run == 이기계:    # 이 기기가 돌리는 카드만 이 기기의 실시간 줄을 붙인다
+                c["마지막줄"] = _실시간_줄(그림.get("저장소", ""), name)
+            이기기 = c["상태"] == "진행" and run and 이기계 and run == 이기계
+            out.append({**c, "소식때": rem.get("커밋때") if c["상태"] == "진행" and not 이기기 else None,
+                        "도는 기계": run or "기기 모름", "출처": "원격", "이기기돌림": bool(이기기), "원격만": name not in mine,
+                        "원격표시": ["원격 머리말 읽지 못함"] if fm is None else []})
+        return _줄_세우기(out)
+    if 그림 and not 그림.get("없음") and 그림.get("끝") and 그림.get("저장소"):    # 거울에서 읽었는데 원격에 카드가 0장 — 사본 카드로 돌아가지 않는다. 「저장소」는 읽은 그림만 갖는 표시다(끝만 적은 자리표시는 사본을 쓴다)
+        return []
     out = []
     for name in sorted(set(mine) | set(remote)):
         local, rem = mine.get(name), remote.get(name)
@@ -2179,7 +2388,7 @@ def _원격_문구(item, cards):
             초 = (dt.datetime.now() - when).total_seconds()
             out.append("원격 기준 %d분 전" % max(0, int(초 // 60)) + (" — 5분 넘게 못 받음" if 초 > REMOTE_STALE_SEC else ""))
         if not pic["오류"] and not pic["카드"] and (any(c.get("출처") != "원격" for c in cards) or pic.get("앞카드수", 0) > 0):
-            out.append("원격 카드를 읽지 못함 — 이 기기 사본 기준으로 보임")
+            out.append("원격 카드를 읽지 못함 — 원격 카드 0장" if pic.get("끝") else "원격 카드를 읽지 못함 — 이 기기 사본 기준으로 보임")
     밀림, 거부 = _올리기_결과(item, cards)
     if 밀림:
         out.append("올리지 못한 고침 있음 (%d장)" % 밀림)
@@ -2201,7 +2410,7 @@ def _읽기(item, 합치기=False):
     cards = read_cards(backlog)
     if 합치기:
         cards = merge_cards(cards, REMOTE.get(os.path.abspath(item["path"])), item.get("기기", ""))
-    scenarios = read_scenarios(os.path.join(item["path"], "docs", "plan"))
+    scenarios = 시나리오들(item["path"])
     todo = read_todo_cards(os.path.join(item["path"], "docs", "todo"))
     return cards, scenarios, todo, human_turns(cards, scenarios, item["path"], todo)
 
@@ -2212,8 +2421,8 @@ _미읽음 = object()
 def stalled_alarms(item, cards, 그림=None, now=None, lines=_미읽음):
     """한 프로젝트의 진행 카드마다 경보 0개 이상. `cards` 는 `merge_cards` 를 거친 카드(도는 기계·출처가 붙은 것).
 
-    이 기계 카드(출처 이 기계, 도는 기계가 보는 목록 `기기` 와 같음)는 러너가 살아 있는지·실행 기록이 침묵 상한보다 조용한지,
-    다른 기계 카드(출처 원격)는 원격 머리말 커밋이 시간 상한보다 오래됐는지를 본다. 도는 기계나 이 기계 이름을 모르면 판단하지 않는다.
+    이 기기가 돌리는 카드(도는 기계가 보는 목록 `기기` 와 같음 — 출처와 상관없음)는 러너가 살아 있는지·실행 기록이 침묵 상한보다 조용한지,
+    다른 기기가 돌리는 카드(출처 원격)는 원격 머리말 커밋이 시간 상한보다 오래돼 「소식 끊김」인지를 본다. 도는 기계나 이 기계 이름을 모르면 판단하지 않는다.
     `lines` 는 프로세스 목록(None 이면 못 읽음) — 주지 않으면 이 기계 카드가 있을 때 한 번 읽는다."""
     now = now or dt.datetime.now()
     mine = _기기_이름(item.get("기기"))
@@ -2230,7 +2439,7 @@ def stalled_alarms(item, cards, 그림=None, now=None, lines=_미읽음):
             out.append({"프로젝트": item["name"], "file": c["file"], "title": c["title"], "종류": 종류, "근거": 근거,
                         "열어 볼 곳": _주소(item["name"]) + urllib.parse.quote(c["file"])})
 
-        if c.get("출처") == "이 기계" and mine and _기기_이름(c.get("도는 기계")) == mine:
+        if mine and _기기_이름(c.get("도는 기계")) == mine:      # 이 기기가 돌리는 카드 — 카드가 거울에서 왔어도 러너·실행 기록을 본다
             if lines is _미읽음:
                 lines = process_lines()
             if runner_alive(lines, c["file"]) is False:
@@ -2242,8 +2451,8 @@ def stalled_alarms(item, cards, 그림=None, now=None, lines=_미읽음):
         elif c.get("출처") == "원격" and 그림:
             때 = ((그림.get("카드") or {}).get(c["file"]) or {}).get("커밋때")
             if 때 and (now - 때).total_seconds() > hard:
-                add("다른 기기 — %d분째 바뀌지 않음, 확인 못함" % ((now - 때).total_seconds() // 60),
-                    "원격 머리말 마지막 커밋 %s · %s시간 상한 %d분" % (때.strftime("%H:%M"), label, hard // 60))
+                add("소식 끊김 — 돌던 기기 확인",
+                    "원격 머리말 마지막 커밋 %s(%d분째 바뀌지 않음) · %s시간 상한 %d분" % (때.strftime("%H:%M"), (now - 때).total_seconds() // 60, label, hard // 60))
     return out
 
 
@@ -2287,7 +2496,7 @@ def home_numbers(rows, today, 병합=None):
     run = [ref(r, c) for r, c in 고름["진행"]]
     wait = [ref(r, c) for r, c in 고름["대기"]]
     stop = [ref(r, c) for r, c, _ in 고름["멈춤"]]
-    remote = sum(c.get("출처") == "원격" for _, c in 고름["진행"])
+    remote = sum(c.get("출처") == "원격" and not c.get("이기기돌림") for _, c in 고름["진행"])     # 출처는 거울에서 온 카드면 늘 원격이다 — 다른 기기 카드는 이 기기가 돌리는 카드를 뺀 것
     hold = sum(g == "러너가 멈춤" for _, _, g in 고름["멈춤"])
     alarm = sum(len({a["file"] for a in r.get("경보") or []}) for r in rows)
     over = sum(len(r.get("예상 넘김") or []) for r in rows)
@@ -2305,11 +2514,17 @@ def home_numbers(rows, today, 병합=None):
          "카드": stop, "위험": len(stop) >= 1, "고리": 고리("멈춤")}]
 
 
+def _사람손_파일들(project):
+    """사람 손 기록 파일 — 보드가 새로 쓰는 자리(`RESOLVED_DIR/<이름>`)와 옛 기록·배차가 쓰는 사본 `docs/plan/` 두 자리 모두."""
+    return (sorted(glob.glob(os.path.join(RESOLVED_DIR, _폴더이름(project), "사람손-*.md")))
+            + sorted(glob.glob(os.path.join(project, "docs", "plan", "사람손-*.md"))))
+
+
 def read_resolved(items):
     """보는 목록 프로젝트의 `docs/plan/사람손-*.md` 기록 줄들 — [{프로젝트, 때, 글}], 때가 늦은 것이 위. 못 읽은 파일은 때가 빈 한 줄."""
     out = []
     for item in items:
-        for path in sorted(glob.glob(os.path.join(item["path"], "docs", "plan", "사람손-*.md"))):
+        for path in _사람손_파일들(item["path"]):
             try:
                 with open(path, encoding="utf-8") as f:
                     lines = f.read().splitlines()
@@ -2398,6 +2613,10 @@ def project_row(item):
     row["차례 수"] = len(turns)
     row["원격"] = _원격_문구(item, cards)
     backlog = os.path.join(item["path"], "docs", "backlog")
+    그림 = REMOTE.get(os.path.abspath(item["path"])) or {}
+    if 그림.get("끝") and 그림.get("끝때"):            # 거울에서 읽는 프로젝트 — 원격 끝 커밋 때
+        row["마지막 움직임"] = 그림["끝때"].strftime("%Y-%m-%d %H:%M")
+        return row
     try:
         last = max(os.path.getmtime(os.path.join(backlog, c["file"])) for c in cards if not c.get("원격만"))
         row["마지막 움직임"] = dt.datetime.fromtimestamp(last).strftime("%Y-%m-%d %H:%M")
@@ -2451,7 +2670,7 @@ def all_turns(projects, sync=False):
                 그림 = REMOTE.get(os.path.abspath(item["path"]))
                 조용히 = _원격_처음_채움(item["path"])
                 turns = sync_turns(item["path"], turns, 조용히, 기록=not item.get("보기"))
-                remote_files = {c["file"] for c in cards if c.get("출처") == "원격"}
+                remote_files = {c["file"] for c in cards if c.get("출처") == "원격" and not c.get("이기기돌림")}
                 alarms = [{**a, "원격": a["file"] in remote_files} for a in stalled_alarms(item, cards, 그림)]
                 sync_alarms(item, alarms, 조용히)
             else:
@@ -2684,7 +2903,7 @@ def _이번주_병합(items, today):
     for item in items:
         끝 = (REMOTE.get(os.path.abspath(item["path"])) or {}).get("끝")
         try:
-            r = subprocess.run(["git", "-C", item["path"], "log", 끝, "--merges", "--format=%ct\t%s"],
+            r = subprocess.run(["git", "-C", _읽을_저장소(item["path"]), "log", 끝, "--merges", "--format=%ct\t%s"],
                                capture_output=True, text=True, timeout=30) if 끝 else None
         except (OSError, subprocess.SubprocessError):
             r = None
@@ -2931,7 +3150,9 @@ def read_status_stages(폴더명, 카드):
 
 
 def _git_읽기(project, *args):
-    return subprocess.run(["git", "-C", project] + list(args), capture_output=True, text=True, timeout=30)
+    """프로젝트의 이력 읽기 git 한 번. 그림에 끝이 있고 거울이 있으면 거울에서 읽는다(설정을 읽는 `remote` 만 사본)."""
+    대상 = project if args[:1] == ("remote",) else _읽을_저장소(project)
+    return subprocess.run(["git", "-C", 대상] + list(args), capture_output=True, text=True, timeout=30)
 
 
 def _전체_log(project, *뒤, 앞=()):
@@ -3090,7 +3311,7 @@ def _묶음_읽기(project, 열쇠들):
     """`git cat-file --batch` 한 번으로 `<sha>^:<경로>` 들의 글 — {열쇠: 글 또는 None(없음)}."""
     if not 열쇠들:
         return {}
-    r = subprocess.run(["git", "-C", project, "cat-file", "--batch"], input="".join(x + "\n" for x in 열쇠들).encode("utf-8"),
+    r = subprocess.run(["git", "-C", _읽을_저장소(project), "cat-file", "--batch"], input="".join(x + "\n" for x in 열쇠들).encode("utf-8"),
                        capture_output=True, timeout=30)
     data, pos, out = r.stdout, 0, {}
     for k in 열쇠들:
@@ -4993,7 +5214,11 @@ def render_relmap(item, items, 자료, qs):
     return _기능_틀() % {"name": esc("%s · %s" % (화면이름["graph"], item["name"])), "body": 본문}
 
 
-def render_card_detail(item, card, cards, scenarios, history, 머리말=None, 중앙값=None, 검토=None, 웹=""):
+class _본문_그림(Exception):
+    """카드 상세 본문 절을 이미 그렸다는 표시 — 아래 `except` 가 받아 넘어간다."""
+
+
+def render_card_detail(item, card, cards, scenarios, history, 머리말=None, 중앙값=None, 검토=None, 웹="", 본문=None):
     """카드 상세 HTML 문자열. 예외 없이 문자열을 돌려준다. 값을 못 읽은 자리는 이유를 적고 나머지는 그대로 낸다.
     위쪽은 목업(머리·요약·단계 흐름·판정과 지적·사람이 볼 것), 아래쪽은 지금까지의 절이다. 새 인자가 비면 중앙값 없음·판정 기록 없음·원격 없음."""
     esc = html.escape
@@ -5011,13 +5236,21 @@ def render_card_detail(item, card, cards, scenarios, history, 머리말=None, �
         parts.append("<p>출처: %s · 실행 기기 %s</p>" % (esc(card["출처"].replace("이 기계", "이 기기")), esc(_기기_글(card["도는 기계"]))))
     parts.append("<h2>머리말</h2>" + (_표_html(("키", "값"), list(fm.items())) if fm else "<p>머리말 없음</p>"))
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            text = f.read()
+        if isinstance(본문, tuple):                  # 거울에서 못 읽음 — 사본 글로 돌아가지 않는다(머리말은 원격, 본문은 사본인 화면을 만들지 않는다)
+            parts.append("<h2>본문</h2><p>본문을 원격에서 읽지 못함 — %s</p>" % esc(본문[1]))
+            raise _본문_그림
+        if isinstance(본문, str):
+            text = 본문
+        else:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                text = f.read()
         try:
             shown = 본문_그리기(text)
         except Exception:                            # 그리기가 무엇으로 실패하든 원문이 보인다
             shown = "<pre>%s</pre>" % esc(text)
         parts.append("<h2>본문</h2>" + shown)
+    except _본문_그림:
+        pass
     except OSError:
         parts.append("<h2>본문</h2><p>본문은 이 기기에 없음 — 원격에만 있는 카드</p>")
     parts.append("<h2>단계별 실행 기록</h2>")
@@ -5427,7 +5660,7 @@ def _카드_내용들(project, 쪽지):
     if not 새로:
         return out
     커밋들 = list(dict.fromkeys(h for h, _ in 새로))     # 같은 입력에 커밋마다 `<해시>^{commit}` 줄을 덧붙여 「커밋 없음」과 「파일 없음」을 가른다
-    r = subprocess.run(["git", "-C", project, "cat-file", "--batch"], capture_output=True, timeout=30,
+    r = subprocess.run(["git", "-C", _읽을_저장소(project), "cat-file", "--batch"], capture_output=True, timeout=30,
                        input="".join(["%s:docs/backlog/%s\n" % x for x in 새로] + ["%s^{commit}\n" % h for h in 커밋들]).encode("utf-8"))
     data, pos, 읽음, 있는커밋 = r.stdout, 0, {}, set()
     for key in 새로 + [(h, None) for h in 커밋들]:
@@ -5457,7 +5690,7 @@ def read_timeline_project(project, 끝=None, now=None):
     """한 프로젝트의 시간 막대 자료 — {"구간": [...], "작은 수정": [(때, 제목)], "완료 때": {카드 파일: 때},
     "기다림": [...], "병합": [(때, 누가)], "이어받기 때": [때]}. 구간마다 `국면` 조각이 붙는다. git 을 못 읽으면 OSError."""
     now = now or dt.datetime.now()
-    log = ["git", "-C", project, "log", "--all"] + ([끝] if 끝 else []) + ["--format=" + _시간_서식]
+    log = ["git", "-C", _읽을_저장소(project), "log", "--all"] + ([끝] if 끝 else []) + ["--format=" + _시간_서식]
     r = subprocess.run(log, capture_output=True, text=True, timeout=30)
     if r.returncode != 0 and 끝:                       # 원격 끝 객체가 이 기계에 없으면 이 기계 참조만 읽는다
         r = subprocess.run(log[:5] + log[6:], capture_output=True, text=True, timeout=30)
@@ -5609,7 +5842,7 @@ _움직임_서식 = "\x1e" + _구분.join(["%ct"] + ["%(trailers:key=Loop-" + k 
 
 def read_moves(project, 끝=None):
     """커밋마다 `{"때", "카드"(.md 뺀 이름), "단계"(러너 단계 커밋이면 True), "판"}`. 카드는 `Loop-Issue`, 없으면 `Loop-Card`. 못 읽으면 OSError."""
-    log = ["git", "-C", project, "log", "--all"] + ([끝] if 끝 else []) + ["--format=" + _움직임_서식]
+    log = ["git", "-C", _읽을_저장소(project), "log", "--all"] + ([끝] if 끝 else []) + ["--format=" + _움직임_서식]
     r = subprocess.run(log, capture_output=True, text=True, timeout=30)
     if r.returncode != 0 and 끝:                       # 원격 끝 객체가 이 기계에 없으면 이 기계 참조만 읽는다
         r = subprocess.run(log[:5] + log[6:], capture_output=True, text=True, timeout=30)
@@ -5634,7 +5867,7 @@ def read_feed(project, 끝, 기계맵):
     단계 커밋(`Loop-Stage`)은 `Loop-Verdict` 가 통과·반려일 때만, 머리말 커밋(`Loop-Card` 만)은 카드 파일의 `멈춘이유:` 가
     빈 값에서 채워지면 「멈춤」, 아니면 `상태:` 가 바뀌면 「상태 → 새 값」. 기계는 `기계맵`(카드 파일 → 도는 기계), 모르면 「기기 모름」."""
     def git(*args):
-        r = subprocess.run(["git", "-C", project, "-c", "core.quotepath=false", *args], capture_output=True, text=True, timeout=30)
+        r = subprocess.run(["git", "-C", _읽을_저장소(project), "-c", "core.quotepath=false", *args], capture_output=True, text=True, timeout=30)
         if r.returncode != 0 and 끝 and args[0] == "log" and 끝 in args:      # 원격 끝 객체가 이 기계에 없으면 이 기계 참조만 읽는다
             return git(*[a for a in args if a != 끝])
         if r.returncode != 0:
@@ -7030,6 +7263,15 @@ def 승격_글(text):
     return None
 
 
+def _올린_뒤_그림(project, r):
+    """단추로 원격에 올린 직후 그 프로젝트의 그림을 바로 새로 읽는다 — 카드 상태의 출처가 원격이라, 다음 바퀴(최대 1분)를 기다리면 방금 올린 카드가 화면에 안 보인다."""
+    if r.get("결과") == "올림":
+        try:
+            refresh_remote([{"path": project}])
+        except Exception:                            # noqa: BLE001 — 그림 갱신 실패가 단추의 결과를 바꾸지 않는다
+            pass
+
+
 def 카드_올리기(project, 파일이름, 글="", 승격=False, 잇기=None):
     """새 카드 파일 하나만 원격 기준 가지 끝 위에 커밋해 올린다. {"결과": 올림 | 올리지 못함 | 원격 없음, "까닭", "커밋"}.
     `승격=True` 면 새 파일이 아니라 원격 끝의 그 카드(아이디어일 때만)에서 `상태:` 줄만 대기로 바꿔 올린다. `잇기` 가 줄 목록이면 원격 끝의 그 카드 「## 배경」 끝에 그 줄들을 더해 올린다
@@ -7134,6 +7376,7 @@ def _카드만들기_처리(서버, item, items, form):
             서버._그리기(improve_page(item, {}, items, {"까닭들": ["카드 파일을 쓰지 못함 — %s" % e]}), 500)
             return
         r = 카드_올리기(대상["path"], 파일, 글)
+        _올린_뒤_그림(대상["path"], r)
         줄 = "카드를 만들었다 — %s/%s" % (대상["name"], 파일)
         if r["결과"] == "올림":
             줄 += " · 원격 저장소에 올림(커밋 %s)" % r["커밋"][:7]
@@ -7199,6 +7442,7 @@ def _잇기_처리(서버, item, items, form):
                 서버._그리기(improve_page(item, {}, items, {"까닭들": ["카드 파일을 쓰지 못함 — %s" % e]}), 500)
                 return
         r = 카드_올리기(대상["path"], 파일, 잇기=줄들)
+        _올린_뒤_그림(대상["path"], r)
         줄 = "카드에 이었다 — %s/%s" % (대상["name"], 파일)
         if r["결과"] == "올림":
             줄 += " · 원격 저장소에 올림(커밋 %s)" % r["커밋"][:7] + (" · 원격 끝에만 더했다" if 옛 is None else "")
@@ -7246,6 +7490,7 @@ def _승격_처리(서버, item, items, form):
             보이기("카드 파일을 쓰지 못함 — %s(상태는 그대로)" % e, 500)
             return
         r = 카드_올리기(item["path"], 파일, 승격=True)
+        _올린_뒤_그림(item["path"], r)
         if r["결과"] in ("이미 아이디어 아님", "원격에 없음"):
             try:
                 with open(경로, "w", encoding="utf-8", newline="") as f:
@@ -7490,9 +7735,17 @@ class 보드서버(작업파일서버):
                 return
             remote = ((REMOTE.get(os.path.abspath(item["path"])) or {}).get("카드") or {}).get(card_file) or {}
             fm = remote.get("머리말") if card.get("출처") == "원격" else None
+            본문 = None
+            끝 = (REMOTE.get(os.path.abspath(item["path"])) or {}).get("끝")
+            if card.get("출처") == "원격" and 끝:         # 본문도 머리말과 같은 끝에서 — 거울의 로컬 `cat-file`, 원격에는 닿지 않는다
+                if not os.path.isdir(_거울_경로(item["path"])):
+                    본문 = ("못읽음", "거울 폴더가 없음")
+                else:
+                    글 = _카드_내용들(item["path"], [(끝, card_file)]).get((끝, card_file))
+                    본문 = 글 if 글 is not None else ("못읽음", "거울의 원격 끝에 그 카드 글이 없음")
             self._그리기(render_card_detail(item, card, cards, scenarios, read_card_history(item["path"], card_file), fm,
                                             read_size_medians(item, cards, card), read_card_review(item["path"], card_file),
-                                            _원격_웹(item["path"])))
+                                            _원격_웹(item["path"]), 본문))
             return
         self.directory = os.path.join(item["path"], "docs", "backlog")
         self.path = "/" + sub
@@ -7551,6 +7804,7 @@ def _보드인가(port):
 def 상주(project=None, every=10):
     """보드 서버를 띄우고 every 초마다 모든 프로젝트의 사람 차례를 알린다. 자리가 막혔으면 알리고 1."""
     extra = {"name": _이름(project), "path": project, "표시": []} if project else None
+    원격_불러오기(_보는목록(extra)[0])         # 첫 원격 확인 전에도 마지막 그림으로 시작한다
     url, httpd = serve(project=project, port=PORT_BASE)
     if not httpd:
         print(who_holds(PORT_BASE))

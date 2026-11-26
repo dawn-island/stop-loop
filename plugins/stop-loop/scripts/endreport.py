@@ -211,14 +211,22 @@ def _저장소_경로(project):
     return out
 
 
+def _사람손_줄(project, no):
+    """시나리오의 사람 손 기록 줄(`- ` 로 시작) — 사본 `docs/plan/` 의 옛·배차 기록과 보드가 새로 쓰는 자리(`board.RESOLVED_DIR`) 두 자리 모두."""
+    out = []
+    for path in (os.path.join(project, "docs", "plan", "사람손-%s.md" % no),
+                 os.path.join(board.RESOLVED_DIR, os.path.basename(os.path.abspath(project)), "사람손-%s.md" % no)):
+        try:
+            with open(path, encoding="utf-8") as f:
+                out += [l for l in f.read().splitlines() if l.startswith("- ")]
+        except OSError:
+            pass
+    return out
+
+
 def _목표지표(project, no, rows, now):
     """끝 보고의 「## 목표 지표」 절 줄 목록 (SC-01 E-7). 0 은 0 으로, 셈하지 못한 것은 「셈하지 못함」으로 적는다."""
-    plan = os.path.join(project, "docs", "plan")
-    try:
-        with open(os.path.join(plan, "사람손-%s.md" % no), encoding="utf-8") as f:
-            손 = [l for l in f.read().splitlines() if l.startswith("- ")]
-    except OSError:
-        손 = []
+    손 = _사람손_줄(project, no)
     칸 = [l[2:].split(" · ") for l in 손]
     ps = next((_시각(c[0]) for c in 칸 if len(c) >= 3 and c[2] == "승인"), None)
     if ps is None:
@@ -389,11 +397,7 @@ def main(argv):
     path = os.path.join(plan, board.END_REPORT % no)
     now = dt.datetime.now().replace(microsecond=0)
     지표 = _목표지표(project, no, rows, now)
-    try:
-        with open(os.path.join(plan, "사람손-%s.md" % no), encoding="utf-8") as f:
-            손수 = sum(1 for l in f.read().splitlines() if l.startswith("- "))
-    except OSError:
-        손수 = 0
+    손수 = len(_사람손_줄(project, no))
     text = _보고서(sc, cards, rows, hist, 지표 + [""] + _개선(project, no, 손수), now)   # 다 센 뒤에 연다 — 오류가 파일을 비우지 않게
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
