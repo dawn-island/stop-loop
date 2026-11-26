@@ -5389,21 +5389,46 @@ def search_json(items, 결과, 까닭, 낱말=""):
 _시간_서식 = "\x1e" + _구분.join(["%H", "%ct", "%s"] + ["%(trailers:key=Loop-" + k + ",valueonly)" for k in ("Issue", "Card", "Resumed", "Stage")])
 
 
+_카드글_저장 = {}                                       # {(프로젝트, 해시, 카드 파일): 글 또는 None(커밋은 있는데 파일이 없음)} — 커밋 내용은 안 바뀌어 무효화가 없다
+_카드글_저장_상한 = 20000
+
+
 def _카드_내용들(project, 쪽지):
-    """`[(해시, 카드 파일)]` 의 그 커밋 때 카드 파일 내용 `{(해시, 카드 파일): 글}`. 없는 것은 빠진다."""
-    if not 쪽지:
-        return {}
+    """`[(해시, 카드 파일)]` 의 그 커밋 때 카드 파일 내용 `{(해시, 카드 파일): 글}`. 없는 것은 빠진다.
+    읽은 것은 저장해 두고 다시 묻지 않는다. 「커밋 객체가 이 기계에 없음」만 저장하지 않는다 — 원격을 받으면 읽히기 때문이다."""
+    out, 새로 = {}, []
+    for x in dict.fromkeys(쪽지):
+        if (project,) + x in _카드글_저장:
+            if _카드글_저장[(project,) + x] is not None:
+                out[x] = _카드글_저장[(project,) + x]
+        else:
+            새로.append(x)
+    if not 새로:
+        return out
+    커밋들 = list(dict.fromkeys(h for h, _ in 새로))     # 같은 입력에 커밋마다 `<해시>^{commit}` 줄을 덧붙여 「커밋 없음」과 「파일 없음」을 가른다
     r = subprocess.run(["git", "-C", project, "cat-file", "--batch"], capture_output=True, timeout=30,
-                       input="".join("%s:docs/backlog/%s\n" % x for x in 쪽지).encode("utf-8"))
-    out, data, pos = {}, r.stdout, 0
-    for key in 쪽지:
+                       input="".join(["%s:docs/backlog/%s\n" % x for x in 새로] + ["%s^{commit}\n" % h for h in 커밋들]).encode("utf-8"))
+    data, pos, 읽음, 있는커밋 = r.stdout, 0, {}, set()
+    for key in 새로 + [(h, None) for h in 커밋들]:
         end = data.index(b"\n", pos)
         head = data[pos:end].decode("utf-8", "replace").split()
         pos = end + 1
-        if len(head) == 3 and head[1] == "blob":
+        if len(head) == 3 and head[1] in ("blob", "commit"):
             size = int(head[2])
-            out[key] = data[pos:pos + size].decode("utf-8", "replace")
+            if key[1] is None:
+                있는커밋.add(key[0])
+            elif head[1] == "blob":
+                읽음[key] = data[pos:pos + size].decode("utf-8", "replace")
             pos += size + 1
+    if r.returncode == 0:
+        if len(_카드글_저장) + len(새로) > _카드글_저장_상한:
+            _카드글_저장.clear()
+        for key in 새로:
+            if key in 읽음:
+                _카드글_저장[(project,) + key] = 읽음[key]
+            elif key[0] in 있는커밋:
+                _카드글_저장[(project,) + key] = None
+    out.update(읽음)
     return out
 
 
@@ -5425,7 +5450,8 @@ def read_timeline_project(project, 끝=None, now=None):
                             "issue": f[3].removesuffix(".md"), "card": f[4].removesuffix(".md"), "resumed": f[5] == "true", "stage": f[6]})
     commits.sort(key=lambda c: c["때"])
     heads = [c for c in commits if c["card"] and not c["issue"] and c["제목"].startswith("작업목록:")]
-    내용 = _카드_내용들(project, [(c["sha"], c["card"] + ".md") for c in heads])
+    기록없음 = sorted({c["issue"] for c in commits if c["issue"]} - {c["card"] for c in heads}) if 끝 else []   # 원격 끝 머리말을 볼 후보 — 같은 프로세스로 함께 읽는다
+    내용 = _카드_내용들(project, [(c["sha"], c["card"] + ".md") for c in heads] + [(끝, card + ".md") for card in 기록없음])
     by_card, steps = {}, {}
     for c in heads:
         text = 내용.get((c["sha"], c["card"] + ".md"))
