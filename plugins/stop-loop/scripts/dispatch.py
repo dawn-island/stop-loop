@@ -8,10 +8,16 @@
 더 돌 것이 없으면 한 줄 요약을 찍고 끝난다.
 
     python3 bin/dispatch.py
+
+`--상주` 는 끝나지 않는다 — 60초마다 한 바퀴씩 원격을 받고, 병합된 카드를 정리하고, 대기 카드를 집고, 살아 있음 파일을 쓴다.
+`--상주-켜기`·`--상주-끄기` 는 로그인 자동 실행을 등록·해제한다. 멈춤 파일 `~/.stop-loop/dispatch.stop` 이 있으면 새 카드를 집지 않는다.
+
+    python3 bin/dispatch.py --상주
 """
 import datetime as dt
 import json
 import os
+import plistlib
 import re
 import subprocess
 import sys
@@ -30,6 +36,13 @@ RUNNER = os.path.join(HERE, "runner.py")
 CAP = 4          # 이 기계의 동시 상한 기본값. 바꾸려면 projects.json 의 maxParallel(max_parallel)
 REHANDOFF_CAP = 3  # 기준 가지 탓으로 멈춘 카드를 카드당 다시 인계하는 횟수. CAP 과 독립이다
 POLL = 1.0       # 실행이 끝났는지 보는 간격(초)
+RESIDENT_EVERY = 60      # 상주 배차의 바퀴 간격(초) — 시험이 바꿔 끼운다
+STOP_FILE = os.path.expanduser("~/.stop-loop/dispatch.stop")             # 있으면 상주 배차는 새 카드를 집지 않는다(내용은 읽지 않는다)
+STATUS_FILE = os.path.expanduser("~/.stop-loop/status/dispatch.json")    # 상주 배차의 살아 있음 파일 — 보드가 읽는다
+PLUGIN_JSON = os.path.join(runner.HQ, ".claude-plugin", "plugin.json")   # 자기 코드가 든 플러그인 폴더의 판 파일
+CONFIG_DIR = "~/.claude"                                                 # 설치 기록을 읽는 설정 폴더
+LAUNCH_LABEL = "dawn-island.stop-loop.dispatch"
+WAIT_PR = "앞 카드 PR 병합 기다림"
 
 gh_token = runner.gh_token      # 시험이 바꿔 끼운다
 
@@ -182,25 +195,31 @@ def _other_device(card, device):
     return bool(device) and dev not in ("", "—", "-") and dev != device
 
 
-def pick_next(cards, handed, live=frozenset(), held=frozenset(), lists=None, device=""):
+def pick_next(cards, handed, live=frozenset(), held=frozenset(), lists=None, device="", opened=frozenset()):
     """(집을 카드 또는 None, 건너뛴 까닭 또는 None).
 
     live = 이번 배차가 넘겨 아직 끝나지 않은 카드 경로. 돌고 있는 카드 = 상태 진행 또는 live.
     held = 승인되지 않은 시나리오 번호 — 그 시나리오의 대기 카드는 집지 않는다(E-2).
     lists = 선행 판정에 쓰는 시나리오별 카드 목록(`_ready`).
     device = 이 기기 이름. 다른 기기 카드는 집지도, 돌고 있는 카드로 세지도 않는다(상태는 건드리지 않는다). 선행 판정은 전체 카드를 본다.
+    opened = PR 이 열린 채 병합을 기다리는 카드 경로. 그 카드의 시작점은 겹침에 넣지만 돌고 있는 카드로는 세지 않는다 —
+    겹치지 않는 다른 카드와 재인계는 막지 않는다. 그것 때문에만 못 집으면 까닭은 `WAIT_PR`.
     돌고 있는 카드와 `시작점` 경로가 하나라도 같은 카드는 집지 않는다(시작점이 비면 겹치지 않는다) — 낱장·시나리오 카드 모두.
     """
     mine = [c for c in cards if not _other_device(c, device)]
     running = [c for c in mine if c["상태"] == "진행" or c["path"] in live]
     skip = "진행 카드 있어 건너뜀"
     busy = {p for c in running for p in c.get("시작점", [])}
-    ready = [c for c in mine if c["상태"] == "대기" and c["path"] not in handed and _ready(c, cards, lists)
-             and c["시나리오"] not in held and not busy.intersection(c.get("시작점", []))]
+    waiting = {p for c in mine if c["path"] in opened and c not in running for p in c.get("시작점", [])}
+    pending = [c for c in mine if c["상태"] == "대기" and c["path"] not in handed and _ready(c, cards, lists)
+               and c["시나리오"] not in held and not busy.intersection(c.get("시작점", []))]
+    ready = [c for c in pending if not waiting.intersection(c.get("시작점", []))]
     if ready:
         return min(ready, key=lambda c: c["file"]), None
     if running:
         return None, skip
+    if len(pending) > len(ready):
+        return None, WAIT_PR
     others = any(_other_device(c, device) and c["상태"] == "대기" and c["path"] not in handed for c in cards)
     return (None, OTHER_DEVICE) if others else (None, None)
 
@@ -467,6 +486,337 @@ def pick_rehandoff(project_path, cards, handed, live, device=""):
     return None
 
 
+def _run(cmd, cwd, env):
+    return subprocess.run(cmd, cwd=cwd, env=env, text=True, capture_output=True)
+
+
+def latest_pr(root, card, env):
+    """(PR 또는 None, 오류 문구). `--state all` 이 없으면 gh 는 열린 PR 만 내놓아 병합된 것이 안 보인다.
+    정리 스크립트(`bin/ship_cards.py`)와 상주 배차가 이 한 곳을 함께 쓴다."""
+    res = _run(["gh", "pr", "list", "--head", "loop/" + card, "--state", "all",
+                "--json", "number,state,url,createdAt"], root, env)
+    if res.returncode:
+        return None, "PR 상태를 읽지 못함: " + (res.stderr or res.stdout).strip()
+    try:
+        prs = json.loads(res.stdout)
+        if any(p["state"] not in ("OPEN", "MERGED", "CLOSED") for p in prs):
+            raise ValueError("알 수 없는 상태")
+    except (ValueError, KeyError, TypeError) as e:
+        return None, "PR 상태를 읽지 못함: %s" % e
+    return (max(prs, key=lambda p: p["createdAt"]) if prs else None), None
+
+
+def align_cards(root, env):
+    """pull 이 거부되지 않게: 원격 기준 가지가 기계 열쇠 줄만 바꾼 카드 가운데 작업 파일이 고쳐진 채인 것의
+    색인 항목만 원격 내용으로 맞춘다. 작업 파일은 건드리지 않는다. 본문·사람 열쇠까지 바뀐 카드는 맞추지 않는다."""
+    git = lambda *a, **k: runner._card_git(root, *a, env=env, **k)       # noqa: E731
+    url = git("remote", "get-url", "origin").stdout.strip()
+    if not url:
+        return
+    _, tip, err = runner._remote_tip(root, url, env)
+    if err:
+        return
+    for rel in git("diff", "--name-only", "HEAD", tip, "--", "docs/backlog").stdout.splitlines():
+        if git("diff", "--quiet", "--", rel).returncode == 0 or git("diff", "--cached", "--quiet", "--", rel).returncode:
+            continue                                  # 작업 파일이 그대로이거나 색인을 사람이 건드렸다
+        old, new = git("show", "HEAD:" + rel), git("show", "%s:%s" % (tip, rel))
+        ent = git("ls-tree", tip, "--", rel).stdout.split()
+        if old.returncode or new.returncode or len(ent) < 3 \
+                or runner.card_without_keys(old.stdout) != runner.card_without_keys(new.stdout):
+            continue
+        git("update-index", "--cacheinfo", "%s,%s,%s" % (ent[0], ent[2], rel))
+
+
+def open_prs(project_path, cards, env):
+    """`(PR 을 기다리는 카드 경로 집합, {경로: 까닭})`. `검토` 카드에만 PR 을 묻는다 — 열린 PR 이거나 읽지 못한 카드(막는 쪽으로 넘어진다)."""
+    opened, why = set(), {}
+    for c in cards:
+        if c["상태"] != "검토":
+            continue
+        try:
+            pr, err = latest_pr(project_path, c["file"][:-3], env)
+        except OSError as e:
+            pr, err = None, "PR 상태를 읽지 못함: %s" % e
+        if err:
+            opened.add(c["path"])
+            why[c["path"]] = err
+        elif pr and pr["state"] == "OPEN":
+            opened.add(c["path"])
+    return opened, why
+
+
+def _project_env(project_path):
+    """자식 프로세스에만 넣는 계정 토큰. 계정 칸이 없거나 토큰이 없으면 그대로."""
+    env = dict(os.environ)
+    try:
+        account = runner.load_models(project_path).get("_githubAccount")
+    except Exception:                # noqa: BLE001 — 설정을 못 읽어도 바퀴는 돈다
+        account = None
+    token = gh_token(account) if account else None
+    if token:
+        env["GH_TOKEN"] = token
+    return env
+
+
+def sync_remote(project_path):
+    """원격 기준 가지를 빨리감기로만 받는다. 받았거나 받을 것이 없으면 None, 건너뛰면 까닭 글. 예외를 내지 않는다.
+    받는 조건: 작업 사본이 기준 가지에 있고 · 커밋 안 된 변경이 없거나 카드 기계 열쇠 줄뿐이고 · 빨리감기가 된다.
+    병합·되감기·덮어쓰기는 하지 않는다."""
+    try:
+        if not os.path.exists(os.path.join(project_path, ".git")):
+            return None
+        env = _project_env(project_path)
+        git = lambda *a, **k: runner._card_git(project_path, *a, env=env, **k)       # noqa: E731
+        url = git("remote", "get-url", "origin").stdout.strip()
+        if not url:
+            return None
+        base, tip, err = runner._remote_tip(project_path, url, env)
+        if err:
+            return "원격을 받지 못함: " + err
+        cur = git("symbolic-ref", "--short", "-q", "HEAD").stdout.strip() or "(분리된 HEAD)"
+        if cur != base:
+            return "기준 가지가 아닌 가지 %s 에 있음" % cur
+        for line in git("status", "--porcelain", "--untracked-files=no").stdout.splitlines():
+            rel = line[3:].strip().strip('"')
+            if line[:2] in (" M", "M ", "MM") and rel.startswith("docs/backlog/") and rel.endswith(".md"):
+                old = git("show", "HEAD:" + rel)
+                try:
+                    with open(os.path.join(project_path, rel), encoding="utf-8") as f:
+                        new = f.read()
+                except (OSError, UnicodeDecodeError):
+                    return "커밋 안 된 변경: " + rel
+                if old.returncode == 0 and runner.card_without_keys(old.stdout) == runner.card_without_keys(new):
+                    continue
+            return "커밋 안 된 변경: " + rel
+        if git("merge-base", "--is-ancestor", tip, "HEAD").returncode == 0:
+            return None
+        if git("merge-base", "--is-ancestor", "HEAD", tip).returncode:
+            return "빨리감기가 안 됨: 작업 사본 %s 에 원격에 없는 커밋이 있음" % base
+        align_cards(project_path, env)
+        res = git("merge", "--ff-only", tip)
+        if res.returncode:
+            return "빨리감기가 안 됨: " + ((res.stderr or res.stdout).strip().splitlines() or ["?"])[-1]
+        return None
+    except Exception as e:                # noqa: BLE001 — 원격 맞추기가 바퀴를 죽이지 않는다
+        return "원격을 받지 못함: %s" % e
+
+
+def _head(project_path):
+    """작업 사본 `HEAD` 의 sha. 못 읽으면 빈 값."""
+    try:
+        res = _run(["git", "rev-parse", "HEAD"], project_path, None)
+        return res.stdout.strip() if res.returncode == 0 else ""
+    except OSError:
+        return ""
+
+
+def version_drift():
+    """상주 배차 자신의 판과 지금 설치된 판이 다르면 「<자기 판> → <설치된 판>」. 플러그인이 아니거나 한쪽이라도 못 읽으면 None."""
+    if not runner.PLUGIN:
+        return None
+    try:
+        with open(PLUGIN_JSON, encoding="utf-8") as f:
+            mine = json.load(f)["version"]
+        with open(os.path.join(os.path.expanduser(CONFIG_DIR), "plugins", "installed_plugins.json"), encoding="utf-8") as f:
+            plugins = json.load(f)["plugins"]
+        key = next(k for k in sorted(plugins) if k.split("@", 1)[0] == runner.PLUGIN)
+        theirs = plugins[key][0]["version"]
+    except (OSError, ValueError, KeyError, IndexError, TypeError, AttributeError, StopIteration):
+        return None
+    if not (isinstance(mine, str) and mine and isinstance(theirs, str) and theirs) or mine == theirs:
+        return None
+    return "%s → %s" % (mine, theirs)
+
+
+def 상주_켜기():
+    """로그인 항목 파일 하나를 쓰고 등록한다 — 지금 이 dispatch.py 를 가리킨다. 보드의 등록은 건드리지 않는다."""
+    path = os.path.join(board.LAUNCH_DIR, LAUNCH_LABEL + ".plist")
+    os.makedirs(board.LAUNCH_DIR, exist_ok=True)
+    with open(path, "wb") as f:
+        plistlib.dump({"Label": LAUNCH_LABEL, "ProgramArguments": [sys.executable, os.path.abspath(__file__), "--상주"],
+                       "RunAtLoad": True, "KeepAlive": True, "AbandonProcessGroup": True,
+                       "EnvironmentVariables": {"PATH": board._상주_PATH()}}, f)
+    domain = "gui/%d" % os.getuid()
+    board._launchctl(["bootout", "%s/%s" % (domain, LAUNCH_LABEL)])      # 이미 있으면 내린다 — 없어서 실패해도 무방
+    rc, err = board._launchctl(["bootstrap", domain, path])
+    if rc:
+        print("로그인 항목을 등록하지 못했다: %s" % err)
+        return 1
+    print("켰다 — 로그인 때 상주 배차가 뜬다: %s" % path)
+    return 0
+
+
+def 상주_끄기():
+    board._launchctl(["bootout", "gui/%d/%s" % (os.getuid(), LAUNCH_LABEL)])
+    try:
+        os.remove(os.path.join(board.LAUNCH_DIR, LAUNCH_LABEL + ".plist"))
+    except FileNotFoundError:
+        pass
+    print("껐다")
+    return 0
+
+
+class _Why(dict):
+    """프로젝트 이름 → 건너뛴 까닭. 같은 바퀴에 까닭이 둘 이상이면 덮어쓰지 않고 「 · 」 로 잇는다."""
+
+    def __setitem__(self, name, why):
+        old = self.get(name)
+        if old and why not in old.split(" · "):
+            why = "%s · %s" % (old, why)
+        elif old:
+            why = old
+        super().__setitem__(name, why)
+
+
+class _Resident:
+    """상주 배차 — 바퀴마다 프로젝트를 원격과 맞추고, 병합된 카드를 정리하고, 대기 카드를 집고, 살아 있음 파일을 쓴다.
+    인자 없는 배차가 「한 번」 동안만 들고 있던 상태(handed·dead·shown)는 여기서 바퀴마다 풀린다."""
+
+    def __init__(self):
+        self.handed = set()      # 넘긴 카드 경로 — 러너가 돌지 않고 디스크 상태가 대기가 아니게 된 것을 보면 풀린다
+        self.running = {}        # 카드 경로 → (프로젝트 이름, 프로세스, 카드)
+        self.dead = set()        # 토큰을 못 얻어 더 보지 않는 프로젝트 — 바퀴마다 토큰을 다시 묻는다
+        self.probed = {}         # 재인계 후보 경로 → 판정한 때의 작업 사본 HEAD
+        self.prev_shown, self.cur_shown = set(), set()
+        self.skipped, self.skipwheel = _Why(), set()
+        self.paths = {}
+        self.wheel, self.stop, self.drift = 0, False, ""
+        self.cap = max_parallel()
+
+    def write(self):
+        data = {"기기": this_machine(), "때": dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"), "바퀴": self.wheel,
+                "pid": os.getpid(), "멈춤": self.stop, "판바뀜": self.drift,
+                "카드": [{"프로젝트": name, "카드": card["file"]} for name, _, card in self.running.values()],
+                "건너뜀": dict(self.skipped)}
+        tmp = "%s.tmp%d" % (STATUS_FILE, os.getpid())
+        try:
+            os.makedirs(os.path.dirname(STATUS_FILE), exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, STATUS_FILE)
+        except OSError:
+            pass
+
+    def reap(self):
+        for key, (name, proc, card) in list(self.running.items()):
+            if proc.poll() is None:
+                continue
+            del self.running[key]
+            if board.front_matter(card["path"]).get("상태", "") != "대기":
+                self.handed.discard(key)
+            backlog.tidy(self.paths[name], 실행=True)     # 병합된 카드를 완료로, 끝 보고 방아쇠
+            endreport.auto(self.paths[name])
+
+    def visit(self, name, path, device):
+        if name in self.dead:
+            account = runner.load_models(path).get("_githubAccount")
+            if account and not gh_token(account):
+                self.skipped[name] = "계정 토큰 없음"
+                return
+            self.dead.discard(name)
+        why = sync_remote(path)
+        if why:
+            self.skipped[name] = why
+        backlog.tidy(path, 실행=True)
+        for line in promote(path, name):
+            self.cur_shown.add(line)
+            if line not in self.prev_shown:
+                print(line)
+        while len(self.running) < self.cap and self.take(name, path, device):
+            pass
+
+    def take(self, name, path, device):
+        """카드 하나를 집어 러너를 띄웠으면 True."""
+        cards, why = read_cards(path)
+        for c in cards:
+            if c["path"] in self.handed and c["path"] not in self.running and c["상태"] != "대기":
+                self.handed.discard(c["path"])
+        card, pr_why = None, {}
+        if not why:
+            opened = set()
+            if any(c["상태"] == "검토" for c in cards):
+                opened, pr_why = open_prs(path, cards, _project_env(path))
+            card, why = pick_next(cards, self.handed | self.skipwheel, set(self.running), held(path), lists(path),
+                                  device=device, opened=opened)
+            if why == WAIT_PR and pr_why:
+                why = next(iter(pr_why.values()))
+        again = False
+        if card is None and not (why and why not in (None, "진행 카드 있어 건너뜀", OTHER_DEVICE, WAIT_PR)):
+            head = _head(path)
+            probe = self.handed | {p for p, h in self.probed.items() if h == head}
+            before = set(probe)
+            card = pick_rehandoff(path, cards, probe, set(self.running), device=device)
+            self.probed.update({p: head for p in probe - before})
+            again = card is not None
+            if again:
+                why = None
+        if why:
+            self.skipped[name] = why
+            return False
+        if card is None:
+            stale = [c["file"] for c in cards if c["path"] in self.handed and c["path"] not in self.running and c["상태"] == "대기"]
+            if stale:
+                self.skipped[name] = "다시 넘기지 않음 — 러너가 상태를 바꾸지 않고 끝남: " + ", ".join(stale)
+            return False
+        if board.front_matter(card["path"]).get("상태", "") != ("보류" if again else "대기"):
+            self.skipwheel.add(card["path"])        # 그 사이 다른 배차가 집었다 — 띄우지 않는다
+            return True
+        if not check_account(path, card["path"]):
+            self.dead.add(name)
+            self.skipped[name] = "계정 토큰 없음"
+            return False
+        if again:
+            n = _count(card) + 1
+            if not _set_head(card["path"], 재인계=n):
+                print("재인계 안 함 — %s/%s: 재인계 횟수를 쓰지 못함" % (name, card["file"]))
+                self.skipwheel.add(card["path"])
+                return True
+            print("재인계 — %s/%s: 기준 가지가 고쳐짐, %d회째" % (name, card["file"], n))
+        self.handed.add(card["path"])
+        args = [sys.executable, RUNNER, path, card["path"]] + (["--resume"] if again else [])
+        env = dict(os.environ, STOP_LOOP_DEVICE=this_machine() or device)
+        self.running[card["path"]] = (name, subprocess.Popen(args, env=env), card)
+        return True
+
+    def run(self, wheels):
+        self.drift = version_drift() or ""
+        self.write()                                  # 뜰 때 한 번 — 바퀴 0
+        while True:
+            self.wheel += 1
+            t0 = time.time()
+            self.drift = version_drift() or ""
+            self.stop = os.path.exists(STOP_FILE)
+            self.skipped, self.skipwheel, self.cur_shown = _Why(), set(), set()
+            self.reap()
+            self.write()
+            if not (self.stop or self.drift):
+                devices = {}
+                try:
+                    projects = load_projects(PROJECTS_JSON, devices)
+                except (OSError, ValueError, KeyError, TypeError) as e:
+                    self.skipped["프로젝트 목록"] = "프로젝트 목록을 읽지 못함: %s (%s)" % (PROJECTS_JSON, e)
+                    projects = []
+                self.paths.update(dict(projects))
+                for name, path in projects:
+                    try:
+                        self.visit(name, path, devices.get(name, ""))
+                    except Exception as e:        # noqa: BLE001 — 한 프로젝트의 탈이 상주를 죽이지 않는다
+                        self.skipped[name] = "오류: %s" % e
+                    self.write()
+            self.prev_shown = self.cur_shown
+            self.write()
+            if wheels is not None and self.wheel >= wheels:
+                break
+            while time.time() < t0 + RESIDENT_EVERY:
+                self.reap()
+                time.sleep(POLL)
+        while self.running:
+            self.reap()
+            time.sleep(POLL)
+        self.write()
+        return 0
+
+
 def _summary(started, results, skipped):
     now = dt.datetime.now()
     if results:
@@ -481,7 +831,14 @@ def _summary(started, results, skipped):
     return line
 
 
-def main(argv=None):
+def main(argv=None, wheels=None):
+    argv = list(argv or [])
+    if "--상주-켜기" in argv:
+        return 상주_켜기()
+    if "--상주-끄기" in argv:
+        return 상주_끄기()
+    if "--상주" in argv:
+        return _Resident().run(wheels)         # `wheels` 는 시험 전용 — 바퀴를 그만큼 돌고 러너를 기다린 뒤 돌아온다
     started = dt.datetime.now()
     try:
         devices = {}
@@ -522,7 +879,7 @@ def main(argv=None):
                 card, why = pick_next(cards, handed, set(running), held(path), lists(path),
                                       device=devices.get(name, ""))
             again = False
-            if card is None and not (why and why not in (None, "진행 카드 있어 건너뜀", OTHER_DEVICE)):
+            if card is None and not (why and why not in (None, "진행 카드 있어 건너뜀", OTHER_DEVICE, WAIT_PR)):
                 card = pick_rehandoff(path, cards, handed, set(running), device=devices.get(name, ""))
                 again = card is not None
                 if again:

@@ -2782,6 +2782,62 @@ def _사이드바_고리(href, 글, 현재, 배지="", 뜨거움=False):
                                        '<span class="n%s">%s</span>' % (" hot" if 뜨거움 else "", 배지) if 배지 != "" else "")
 
 
+DISPATCH_STALE_SEC = 300     # 이보다 오래 쓰지 않은 `dispatch.json` 은 「배차 꺼짐」 — 바퀴(60초)보다 길고 원격 낡음 경고와 같은 값
+
+
+def _pid_살아있나(pid):
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except (ProcessLookupError, OSError, OverflowError):
+        return False
+    return True
+
+
+def dispatch_lines(items, rows, now=None):
+    """사이드바 상자에 더할 배차 줄 `[(글, 경고인가)]`. 이 기기는 `STATUS_DIR/dispatch.json`, 다른 기기는 원격 카드 머리말로 추정한다.
+    보드는 배차를 가져오지 않는다 — 파일 이름과 꺼짐 판단을 여기서 따로 안다."""
+    now = now or dt.datetime.now()
+    out, this = [], ""
+    try:
+        with open(os.path.join(STATUS_DIR, "dispatch.json"), encoding="utf-8") as f:
+            data = json.load(f)
+        때 = dt.datetime.strptime(data["때"], "%Y-%m-%dT%H:%M:%S")
+        pid = int(data["pid"])
+        this = _기기_이름(data.get("기기"))
+        분 = max(0, int((now - 때).total_seconds() // 60))
+        if (now - 때).total_seconds() <= DISPATCH_STALE_SEC and _pid_살아있나(pid):
+            글, 경고 = "배차 켜짐 · 마지막 바퀴 %d분 전" % 분, False
+            if data.get("멈춤"):
+                글 += " · 멈춤 파일 있음"
+            if data.get("판바뀜"):
+                글 += " · 판 바뀜 %s — 새 판에서 --상주-켜기 해야 새 카드를 집음" % data["판바뀜"]
+                경고 = True
+            out.append((글, 경고))
+        else:
+            out.append(("배차 꺼짐", False))
+    except FileNotFoundError:
+        out.append(("배차 꺼짐", False))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        out.append(("배차 상태 못 읽음", True))
+    이름들, 소식 = {_기기_이름(i.get("기기")) for i in items}, {}
+    for i in items:
+        for c in ((REMOTE.get(os.path.abspath(i["path"])) or {}).get("카드") or {}).values():
+            fm = c.get("머리말") or {}
+            기계 = _기기_이름(fm.get("돈기계"))
+            if fm.get("상태") == "진행" and 기계:
+                이름들.add(기계)
+                if c.get("커밋때") and (기계 not in 소식 or c["커밋때"] > 소식[기계]):
+                    소식[기계] = c["커밋때"]
+    for 이름 in sorted(이름들 - {"", this}):
+        글 = "%s · 배차 원격으로 모름" % 이름
+        if 이름 in 소식:
+            글 += " · 마지막 카드 소식 %d분 전" % max(0, int((now - 소식[이름]).total_seconds() // 60))
+        out.append((글, False))
+    return out
+
+
 def render_shell(items, rows, turns, path):
     """모든 서버 화면 왼쪽의 `<nav class="side">`. `rows` 는 `items` 와 같은 순서의 `project_row`, `turns` 는 `my_turns` 결과, `path` 는 요청 경로.
     어떤 예외가 나도 최소 사이드바(고리 넷)를 돌려준다 — 화면 본문은 사이드바 때문에 막히지 않는다."""
@@ -2819,7 +2875,7 @@ def render_shell(items, rows, turns, path):
         # 못 읽은 프로젝트는 자기 마지막 읽은 시각(「원격 읽음」)을 걸러내지 않는다 — 위의 전체 시각이 다른 프로젝트 것이어도 가려지지 않게
         원격 += [("%s · %s" % (i["name"], x), _원격_경고줄(x)) for i, r in zip(items, rows) for x in r.get("원격", [])
                if not x.startswith("원격 읽음") or any(y.startswith("원격 저장소를 아직 못 읽음") for y in r.get("원격", []))]
-        상자 = ["러너 %s / 상한 %d" % (러너, max_parallel_read())] + 원격 + ["stop-loop %s" % (plugin_version_read() or "—")]
+        상자 = ["러너 %s / 상한 %d" % (러너, max_parallel_read())] + 원격 + dispatch_lines(items, rows) + ["stop-loop %s" % (plugin_version_read() or "—")]
         return ((_사이드바_머리 % esc(이기계 or "—")) + '<div class="grp">%s</div>' % "".join(링크)
                 + '<div class="grp"><span class="gh">프로젝트</span>%s<span class="gh">숫자는 진행 중 · 막힘</span></div>' % ("".join(프로젝트) or '<span class="nolink">보는 프로젝트 없음</span>')
                 + '<div class="grp"><span class="gh">분석</span>%s</div>' % "".join(분석)
