@@ -534,8 +534,7 @@ def machine_checks(project, models_cfg):
     failed = []
     if checks:
         clean_untracked_links(project)
-    # 명령이 「누구의 검사인가」를 알게 한다 — 프로젝트가 카드마다 DB 를 나누는 근거.
-    env = dict(os.environ, STOP_LOOP_CARD=models_cfg["_card"]) if models_cfg.get("_card") else None
+    env = _check_env(models_cfg)
     changed = False                          # False = 아직 안 구함, None = 모름
     for c in checks:
         pats = c.get("paths")
@@ -546,14 +545,75 @@ def machine_checks(project, models_cfg):
             if changed is not None and not _paths_match(changed, pats):
                 print("       %s: %s" % (SKIP_NOT_IN_PATHS, c["cmd"]), flush=True)
                 continue
-        cwd = os.path.join(project, c.get("cwd", "")) if c.get("cwd") else project
-        r = subprocess.run(c["cmd"], shell=True, cwd=cwd, env=env,
-                           capture_output=True, text=True)
-        if r.returncode != 0:
-            tail = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()[-6:]
-            failed.append({"cmd": c["cmd"], "rc": r.returncode,
-                           "tail": "\n".join(tail)})
+        bad = _run_check(project, c, env)
+        if bad:
+            failed.append(bad)
     return (not failed), failed
+
+
+def _check_env(models_cfg):
+    """명령이 「누구의 검사인가」를 알게 한다 — 프로젝트가 카드마다 DB 를 나누는 근거."""
+    return dict(os.environ, STOP_LOOP_CARD=models_cfg["_card"]) if models_cfg.get("_card") else None
+
+
+def _run_check(project, c, env):
+    """검사 한 개를 돈다. 통과하면 None, 실패하면 `{"cmd","rc","tail"}`."""
+    cwd = os.path.join(project, c.get("cwd", "")) if c.get("cwd") else project
+    r = subprocess.run(c["cmd"], shell=True, cwd=cwd, env=env,
+                       capture_output=True, text=True)
+    if r.returncode == 0:
+        return None
+    tail = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()[-6:]
+    return {"cmd": c["cmd"], "rc": r.returncode, "tail": "\n".join(tail)}
+
+
+def split_flaky(project, models_cfg, failed):
+    """실패한 검사를 같은 명령·같은 작업 폴더·같은 카드 환경값으로 정확히 한 번 더 돌려 가른다.
+
+    `(flaky, stable)` — 다시 돌리니 통과한 것(불안정한 시험)과 또 실패한 것(안정 실패). 둘 다 `failed` 의
+    부분 목록이고 순서를 지킨다. 안정 실패의 `rc`·`tail` 은 처음 실패의 것이다. 다시 돌리려다 시작조차 못 하면
+    안정 실패다 — 실패를 통과로 바꾸는 쪽으로 틀리지 않는다. 처음에 이미 돌았으므로 `paths` 로 건너뛰지 않는다.
+    """
+    if not failed:
+        return [], []
+    print("       실패한 검사 %d개를 다시 돈다" % len(failed), flush=True)
+    env = _check_env(models_cfg)
+    by_cmd = {c["cmd"]: c for c in models_cfg.get("_checks") or []}
+    flaky, stable = [], []
+    for x in failed:
+        try:
+            again = _run_check(project, by_cmd.get(x["cmd"], {"cmd": x["cmd"]}), env)
+        except OSError:
+            again = x
+        (stable if again else flaky).append(x)
+    return flaky, stable
+
+
+def note_flaky(state, events, stage, flaky):
+    """불안정으로 가른 검사 이름을 남긴다 — 화면 한 줄, 사건 기록, 상태(같은 단계·명령은 한 번)."""
+    if not flaky:
+        return
+    cmds = [x["cmd"] for x in flaky]
+    for cmd in cmds:
+        print("       불안정한 시험으로 가름 (다시 돌리니 통과): %s" % cmd, flush=True)
+    stoploop.append_event(events, {"stage": stage, "gate": "flaky-check", "checks": cmds})
+    seen = state.setdefault("flakyChecks", [])
+    for cmd in cmds:
+        if {"stage": stage, "cmd": cmd} not in seen:
+            seen.append({"stage": stage, "cmd": cmd})
+
+
+def flaky_section(state):
+    """인계 문서·`10-merge.md` 에 싣는 「불안정한 시험」 절. 없으면 빈 문자열.
+    줄이 `MACHINE_FAIL_FMT` 모양이 아니라 배차가 기계 검사 실패로 읽지 않는다."""
+    cmds = []
+    for x in state.get("flakyChecks") or []:
+        if x["cmd"] not in cmds:
+            cmds.append(x["cmd"])
+    if not cmds:
+        return ""
+    return "## 불안정한 시험\n\n%s\n\n" % "\n".join(
+        "- %s (처음 실패, 다시 돌리니 통과)" % c for c in cmds)
 
 
 def classify_failures(project, base_sha, failed, models_cfg):
@@ -1034,6 +1094,16 @@ CARD_KEYS = ("상태", "단계", "시작", "누적", "멈춘이유", "멈춘종�
 CARD_PUSH_DIR = None
 CARD_GIT_TIMEOUT = 20          # 원격 명령 한 번의 상한(초) — 머리말 쓰기가 실행을 오래 붙잡지 않게
 CARD_PUSH_TRIES = 3            # 올리는 사이 원격이 움직여 밀렸을 때 다시 받아 만드는 횟수
+RETRY_TRIES = 3                # 인계·병합 호출이 일시적으로 실패했을 때 처음 포함 부르는 최대 횟수 (기록 52)
+RETRY_WAITS = (10, 30)         # 첫 실패·둘째 실패 뒤 쉬는 초
+# 거부 문구가 하나라도 있으면 다시 해도 안 된다 — 일시 문구보다 앞선다. 둘 다 없으면 거부로 본다.
+RETRY_REFUSED = ("permission denied", "protected branch", "non-fast-forward", "rejected", "denied",
+                 "authentication failed", "403", "401", "conflict", "not mergeable",
+                 "already exists", "토큰을 얻지 못했다")
+RETRY_TRANSIENT = ("could not resolve host", "temporary failure in name resolution", "timed out",
+                   "timeout", "connection reset", "connection refused", "network is unreachable",
+                   "no such host", "error connecting to api.github.com", "remote end hung up",
+                   "early eof", "tls handshake", "http 500", "http 502", "http 503", "http 504")
 
 
 def _card_git(cwd, *args, env=None, timeout=None, input=None):
@@ -3274,6 +3344,39 @@ def gh_token(account):
     return (res.stdout.strip() or None) if res.returncode == 0 else None
 
 
+def is_transient(text):
+    """실패 출력이 일시적(네트워크·시간 넘김·5xx)인지 가른다. 거부 문구가 먼저, 모르면 거부(기록 52)."""
+    low = (text or "").lower()
+    if any(x in low for x in RETRY_REFUSED):
+        return False
+    return any(x in low for x in RETRY_TRANSIENT)
+
+
+def retry_transient(call, label, settled=None):
+    """`call()`(CompletedProcess 를 돌려준다)을 일시적으로 실패하는 동안 최대 `RETRY_TRIES` 번 부른다.
+
+    성공하거나 거부·모르는 실패면 그 결과를 곧바로 돌려준다. 같은 명령을 그대로 다시 부를 뿐
+    강제 옵션은 붙이지 않는다. `settled` 는 일시 실패 뒤 다시 부르기 전에 이미 끝난 일인지
+    보는 함수 — 참이면 성공으로 돌려준다(병합 시간 넘김 뒤 서버에서는 병합된 경우).
+    """
+    res = None
+    for n in range(RETRY_TRIES):
+        res = call()
+        if res.returncode == 0:
+            return res
+        if not is_transient("%s\n%s" % (res.stderr or "", res.stdout or "")):
+            return res
+        if settled and settled():
+            return subprocess.CompletedProcess(getattr(res, "args", []), 0, res.stdout, res.stderr)
+        if n == RETRY_TRIES - 1:
+            break
+        wait = RETRY_WAITS[min(n, len(RETRY_WAITS) - 1)]
+        print("일시적 실패 — %d초 뒤 다시 시도 (%d/%d): %s"
+              % (wait, n + 2, RETRY_TRIES, label), flush=True)
+        time.sleep(wait)
+    return res
+
+
 def gh(project, *args):
     """`gh` 를 부르는 유일한 자리 — 시험이 이 함수를 바꿔 끼워 실제 GitHub 에 닿지 않는다.
 
@@ -3376,7 +3479,7 @@ def handoff(project, issue_id, body_path, mode="pr"):
     problem = github_login_problem(project) if mode in ("pr", "push") else None
     if problem:
         return [problem]
-    push = git("push", "-u", "origin", branch)
+    push = retry_transient(lambda: git("push", "-u", "origin", branch), "가지 올리기")
     if push.returncode:
         return ["가지를 올리지 못했다 — %s" % tail(push)]
     mismatch = head_mismatch(project, branch)
@@ -3417,7 +3520,7 @@ def repush(project, issue_id, mode):
 
     `local` 이면 원격을 건드리지 않는다(기록 37 결정 1). 강제 push 는 하지
     않는다 — 사람이 그 사이 원격 가지에 올렸으면 거부되고, 그때는 알리고
-    끝낸다(기록 32, 외부 장애에 복구 장치를 만들지 않는다).
+    끝낸다(기록 32). 일시적 실패는 같은 push 를 3번까지 다시 한다(기록 52).
     """
     if mode == "local":
         return []
@@ -3434,7 +3537,7 @@ def repush(project, issue_id, mode):
     if git("remote", "get-url", "origin").returncode:
         return ["원격이 없다 — 소각 커밋은 이 기계의 가지에만 있다"]
 
-    push = git("push", "-u", "origin", branch)
+    push = retry_transient(lambda: git("push", "-u", "origin", branch), "소각 뒤 가지 올리기")
     if push.returncode:
         return ["소각 뒤 가지를 올리지 못했다 — %s" % tail(push)]
     mismatch = head_mismatch(project, branch)
@@ -3648,7 +3751,8 @@ def ready_and_merge(project, issue_id, repush_lines, pr_opened, state, models):
 
     `(찍을 줄, 멈춤 까닭 또는 None)` 을 돌려준다. 다시 올리지 못했거나(PR 이 아직
     소각 전 상태다) 이 실행이 PR 을 안 열었으면 `gh` 를 부르지 않는다. 준비됨·병합이
-    실패하면 PR 을 그대로 두고 멈춘다 — 재시도·되돌리기는 하지 않는다(기록 32).
+    실패하면 PR 을 그대로 두고 멈춘다 — 일시적 실패는 같은 호출을 3번까지 다시 한다(기록 52),
+    거부·되돌리기는 하지 않는다(기록 32).
     """
     branch = "loop/%s" % issue_id
     if not pr_opened:
@@ -3668,12 +3772,12 @@ def ready_and_merge(project, issue_id, repush_lines, pr_opened, state, models):
     target = branch                    # pr view·comment·merge 가 받는 대상
     known = (state.get("merge") or {}).get("reasons") or []
     human = [x for x in known if x.startswith((HUMAN_REASON, OLD_HUMAN_REASON, IRREVERSIBLE_REASON))]   # 이른 병합이 known 을 비우기 전에
-    ready = gh(project, "pr", "ready", branch)
+    ready = retry_transient(lambda: gh(project, "pr", "ready", branch), "PR 준비됨")
     if ready.returncode:
         stop = "준비됨으로 바꾸지 못했다 — %s" % tail(ready)
         # 이른 병합이면 소각만 반영하는 후속 PR 을 연다 — 상태는 한 번만 읽는다.
-        lst = gh(project, "pr", "list", "--head", branch, "--state", "all",
-                 "--json", "number,state,mergedAt")
+        lst = retry_transient(lambda: gh(project, "pr", "list", "--head", branch, "--state", "all",
+                                         "--json", "number,state,mergedAt"), "PR 목록")
         try:
             prs = json.loads(lst.stdout) if lst.returncode == 0 else []
             first = max(prs, key=lambda x: x["number"]) if prs else None
@@ -3747,10 +3851,16 @@ def ready_and_merge(project, issue_id, repush_lines, pr_opened, state, models):
                           capture_output=True, text=True)
     if head.returncode or not head.stdout.strip():
         return out, "병합하지 못했다 — 로컬 HEAD 를 읽지 못했다"
-    m = gh(project, "pr", "merge", target, "--merge",
-           "--match-head-commit", head.stdout.strip(),
-           "--subject", "[loop] %s — 자동 병합" % issue_id,
-           "--body", "기록 41 조건을 모두 채워 러너가 병합했다\n\nLoop-Issue: %s" % issue_id)
+    def already_merged():
+        st = gh(project, "pr", "view", target, "--json", "state", "-q", ".state")
+        return st.returncode == 0 and st.stdout.strip() == "MERGED"
+
+    m = retry_transient(
+        lambda: gh(project, "pr", "merge", target, "--merge",
+                   "--match-head-commit", head.stdout.strip(),
+                   "--subject", "[loop] %s — 자동 병합" % issue_id,
+                   "--body", "기록 41 조건을 모두 채워 러너가 병합했다\n\nLoop-Issue: %s" % issue_id),
+        "PR 병합", settled=already_merged)
     if m.returncode:
         return out, "병합하지 못했다 — %s" % tail(m)
     out.append("자동 병합했다")
@@ -3901,6 +4011,8 @@ def stage_handoff(project, wd, issue, issue_id, state, models, events, outp, con
         failed = []
         if result != "no-base":
             ok, failed = machine_checks(project, dict(models, _base=state.get("tddBase")))
+            flaky, failed = split_flaky(project, models, failed)
+            note_flaky(state, events, "10", flaky)
         marks = upload_markers(project, m.get("sha"), branch)
         problems += [(MACHINE_FAIL_FMT + "\n         %s")
                      % (x["cmd"], x["rc"], x["tail"].replace("\n", "\n         "))
@@ -3931,6 +4043,7 @@ def stage_handoff(project, wd, issue, issue_id, state, models, events, outp, con
                 f.write("\n## 기준 가지에서도 실패 — 참고\n\n")
                 for x in split["base"]:
                     f.write("- " + MACHINE_FAIL_FMT % (x["cmd"], x["rc"]) + "\n")
+            f.write("\n" + flaky_section(state))
         stoploop.append_event(events, {"stage": "10", "gate": "handoff-card-fault",
                                        "problems": [x["cmd"] for x in split["card"]]})
         state["fix10"] = findings
@@ -3968,6 +4081,7 @@ def stage_handoff(project, wd, issue, issue_id, state, models, events, outp, con
                             bool(models.get("_autoMerge")), state["stages"], notes=notes))
         f.write("## 사람 결정 미결\n\n%s\n\n"
                 % ("\n".join("- %s: %s" % x for x in human) if human else "없음"))
+        f.write(flaky_section(state))
         f.write("# 인계\n\n스테이지 결과:\n")
         for k, v in state["stages"].items():
             f.write("- %s: %s%s%s\n" % (k, v["status"],
@@ -4649,6 +4763,10 @@ def main(argv):
                     probs = tdd_evidence(project, wd, state.get("tddBase"), **hints)
                     t0 = time.monotonic()
                     ok, failed = machine_checks(project, dict(models, _base=state.get("tddBase")))
+                    if not ok:
+                        flaky, failed = split_flaky(project, dict(models, _base=state.get("tddBase")), failed)
+                        note_flaky(state, events, "07", flaky)
+                        ok = not failed
                     gate_secs = int(time.monotonic() - t0)
                     if not ok:
                         for x in failed:

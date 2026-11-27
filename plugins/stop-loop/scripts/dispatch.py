@@ -38,6 +38,8 @@ CAP = 4          # 이 기계의 동시 상한 기본값. 바꾸려면 projects.
 REHANDOFF_CAP = 3  # 기준 가지 탓으로 멈춘 카드를 카드당 다시 인계하는 횟수. CAP 과 독립이다
 POLL = 1.0       # 실행이 끝났는지 보는 간격(초)
 RESIDENT_EVERY = 60      # 상주 배차의 바퀴 간격(초) — 시험이 바꿔 끼운다
+AUTO_RESUME_WAIT = 600   # 일시적 실패 카드를 자동으로 이어받기 전에 기다리는 초 — 시험이 바꿔 끼운다
+AUTO_MARK = "자동-이어받음.json"   # 실행 폴더 안 표지 — 그 실행이 자동 이어받기를 한 번 받았다는 유일한 근거
 STOP_FILE = os.path.expanduser("~/.stop-loop/dispatch.stop")             # 있으면 상주 배차는 새 카드를 집지 않는다(내용은 읽지 않는다)
 STATUS_FILE = os.path.expanduser("~/.stop-loop/status/dispatch.json")    # 상주 배차의 살아 있음 파일 — 보드가 읽는다
 PLUGIN_JSON = os.path.join(runner.HQ, ".claude-plugin", "plugin.json")   # 자기 코드가 든 플러그인 폴더의 판 파일
@@ -90,6 +92,33 @@ def is_my_card(run):
     """카드 `돈기계` 가 이 기기의 카드인가 — 이 기기 이름(`"이 기계"`)이거나 이 기기 호스트 이름과 같을 때. 빈 값은 아니다(받을 기기를 모른다)."""
     run = (run or "").strip()
     return bool(run) and (run == this_machine() or run == socket.gethostname())
+
+
+def _mono():
+    """기다림을 재는 시계(초). 시험이 바꿔 끼운다."""
+    return time.monotonic()
+
+
+def auto_resume_candidate(head):
+    """보류이고 `멈춘종류` 가 일시적 실패이고 돈 기기가 이 기기인가. 머리말만 본다(`요청결과` 는 보지 않는다). 입력을 바꾸지 않는다."""
+    return (head.get("상태") == "보류" and head.get("멈춘종류") == "일시적 실패"
+            and is_my_card(head.get("돈기계")))
+
+
+def has_auto_mark(wd):
+    """이 실행 폴더가 자동 이어받기를 이미 한 번 받았는가."""
+    return os.path.exists(os.path.join(wd, AUTO_MARK))
+
+
+def write_auto_mark(wd):
+    """실행 폴더에 표지를 쓴다. 썼으면 True, 못 쓰면 False."""
+    row = {"카드": os.path.basename(wd.rstrip("/")), "때": dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")}
+    try:
+        with open(os.path.join(wd, AUTO_MARK), "w", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except OSError:
+        return False
+    return True
 
 
 HUMAN_ANSWERS = "사람의 답"
@@ -233,7 +262,33 @@ def _other_device(card, device):
     return bool(device) and dev not in ("", "—", "-") and dev != device
 
 
-def pick_next(cards, handed, live=frozenset(), held=frozenset(), lists=None, device="", opened=frozenset()):
+def shared_files(project):
+    """프로젝트 설정 `sharedFiles` 의 규칙 `[{"file": str, "touchedBy": [str, ...]}]`. 못 읽거나 모양이 틀린 것은 빼고, 없으면 `[]`.
+    빈 접두(`""`)는 모든 경로에 닿으므로 버린다."""
+    text = runner.read_config(project)
+    try:
+        raw = json.loads(text)["sharedFiles"] if text else []
+    except (ValueError, KeyError, TypeError):
+        return []
+    rules = []
+    for r in raw if isinstance(raw, list) else []:
+        if not (isinstance(r, dict) and isinstance(r.get("file"), str) and r["file"]
+                and isinstance(r.get("touchedBy"), list)):
+            continue
+        rules.append({"file": r["file"], "touchedBy": [t for t in r["touchedBy"] if isinstance(t, str) and t]})
+    return rules
+
+
+def effective_starts(card, shared):
+    """겹침 판정에 쓰는 카드 경로 — 시작점에, 규칙의 `touchedBy` 접두로 시작하거나 `file` 과 같은 시작점이 있으면 그 규칙의 `file` 을 더한 것."""
+    starts = list(card.get("시작점", []))
+    for r in shared:
+        if r["file"] not in starts and any(s == r["file"] or s.startswith(tuple(r["touchedBy"])) for s in starts):
+            starts.append(r["file"])
+    return starts
+
+
+def pick_next(cards, handed, live=frozenset(), held=frozenset(), lists=None, device="", opened=frozenset(), shared=()):
     """(집을 카드 또는 None, 건너뛴 까닭 또는 None).
 
     live = 이번 배차가 넘겨 아직 끝나지 않은 카드 경로. 돌고 있는 카드 = 상태 진행 또는 live.
@@ -243,15 +298,16 @@ def pick_next(cards, handed, live=frozenset(), held=frozenset(), lists=None, dev
     opened = PR 이 열린 채 병합을 기다리는 카드 경로. 그 카드의 시작점은 겹침에 넣지만 돌고 있는 카드로는 세지 않는다 —
     겹치지 않는 다른 카드와 재인계는 막지 않는다. 그것 때문에만 못 집으면 까닭은 `WAIT_PR`.
     돌고 있는 카드와 `시작점` 경로가 하나라도 같은 카드는 집지 않는다(시작점이 비면 겹치지 않는다) — 낱장·시나리오 카드 모두.
+    shared = 설정 `sharedFiles` 규칙(`shared_files`). 있으면 겹침 경로를 `effective_starts` 로 넓혀 센다.
     """
     mine = [c for c in cards if not _other_device(c, device)]
     running = [c for c in mine if c["상태"] == "진행" or c["path"] in live]
     skip = "진행 카드 있어 건너뜀"
-    busy = {p for c in running for p in c.get("시작점", [])}
-    waiting = {p for c in mine if c["path"] in opened and c not in running for p in c.get("시작점", [])}
+    busy = {p for c in running for p in effective_starts(c, shared)}
+    waiting = {p for c in mine if c["path"] in opened and c not in running for p in effective_starts(c, shared)}
     pending = [c for c in mine if c["상태"] == "대기" and c["path"] not in handed and _ready(c, cards, lists)
-               and c["시나리오"] not in held and not busy.intersection(c.get("시작점", []))]
-    ready = [c for c in pending if not waiting.intersection(c.get("시작점", []))]
+               and c["시나리오"] not in held and not busy.intersection(effective_starts(c, shared))]
+    ready = [c for c in pending if not waiting.intersection(effective_starts(c, shared))]
     if ready:
         return min(ready, key=lambda c: c["file"]), None
     if running:
@@ -658,7 +714,9 @@ def version_drift():
         with open(os.path.join(os.path.expanduser(CONFIG_DIR), "plugins", "installed_plugins.json"), encoding="utf-8") as f:
             plugins = json.load(f)["plugins"]
         key = next(k for k in sorted(plugins) if k.split("@", 1)[0] == runner.PLUGIN)
-        theirs = plugins[key][0]["version"]
+        # 한 열쇠 아래 사용자 범위와 다른 프로젝트의 프로젝트 범위 항목이 섞인다 — 사용자 범위(또는 옛 모양)만 본다.
+        theirs = next(e["version"] for e in plugins[key]
+                      if isinstance(e, dict) and (e.get("scope") == "user" or ("scope" not in e and "projectPath" not in e)))
     except (OSError, ValueError, KeyError, IndexError, TypeError, AttributeError, StopIteration):
         return None
     if not (isinstance(mine, str) and mine and isinstance(theirs, str) and theirs) or mine == theirs:
@@ -718,6 +776,7 @@ class _Resident:
         self.prev_shown, self.cur_shown = set(), set()
         self.skipped, self.skipwheel = _Why(), set()
         self.paths = {}
+        self.seen = {}           # 자동 이어받기 후보 카드 경로 → 처음 본 때(`_mono`) — 메모리에만 둔다
         self.wheel, self.stop, self.drift = 0, False, ""
         self.cap = max_parallel()
 
@@ -761,8 +820,62 @@ class _Resident:
             self.cur_shown.add(line)
             if line not in self.prev_shown:
                 print(line)
+        self.auto_resume(name, path)
         while len(self.running) < self.cap and self.take(name, path, device):
             pass
+
+    def auto_resume(self, name, path):
+        """일시적 실패로 멈춘 이 기기의 보류 카드를 AUTO_RESUME_WAIT 초 기다린 뒤 실행마다 한 번 `--resume` 으로 잇는다.
+        「한 번」은 실행 폴더의 표지 파일만으로 센다. 사람 요청(`requests`)이 먼저 돌고, 돌고 있는 카드·동시 상한이 찬 바퀴는 미룬다."""
+        folder = os.path.join(path, "docs", "backlog")
+        live = set()
+        for fname in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
+            card_path = os.path.join(folder, fname)
+            if not (fname.endswith(".md") and os.path.isfile(card_path)):
+                continue
+            if card_path in self.running:
+                continue
+            head = board.front_matter(card_path)
+            if not auto_resume_candidate(head):
+                continue
+            live.add(card_path)
+            first = self.seen.setdefault(card_path, _mono())
+            if _mono() - first < AUTO_RESUME_WAIT or len(self.running) >= self.cap:
+                continue
+            stem = os.path.splitext(fname)[0]
+            wd, _ = runner.pick_run_dir("%s.%s" % (path.rstrip("/"), stem), stem)
+            if not wd:
+                self.skipped[name] = "이어받을 실행 폴더가 없다: %s" % fname
+                continue
+            if has_auto_mark(wd):
+                continue
+            if not check_account(path, card_path):
+                self.dead.add(name)
+                self.skipped[name] = "계정 토큰 없음"
+                break
+            if not write_auto_mark(wd):
+                print("자동 이어받기 안 함 — %s/%s: 표지를 쓰지 못함" % (name, fname))
+                continue
+            try:
+                prev = json.loads(head.get("요청결과") or "{}")
+            except ValueError:
+                prev = {}
+            number = prev.get("번호") if isinstance(prev, dict) else None
+            if not (isinstance(number, str) and number) or number.startswith("자동:"):
+                number = None                  # 사람 요청 번호만 그대로 둔다 — 지난 자동 번호는 이번 실행 것으로 바꾼다
+            row = {"번호": number or "자동:%s" % os.path.basename(wd.rstrip("/")), "종류": "자동 이어받기", "결과": "이어받음",
+                   "까닭": "일시적 실패로 멈춘 뒤 10분 기다려 배차가 스스로 이어받음",
+                   "때": dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")}
+            if not _set_head(card_path, 요청결과=json.dumps(row, ensure_ascii=False)):
+                print("자동 이어받기 보임칸을 쓰지 못함 — %s/%s" % (name, fname))
+            print("자동 이어받음 — %s/%s" % (name, fname))
+            self.seen.pop(card_path, None)
+            self.handed.add(card_path)
+            env = dict(os.environ, STOP_LOOP_DEVICE=this_machine())
+            self.running[card_path] = (name, subprocess.Popen([sys.executable, RUNNER, path, card_path, "--resume"], env=env),
+                                       {"file": fname, "path": card_path})
+        for key in [k for k in self.seen if os.path.dirname(k) == folder and k not in live]:
+            del self.seen[key]
 
     def requests(self, name, path):
         """원격에서 받은 `docs/backlog/_요청/*.json`(보드가 올린 답·이어받기·보류로 두기)를 이 기기가 돌던 카드에 대해서만 처리한다.
@@ -851,7 +964,7 @@ class _Resident:
             if any(c["상태"] == "검토" for c in cards):
                 opened, pr_why = open_prs(path, cards, _project_env(path))
             card, why = pick_next(cards, self.handed | self.skipwheel, set(self.running), held(path), lists(path),
-                                  device=device, opened=opened)
+                                  device=device, opened=opened, shared=shared_files(path))
             if why == WAIT_PR and pr_why:
                 why = next(iter(pr_why.values()))
         again = False
@@ -991,7 +1104,7 @@ def main(argv=None, wheels=None):
             card = None
             if not why:
                 card, why = pick_next(cards, handed, set(running), held(path), lists(path),
-                                      device=devices.get(name, ""))
+                                      device=devices.get(name, ""), shared=shared_files(path))
             again = False
             if card is None and not (why and why not in (None, "진행 카드 있어 건너뜀", OTHER_DEVICE, WAIT_PR)):
                 card = pick_rehandoff(path, cards, handed, set(running), device=devices.get(name, ""))
