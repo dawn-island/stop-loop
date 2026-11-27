@@ -74,6 +74,12 @@ def plugin_version(config_dir):
     return "%s (%s)" % (ver, sha) if ver and sha else (ver or sha)
 
 
+def plugin_dir():
+    """이 러너가 도는 판 폴더의 실제 경로 — 한 실행이 모든 단계 세션에 고정해 넘기는 폴더.
+    플러그인이 아니면(PLUGIN 이 None) None. 시험이 바꿔 끼운다."""
+    return os.path.realpath(HQ) if PLUGIN else None
+
+
 def agent_ref(agent):
     return "%s:%s" % (PLUGIN, agent) if PLUGIN and agent else agent
 
@@ -101,6 +107,9 @@ _save_ctx = None
 # 판 지킴·계정 지킴이 `main()` 에서 정한 값을 `commit_stage`·`gh` 에 넘기는 전역 — `_events_path` 와
 # 같은 이유(인자를 늘리면 그 함수를 가짜로 바꿔 끼우는 시험이 깨진다). `main()` 머리에서 되돌린다.
 _plugin_ver = None
+# 이 실행이 세션에 고정해 넘기는 판 폴더(ISSUE-runner-pin-plugin-version-2026-11-27). `main()` 이 정한다.
+# `call()` 인자로 넘기지 않는 이유는 `_events_path` 와 같다 — 인자를 늘리면 가짜 `call` 을 끼우는 시험이 깨진다.
+_plugin_dir = None
 _gh_account = None
 _gh_token = None
 TOKEN_KEYS = ("input_tokens", "cache_creation_input_tokens",
@@ -1614,9 +1623,13 @@ def resume_state(state, statef):
     if prev.get("verifierTree"):
         state["verifierTree"] = prev["verifierTree"]
     # 막힘·멈춤·이어받기 기록도 잇는다 — 안 이으면 앞 세션의 까닭이 사라진다. 옛 파일엔 없다.
-    for k in ("gateBlocks", "stops", "resumes"):
+    for k in ("gateBlocks", "stops", "resumes", "pluginFallbacks"):
         v = prev.get(k)
         state[k] = list(v) if isinstance(v, list) else []
+    # 시작 판과 고정 폴더도 잇는다 — 안 이으면 이어받는 러너의 판이 남은 단계를 가져간다. 옛 파일엔 없다.
+    for k in ("plugin", "pluginDir"):
+        if isinstance(prev.get(k), str) and prev[k]:
+            state[k] = prev[k]
     return bool(state["counters"] or state["rounds"] or state["cost"]
                 or state.get("tddBase"))
 
@@ -2536,6 +2549,8 @@ def call(agent, prompt, cwd, config_dir, num=None, models=None):
     if model:
         cmd += ["--model", model]
     cmd += ["--effort", effort_of(models, num, agent)]
+    if _plugin_dir:
+        cmd += ["--plugin-dir", _plugin_dir]     # 같은 이름의 설치본을 통째로 대신한다 — 정의·기술이 시작 판 그대로다
     if agent:
         cmd += ["--agent", agent_ref(agent)]
     cmd.append(prompt)
@@ -3855,6 +3870,10 @@ def stage_handoff(project, wd, issue, issue_id, state, models, events, outp, con
                             bool(state.get("resumed")), scenario=scenario)
     human = human_items(wd)
     notes = [line] if line else []
+    for fb in state.get("pluginFallbacks") or []:
+        notes.append("플러그인 판 대체: %s 가 없어 %s 로 이었다 (%s, %s)"
+                     % (fb.get("from") or "기록된 폴더", fb.get("to") or "설치본",
+                        fb.get("reason"), fb.get("stage") or "이어받기"))
     # 07 「참고 사항」은 병합과 무관한 메모라 병합을 막지 않는다 — 03a·07a 사람 결정만 센다(시나리오 여부와 무관).
     counted = [x for x in human if x[0] in ("03a", "07a")]
     if scenario:
@@ -4000,14 +4019,55 @@ def main(argv):
               % (len(state["rounds"]), state["counters"]))
     if a.resume:
         _log_add(state, "resumes", {"at": dt.datetime.now().strftime("%Y-%m-%d %H:%M")})
-    global _plugin_ver, _gh_account, _gh_token
-    _plugin_ver = _gh_account = _gh_token = None      # 앞 main() 의 값을 물려받지 않는다
-    if not a.dry_run:
-        # 이어받아도 앞 실행의 판을 잇지 않는다 — 이어받는 그때의 판이 이 실행의 시작 때 판이다.
+    global _plugin_ver, _gh_account, _gh_token, _plugin_dir
+    _plugin_ver = _gh_account = _gh_token = _plugin_dir = None   # 앞 main() 의 값을 물려받지 않는다
+
+    def pin_fallback(stage_tag, frm, reason):
+        """고정 폴더를 못 쓰게 됐다 — 멈추지 않고 지금 러너의 판 폴더(없으면 설치본)로 잇고 사실을 남긴다."""
+        global _plugin_dir, _plugin_ver
+        to = plugin_dir()
+        if to and not os.path.isdir(to):
+            to = None
+        entry = {"stage": stage_tag, "from": frm, "to": to, "reason": reason,
+                 "at": dt.datetime.now().strftime("%Y-%m-%d %H:%M")}
+        print("  ! 플러그인 판 대체: %s — %s → %s" % (reason, frm or "기록 없음", to or "설치본"))
+        stoploop.append_event(events, {"stage": stage_tag, "notice": "plugin-fallback",
+                                       "from": frm, "to": to, "reason": reason})
+        _log_add(state, "pluginFallbacks", entry)
+        _plugin_dir = to
         _plugin_ver = plugin_version(a.config_dir)
-        if _plugin_ver:
-            state["plugin"] = _plugin_ver
-            stoploop.append_event(events, {"plugin": _plugin_ver})
+        for k, v in (("pluginDir", to), ("plugin", _plugin_ver)):
+            if v:
+                state[k] = v
+            else:
+                state.pop(k, None)
+
+    if not a.dry_run:
+        recorded = state.get("pluginDir") if a.resume else None
+        if recorded and os.path.isdir(recorded):
+            # 이어받기는 앞 실행의 시작 판으로 잇는다 — 이어받는 러너가 새 판이어도 세션이 읽는 정의는 시작 판이다.
+            _plugin_dir = recorded
+            _plugin_ver = state.get("plugin")
+            ev = {"pluginDir": recorded, "pinned": "resume"}
+            if _plugin_ver:
+                ev["plugin"] = _plugin_ver
+            stoploop.append_event(events, ev)
+        elif a.resume and (recorded or PLUGIN):
+            pin_fallback(None, recorded, "폴더 없음" if recorded else "기록 없음")
+        else:
+            _plugin_ver = plugin_version(a.config_dir)
+            pd = plugin_dir()
+            if pd and os.path.isdir(pd):
+                _plugin_dir = pd
+            ev = {}
+            if _plugin_ver:
+                state["plugin"] = _plugin_ver
+                ev["plugin"] = _plugin_ver
+            if _plugin_dir:
+                state["pluginDir"] = _plugin_dir
+                ev["pluginDir"] = _plugin_dir
+            if ev:
+                stoploop.append_event(events, ev)
         if models.get("_githubAccount"):
             _gh_account = models["_githubAccount"]
             _gh_token = gh_token(_gh_account)
@@ -4050,6 +4110,8 @@ def main(argv):
             state.pop("verifierTree", None)
             save_state(statef, state)
 
+    changed_seen = set()   # 이미 알린 (시작 판, 새 판) — 같은 새 판은 한 번만 적는다
+
     def session(agent, prompt, cwd, num, stage_tag, fix_of=None):
         """세션을 띄우고 직전·직후 HEAD 를 대조한다 (FN-03).
 
@@ -4057,23 +4119,18 @@ def main(argv):
         넣지 않는 이유는 시험이 `r.call` 을 가짜로 바꿔 끼우기 때문이다.
         `state`·`events`·`statef` 를 감싸는 이유는 멈출 때 쓰는 이 값들이
         `main()` 의 지역이라서다. 다시 쓰였으면 이 자리에서 멈춤을 기록하고
-        상태 `"rewritten"` 을 돌려준다(판이 바뀌어 멈추면 `"halted"`) — 호출하는 쪽은 이것만 보고 8 로 끝낸다.
+        상태 `"rewritten"` 을 돌려준다 — 호출하는 쪽은 이것만 보고 8 로 끝낸다.
         시간 초과와 겹쳐도 이력 재작성이 우선한다(증거가 사라지면 안 된다).
         """
+        if _plugin_dir and not os.path.isdir(_plugin_dir):
+            pin_fallback(stage_tag, _plugin_dir, "폴더 없음")
         now = plugin_version(a.config_dir) if _plugin_ver else None
-        if now and now != _plugin_ver:
-            # 실행 도중 플러그인이 갱신됐다 — 앞 단계와 뒤 단계가 다른 정의로 돌지 않게 세션을 띄우기 전에 멈춘다.
-            detail = ("플러그인 판이 바뀌었다: %s → %s — --resume 으로 이어받으면 새 판으로 돈다"
-                      % (_plugin_ver, now))
-            print("       ! %s" % detail)
-            state["stages"][num] = {"status": "failed", "reason": "플러그인 판 바뀜"}
-            state["breaker"] = {"kind": "dod-miss", "stage": stage_tag, "detail": detail}
-            fire(state, "BREAK", {}, events)
-            stoploop.append_event(events, {"stage": stage_tag, "breaker": "plugin-changed",
+        if now and now != _plugin_ver and (_plugin_ver, now) not in changed_seen:
+            # 실행 도중 플러그인이 갱신됐다 — 멈추지 않는다. 세션은 고정 폴더의 정의로 돌고, 바뀐 사실만 남긴다.
+            changed_seen.add((_plugin_ver, now))
+            print("       · 플러그인 판이 바뀌었다: %s → %s — 이 실행은 시작 판으로 끝까지 돈다" % (_plugin_ver, now))
+            stoploop.append_event(events, {"stage": stage_tag, "notice": "plugin-changed",
                                            "from": _plugin_ver, "to": now})
-            save_state(statef, state)
-            print("\n중단 — 플러그인 판이 바뀌었다. 이어받으면 새 판으로 돈다.")
-            return "halted", "", None, 0.0
         before = subprocess.run(["git", "rev-parse", "HEAD"], cwd=cwd,
                                 capture_output=True, text=True).stdout.strip()
         LAST_RESULT.clear()           # 가짜 call 은 안 채운다 — 앞 세션 값을 물려받지 않게

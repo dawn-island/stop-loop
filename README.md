@@ -20,8 +20,9 @@ claude plugin marketplace add dawn-island/stop-loop
 claude plugin install stop-loop@stop-loop
 ```
 
-판을 올릴 때는 `claude plugin update stop-loop@stop-loop`. 실행 도중 판이 바뀌면 러너가 다음 단계 앞에서 멈추고,
-`--resume` 으로 이어받는다.
+판을 올릴 때는 `claude plugin update stop-loop@stop-loop`. 러너는 실행을 시작한 판 폴더를 모든 단계 세션에 고정해 넘기므로,
+실행 도중 판이 바뀌어도 멈추지 않고 시작한 판으로 끝까지 돈다(바뀐 사실은 `events.jsonl` 에 남는다).
+`--resume` 은 기록된 시작 판 폴더로 잇고, 그 폴더가 없을 때만 지금 판으로 잇는다.
 
 ## 프로젝트에 세우기
 
