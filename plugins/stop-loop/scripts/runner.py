@@ -869,6 +869,79 @@ def _answered_decisions(wd, labels=("[답함]", "[사람 결정]", "[사람 몫]
     return keys
 
 
+def _answer_rows(wd):
+    """`07-answers.md` 「## 답」 표의 `[(정할 것, 라벨)]` — 표 차례대로."""
+    try:
+        with open(os.path.join(wd, "07-answers.md"), encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return []
+    sec = re.search(r"^## 답[ \t]*$(.*?)(?=^#{1,2} |\Z)", text, re.S | re.M)
+    rows = []
+    for line in (sec.group(1).splitlines() if sec else []):
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if line.strip().startswith("|") and len(cells) >= 2:
+            rows.append((cells[0], cells[1]))
+    return rows
+
+
+def _decision_obj(item):
+    """정할 것 항목 원문 → `{"정할 것": 문장, "안": [안…]}`. 빈칸 줄은 하나로 줄인다(머리말 한 줄에 싣는다)."""
+    text = " ".join(item.split())
+    key, _, opts = text.partition(" — 고를 수 있는 것:")
+    return {"정할 것": key.strip(), "안": [o.strip() for o in opts.split(" · ") if o.strip()] if opts else []}
+
+
+def human_decisions(wd):
+    """사람이 답할 정할 것 `[{"정할 것", "안"}]` — 07 「## 정할 것」 가운데 PM 이 `[답함]` 으로 답하지 않은 것,
+    그리고 PM 답 표에서 `[사람 결정]`·`[사람 몫]` 으로 올린 것(그 문장이 지금 07 에 없으면 앞 판 `07-changes.md.r*` 에서 안을 찾는다).
+    같은 문장은 한 번만, 먼저 나온 차례대로. 두 파일이 없으면 빈 목록."""
+    answered = {k for k, lab in _answer_rows(wd) if lab == "[답함]"}
+    out, seen = [], set()
+    for item in decision_items(wd):
+        obj = _decision_obj(item)
+        if obj["정할 것"] not in answered and obj["정할 것"] not in seen:
+            seen.add(obj["정할 것"])
+            out.append(obj)
+    olds = None
+    for key, lab in _answer_rows(wd):
+        if lab not in ("[사람 결정]", "[사람 몫]") or key in seen:
+            continue
+        if olds is None:
+            try:
+                olds = sorted((n for n in os.listdir(wd) if re.fullmatch(r"07-changes\.md\.r\d+", n)),
+                              key=lambda n: -int(n.rsplit(".r", 1)[1]))
+            except OSError:
+                olds = []
+        found = None
+        for n in olds:
+            found = next((_decision_obj(i) for i in _section_items(wd, n, "정할 것", "구현하다 고를")
+                          if _decision_obj(i)["정할 것"] == key), None)
+            if found:
+                break
+        seen.add(key)
+        out.append(found or {"정할 것": key, "안": []})
+    return out
+
+
+def _decisions_line(decisions):
+    """카드 머리말 `정할것:` 한 줄 — JSON 배열. 보드의 머리말 읽기가 「두 칸 이상 빈칸 + #」 뒤를 자르므로 글의 빈칸 줄은 하나로 줄인다."""
+    one = lambda t: " ".join(str(t).split())      # noqa: E731
+    return json.dumps([{"정할 것": one(x["정할 것"]), "안": [one(o) for o in x.get("안") or []]} for x in decisions],
+                      ensure_ascii=False)
+
+
+HUMAN_ANSWER_NOTE = ("\n\n[사람 답] 07-answers.md 「## 사람의 답」의 줄은 사람이 보드에서 직접 고른 답이다. "
+                     "그 정할 것이 「## 사람 결정」이나 「## 답」 표에 `[사람 결정]` 으로 남아 있어도 이제 사람이 정한 것이다 — "
+                     "그 답대로 구현하고 같은 정할 것을 「## 정할 것」에 다시 적지 않는다. "
+                     "뒤에 붙는 `[PM 답]` 줄의 『사람 결정으로 올라간 결정은 구현하지 않는다』는 이 정할 것에는 해당하지 않는다.")
+
+
+def human_answer_note(wd):
+    """07 위임문에 붙일 `[사람 답]` 지시 줄. 「## 사람의 답」에 항목이 없으면 빈 글."""
+    return HUMAN_ANSWER_NOTE if _section_items(wd, "07-answers.md", "사람의 답", "\0") else ""
+
+
 def human_items(wd):
     """실행 디렉터리의 03a 「## 사람 결정」·07 「## 참고 사항」·07a 항목을 `[(출처, 원문)]` 로 — 이 순서.
     옛 이름 절(「## 사람 몫」·「## 사람이 볼 것」)도 같은 출처로 읽는다(`OLD_SECTION`) — 새 절 먼저.
@@ -956,7 +1029,7 @@ def backlog_set(**fields):
 
 # ── 카드 머리말 원격 커밋 (ISSUE-sc02-e2-card-push-2026-11-20) ──────────────
 # 기계가 고치는 머리말 열쇠. 카드 본문과 사람이 쓰는 열쇠(기기·시나리오 …)는 올리지 않는다.
-CARD_KEYS = ("상태", "단계", "시작", "누적", "멈춘이유", "멈춘종류", "차례", "갱신", "재인계", "돈기계")
+CARD_KEYS = ("상태", "단계", "시작", "누적", "멈춘이유", "멈춘종류", "차례", "갱신", "재인계", "돈기계", "정할것", "요청결과")
 # 저장소 밖 결과 폴더. 가져오기만 해서는 꺼져 있다 — 맨 아래 진입점 블록이 명령으로 띄울 때만 켠다.
 CARD_PUSH_DIR = None
 CARD_GIT_TIMEOUT = 20          # 원격 명령 한 번의 상한(초) — 머리말 쓰기가 실행을 오래 붙잡지 않게
@@ -1442,6 +1515,8 @@ def fire(state, event, guards, events_path, turn=None):
         now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
         if nxt == "running" and prev != "running":
             extra["시작"] = now
+            if backlog_get("정할것"):       # 이어받아 다시 시작하면 사람이 답할 정할 것은 없다
+                extra["정할것"] = ""
         elif prev == "running" and nxt != "running":
             try:
                 total = int(backlog_get("누적") or 0)
@@ -1452,6 +1527,10 @@ def fire(state, event, guards, events_path, turn=None):
             b = state.get("breaker") or {}
             extra["멈춘이유"] = b.get("detail") or b.get("kind") or "멈춤"
             extra["멈춘종류"] = stop_kind(b)
+            if extra["멈춘종류"] == "사람 결정" and b.get("정할것"):
+                extra["정할것"] = _decisions_line(b["정할것"])
+            elif backlog_get("정할것"):
+                extra["정할것"] = ""
             _log_add(state, "stops", {"stage": b.get("stage"), "at": now,
                                       "kind": b.get("kind") or event,
                                       "reason": extra["멈춘이유"]})
@@ -1460,6 +1539,8 @@ def fire(state, event, guards, events_path, turn=None):
             extra["멈춘이유"] = ""
             if backlog_get("멈춘종류"):     # 없던 카드에 빈 줄을 새로 만들지 않는다
                 extra["멈춘종류"] = ""
+            if backlog_get("정할것"):
+                extra["정할것"] = ""
         # `차례: 러너` = 멈춤·검토지만 사람이 움직일 차례가 아니다(보드가 사람 차례에서 뺀다).
         # 요청한 전이(turn)만 쓰고, 그 밖의 전이는 값이 있을 때만 비운다 — 상태와 같은 쓰기 한 번.
         if turn is not None:
@@ -4240,6 +4321,8 @@ def main(argv):
                           % full_suite_line("07 게이트", g["commit"], g["secs"]))
         prompt = delegate_text(num, name, outp, issue, wd, extra=gate_extra,
                                models=models)
+        if num == "07":
+            prompt += human_answer_note(wd)     # 사람이 보드에서 고른 답이 있으면 「구현할 답」이라는 뜻을 위임문이 말한다
 
         if a.dry_run:
             print("  %-4s %-14s %-22s %-8s → %s"
@@ -4522,7 +4605,8 @@ def main(argv):
                 if pending and human_left:     # 사람 결정이 남았는데 07 이 또 새 정할 것을 적었다 — 헛돎
                     why = "사람 결정이 남은 뒤 07 이 다시 정할 것을 적었다"
                     state["stages"]["07"] = {"status": "failed", "reason": "사람 결정 뒤 되묻기"}
-                    state["breaker"] = {"kind": "rounds-exhausted", "stage": "07", "detail": why}
+                    state["breaker"] = {"kind": "rounds-exhausted", "stage": "07", "detail": why,
+                                        "정할것": human_decisions(wd)}
                     fire(state, "BREAK", {}, events)
                     save_state(statef, state)
                     print("\n중단 — %s. 사람이 볼 차례다." % why)

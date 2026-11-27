@@ -10,10 +10,11 @@
 첫 화면(`/`)이 보는 목록(`~/.stop-loop/projects.json` 의 `"projects"` 와 `"보기"`)의 모든
 프로젝트를 한 줄씩 보이고, 줄을 누르면 `/p/<이름>/board.html` 에 그 프로젝트 칸반이 열린다.
 
-파일이 진실이다. 보드가 파일을 쓰는 길은 셋뿐이다 — 「카드로 만들기」(개선 거리 화면, 새 아이디어 카드
+파일이 진실이다. 보드가 파일을 쓰는 길은 넷뿐이다 — 「카드로 만들기」(개선 거리 화면, 새 아이디어 카드
 파일 하나를 쓰고 원격 기준 가지에 올린다), 「대기로 올리기」(시나리오에 안 묶인 아이디어 카드의 `상태:` 줄만
 대기로, 확인 창 뒤에 그 파일 하나만 올린다), 「이 카드에 잇기」(개선 거리 화면, 이미 있는 카드 「## 배경」 끝에 출처 줄만
-더하고 그 파일 하나만 올린다). 모두 127.0.0.1 에서 이 기계의 보드 화면이 보낸 요청만 받는다.
+더하고 그 파일 하나만 올린다), 「답 보내고 이어받기」·「이어받기」·「보류로 두기」(내 할 일의 멈춘 카드 — 원격 끝에
+`docs/backlog/_요청/<카드>.json` 요청 파일 하나만 올려, 그 카드를 돌던 기기의 상주 배차가 받는다). 모두 127.0.0.1 에서 이 기계의 보드 화면이 보낸 요청만 받는다.
 상태를 바꾸려면 그 파일의 `상태:` 줄을 고친다(승격은 사람만 한다, `workflows/01-loop-design.md`).
 러너는 실행 중에 같은 줄을 되쓴다.
 
@@ -278,6 +279,15 @@ def list_value(value):
     return [x for x in (p.strip() for p in value.split(",")) if x and x not in ("—", "-")]
 
 
+def _머리말_json(value, kind):
+    """머리말 한 줄의 JSON 값. `kind`(list·dict) 모양이 아니거나 깨졌으면 그 종류의 빈 값."""
+    try:
+        got = json.loads(value) if value else None
+    except ValueError:
+        got = None
+    return got if isinstance(got, kind) else kind()
+
+
 def _카드_만들기(file, title, fm, 마지막줄="", 사람분=None):
     return {"file": file, "title": title,
             "상태": fm.get("상태", "대기"), "크기": fm.get("크기", ""),
@@ -288,6 +298,7 @@ def _카드_만들기(file, title, fm, 마지막줄="", 사람분=None):
             "인수조건": list_value(fm.get("인수조건", "")),
             "완료기준": list_value(fm.get("완료기준", "")), "선행": list_value(fm.get("선행", "")),
             "돈기계": fm.get("돈기계", ""), "기기": fm.get("기기", ""), "기능": list_value(fm.get("기능", "")),
+            "멈춘종류": fm.get("멈춘종류", ""), "정할것": _머리말_json(fm.get("정할것"), list), "요청결과": _머리말_json(fm.get("요청결과"), dict) or None,
             "마지막줄": 마지막줄, "사람분": 사람분}
 
 
@@ -873,16 +884,18 @@ def human_turns(cards, scenarios, project, todo=(), today=None):
     name = os.path.basename(os.path.abspath(project))
     out = []
 
-    def add(종류, 시나리오, 제목, 기다림, 때, 곳, key):
+    def add(종류, 시나리오, 제목, 기다림, 때, 곳, key, **더):
         out.append({"열쇠": "%s:%s" % (종류, key), "종류": 종류, "프로젝트": name, "시나리오": 시나리오,
-                    "제목": 제목, "기다리는 것": 기다림, "생긴 때": 때, "열어 볼 곳": 곳, "알림": None})
+                    "제목": 제목, "기다리는 것": 기다림, "생긴 때": 때, "열어 볼 곳": 곳, "알림": None, **더})
 
     for c in cards:
         if c.get("차례") == "러너":
             continue            # 러너가 움직일 차례(기준 가지를 기다림·자동 병합) — 칸반엔 남고 사람 차례만 아니다
         if c["상태"] == "보류":
             add("멈춤", c["시나리오"], c["title"], c["멈춘이유"] or "까닭을 읽지 못한 멈춤",
-                _생긴때(project, c), "board.html" if c.get("원격만") else c["file"], c["file"])
+                _생긴때(project, c), "board.html" if c.get("원격만") else c["file"], c["file"],
+                정할것=c.get("정할것") or [], 돈기계=c.get("돈기계", ""), 멈춘종류=c.get("멈춘종류", ""),
+                요청결과=c.get("요청결과"), 단추=단추_종류(c))
         elif c["상태"] == "검토":
             add("사람이 병합할 PR", c["시나리오"], c["title"], "PR 을 보고 병합한다",
                 _생긴때(project, c), "board.html" if c.get("원격만") else c["file"], c["file"])
@@ -1281,6 +1294,7 @@ THEME = """:root {
   --st-아이디어:var(--gray); --st-대기:var(--blue); --st-진행:var(--blue); --st-검토:var(--blue); --st-보류:var(--ochre); --st-완료:var(--teal);
   --overlay:rgba(0,0,0,.35); --today:#c0392b;
   --ph-분석:#9db5ef; --ph-설계:#5f84e0; --ph-멈춤:#b0b3b8; --lane-head:#f3f3f1;
+  --wt-검토:#d9a38a; --wt-멈춤:#8a8f98; --wt-오류:#b3261e; --wt-일시:#f3d9cc;
   --sans:'Noto Sans KR', system-ui, -apple-system, 'Apple SD Gothic Neo', sans-serif;
   --mono:'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
   --r-panel:12px; --r-card:10px; --r-pill:999px; }
@@ -1292,7 +1306,8 @@ THEME = """:root {
   --ochre:#d1a94a; --ochre-bg:#352d1c; --ochre-ink:#e0c27a;
   --blue-bg:#232b3f; --orange-bg:#3a2a22; --teal-bg:#1f3330; --gray-bg:#2a2926; --orange-line:#6b3f2c; --orange-soft:#2e231d;
   --off:#33312d; --dash:#3a3834;
-  --ph-분석:#5a6f9e; --ph-설계:#6f8fdc; --ph-멈춤:#5c5f64; --lane-head:#25241f; } }
+  --ph-분석:#5a6f9e; --ph-설계:#6f8fdc; --ph-멈춤:#5c5f64; --lane-head:#25241f;
+  --wt-검토:#a9694d; --wt-멈춤:#6b6f76; --wt-오류:#e5736a; --wt-일시:#4a3329; } }
 * { box-sizing: border-box; }
 body.with-side { padding:0; }
 .shell { display:flex; flex-wrap:wrap; min-height:100vh; }
@@ -2597,6 +2612,21 @@ def 러너가_멈춤(c):
     return c["상태"] == "보류" and c.get("단계", "").strip() != ""
 
 
+이어받기_종류 = ("일시적 실패",)        # 「이어받기」 단추를 붙이는 멈춘종류 — 부하·네트워크·시간 넘김은 모두 이 종류로 분류된다(runner.stop_kind)
+
+
+def 단추_종류(c):
+    """멈춘 카드에 붙일 단추 종류 — 「돌던 기기를 모름」·「답하기」·「이어받기」·「보류로 두기」, 러너가 멈춘 보류가 아니면 None.
+    화면 그리기와 `POST card-request` 검사가 이 한 판정을 쓴다."""
+    if not 러너가_멈춤(c):
+        return None
+    if not (c.get("돈기계") or "").strip():
+        return "돌던 기기를 모름"
+    if c.get("정할것"):
+        return "답하기"
+    return "이어받기" if c.get("멈춘종류") in 이어받기_종류 else "보류로 두기"
+
+
 def _칸_고름(rows):
     """숫자 칸과 카드 목록이 함께 쓰는 고르기 — `{진행: [(줄, 카드)], 대기: [...], 멈춤: [(줄, 카드, 갈래)], 보류: [(줄, 카드)]}`.
     멈춤은 카드 한 장이 한 번만 나온다(러너가 멈춤 → 경보 → 예상 넘김 가운데 앞선 갈래). 일부러 미룬 보류는 멈춤이 아니라 보류 열쇠에 담는다.
@@ -3188,6 +3218,43 @@ def render_cards(보기, 묶음들, 덧=()):
     return 틀 % {"name": esc(_보기_제목.get(보기, 보기)), "body": "\n".join(parts)}
 
 
+def _요청_칸(t):
+    """내 할 일 「멈춤」 줄 아래 요청 칸 — 단추 종류대로 폼. 단추가 없는 항목은 빈 글. 폼은 모두 확인 창을 거친다."""
+    kind = t.get("단추")
+    if t.get("종류") != "멈춤" or not kind:
+        return ""
+    esc = html.escape
+    카드 = t["열쇠"].partition(":")[2]
+    action = "/p/%s/card-request" % urllib.parse.quote(t["프로젝트"], safe="")
+    조각 = []
+    if t.get("요청결과"):
+        x = t["요청결과"]
+        조각.append('<div class="tm">마지막 요청: %s — %s(%s)</div>' % (esc(str(x.get("종류", ""))), esc(str(x.get("결과", ""))), esc(str(x.get("까닭") or ""))))
+    if kind == "돌던 기기를 모름":
+        조각.append('<span class="badge b-gray">돌던 기기를 모름</span>')
+        return '<div class="treq" style="flex-basis:100%%">%s</div>' % "".join(조각)
+
+    def form(종류, 단추, 안, confirm):
+        return ('<form method="post" action="%s" onsubmit="return confirm(%s)"><input type="hidden" name="card" value="%s">'
+                '<input type="hidden" name="kind" value="%s"><input type="hidden" name="confirm" value="1">%s'
+                '<button type="submit">%s</button></form>' % (esc(action, quote=True), esc(json.dumps(confirm, ensure_ascii=False), quote=True),
+                                                              esc(카드, quote=True), esc(종류, quote=True), 안, esc(단추)))
+    if kind == "답하기":
+        칸 = ['<input type="hidden" name="n" value="%d">' % len(t["정할것"])]
+        for i, x in enumerate(t["정할것"]):
+            고름 = "".join('<label><input type="radio" name="pick%d" value="%s"> %s</label> ' % (i, esc(a, quote=True), esc(a)) for a in x.get("안") or [])
+            칸.append('<div class="tq"><input type="hidden" name="q%d" value="%s"><div class="tt">%s</div>%s'
+                      '<label><input type="radio" name="pick%d" value="직접 쓰기"%s> 직접 쓰기</label> <input type="text" name="own%d" aria-label="직접 쓴 답">'
+                      '<input type="text" name="note%d" placeholder="덧붙일 말 (선택)" aria-label="덧붙일 말 (선택)"></div>'
+                      % (i, esc(x["정할 것"], quote=True), esc(x["정할 것"]), 고름, i, "" if x.get("안") else " checked", i, i))
+        조각.append(form("답", "답 보내고 이어받기", "".join(칸), "고른 답을 보내고 %s 배차가 이어받게 할까요?" % (t.get("돈기계") or "")))
+    else:
+        if kind == "이어받기":
+            조각.append(form("이어받기", "이어받기", "", "이 카드를 %s 배차가 이어받게 할까요?" % (t.get("돈기계") or "")))
+        조각.append(form("보류로 두기", "보류로 두기", "", "이 카드를 일부러 미룬 보류로 둘까요?"))
+    return '<div class="treq" style="flex-basis:100%%">%s</div>' % "".join(조각)
+
+
 def render_home(rows, turns, 오류, tab="", 처리=(), today=None, machines="", now=None, 병합=None, 기계수=None, feed=""):
     """첫 화면 — 숫자 네 칸, 프로젝트 진행 표, 내 차례(세 탭)와 최근 활동 나란히, 기계 줄 순서. `turns` 는 `my_turns` 결과.
     `tab` 이 old·done 이 아니면 「지금」. `machines`·`feed` 는 서버가 그린 조각."""
@@ -3202,7 +3269,8 @@ def render_home(rows, turns, 오류, tab="", 처리=(), today=None, machines="",
         단추 = "완료 보고서 보기" if t["종류"] == "완료 선언" else "보드 보기" if t["종류"] == "못 읽음" else "카드 보기"
         메타 = " · ".join(x for x in (t["프로젝트"], t["기다리는 것"], t["생긴 때"], "알림 못 띄움" if t.get("알림") is False else "") if x)
         return ('<li class="turn"><span class="kind k-%s">%s</span><div class="tbody"><div class="tt">%s</div><div class="tm">%s</div></div>'
-                '<a class="tact" href="%s">%s</a></li>' % (색, esc(t["종류"]), esc(t["제목"]), esc(메타), esc(t["열어 볼 곳"], quote=True), 단추))
+                '<a class="tact" href="%s">%s</a>%s</li>' % (색, esc(t["종류"]), esc(t["제목"]), esc(메타), esc(t["열어 볼 곳"], quote=True), 단추,
+                                                           _요청_칸(t)))
 
     def lst(items, 없음):
         return '<ul class="tlist">%s</ul>' % "".join(li(t) for t in items) if items else '<p class="more">%s</p>' % 없음
@@ -5956,22 +6024,41 @@ def read_timeline_project(project, 끝=None, now=None):
             elif run:
                 구간.append(_구간_만들기(card, run, c["때"], False, 기계, n_resumed, n_hand, resumed, steps.get(card, [])))
                 run = None
-            if state in ("보류", "검토") or c["fm"].get("멈춘이유", "").strip():       # 사람 기다림 — 풀리는 머리말 커밋까지
-                wait = wait or {"카드": card + ".md", "제목": c["제목글"], "기계": 아는기계 or "기기 모름", "시작": c["때"]}
-            elif wait:
+            종류 = _기다림_종류(c["fm"])
+            if wait and wait["종류"] != 종류:               # 기다림이 풀렸거나 종류가 바뀌면 이 머리말 커밋에서 구간을 닫는다
                 기다림.append({**wait, "끝": c["때"], "진행 중": False})
                 wait = None
+            if 종류 and not wait:
+                wait = {"카드": card + ".md", "제목": c["제목글"], "기계": 아는기계 or "기기 모름", "시작": c["때"], "종류": 종류}
             if state == "완료" and prev != "완료":
                 완료때[card + ".md"] = c["때"]
             prev = state
         if run:
             구간.append(_구간_만들기(card, run, now, True, 기계, n_resumed, n_hand, resumed, steps.get(card, [])))
-        if wait:
+        if wait and now_fm.get("상태") == "완료":          # 지금 완료인데 기다림이 열린 채 — 닫는 커밋이 꼬리표가 없어 못 읽은 것. 완료 때, 없으면 마지막 단계 커밋으로 닫는다
+            끝점 = 완료때.get(card + ".md") or max((c["때"] for c in steps.get(card, [])), default=None)
+            if 끝점 and wait["시작"] < min(끝점, now):
+                기다림.append({**wait, "끝": min(끝점, now), "진행 중": False})
+        elif wait:
             기다림.append({**wait, "끝": now, "진행 중": True})
     작은 = [(c["때"], c["제목"]) for c in commits if c["제목"].startswith("작은 수정:")]
     병합 = [(c["때"], _병합_누가(c["제목"])[0]) for c in commits if _병합_누가(c["제목"])]
     return {"구간": 구간, "작은 수정": 작은, "완료 때": 완료때, "기다림": 기다림, "병합": 병합,
             "이어받기 때": [c["때"] for card in sorted(steps) for c in _이어받기_묶음_첫(steps[card])]}
+
+
+# 멈춘 종류 이름은 `bin/runner.py` 의 `STOP_KIND_RULES`·`stop_kind` 종류 이름의 사본이다 — 보드는 러너를 가져오지 못해 바꿀 때 두 곳을 함께 고친다.
+_기다림_이름 = {"검토": "병합 기다림", "보류": "보류", "멈춤": "멈춤(사람 결정·기타)", "오류": "멈춤(오류)", "일시": "멈춤(일시적 실패)"}
+_오류_멈춘종류 = ("범위 밖 파일 변경", "산출물 형식 오류", "기준 가지 실패")
+_일시_멈춘종류 = ("일시적 실패",)
+
+
+def _기다림_종류(fm):
+    """머리말 하나의 기다림 종류 — 검토·보류·멈춤·오류·일시, 기다림이 아니면 "". `멈춘이유` 가 차 있으면 상태보다 이긴다."""
+    if (fm.get("멈춘이유") or "").strip():
+        종류 = (fm.get("멈춘종류") or "").strip()
+        return "오류" if 종류 in _오류_멈춘종류 else "일시" if 종류 in _일시_멈춘종류 else "멈춤"
+    return {"보류": "보류", "검토": "검토"}.get(fm.get("상태", "대기"), "")
 
 
 def _이어받기_묶음_첫(단계들):
@@ -6362,6 +6449,11 @@ a.tl-label { flex:0 0 var(--lab); padding:8px 16px; font-size:12px; color:var(--
 .tl-ph-검증, .tl-ph-인계 { background:var(--teal); }
 .tl-ph-기다림 { background:var(--orange); }
 .tl-ph-멈춤 { background:var(--ph-멈춤); }
+.tl-wt-검토 { background:var(--wt-검토); }
+.tl-wt-보류 { background:var(--ochre); }
+.tl-wt-멈춤 { background:var(--wt-멈춤); }
+.tl-wt-오류 { background:repeating-linear-gradient(45deg, var(--wt-오류) 0 4px, var(--panel) 4px 7px); }
+.tl-wt-일시 { background:var(--wt-일시); border:1px dashed var(--wt-오류); }
 .tl-cut { position:absolute; top:0; bottom:0; width:2px; background:var(--fg); }
 .tl-today { position:absolute; top:0; bottom:0; width:2px; background:var(--orange); pointer-events:none; z-index:2; }
 .tl-lgd { display:flex; flex-wrap:wrap; gap:16px; align-items:center; font-size:12px; color:var(--ink2); margin:0 0 12px; }
@@ -6526,9 +6618,9 @@ def render_timeline(data, 시작, 끝, now, 까닭, 고른="", 카드="", 프로
     기다림들 = [x for x in data.get("기다림", []) if 기간안(x)]
     칸 = [("기간 안 병합", "%d장" % sum(1 for t, _, p in data["병합"] if 시작 <= t < 끝 and ok(p)) if "병합" in data else "—"),
          ("동시에 돈 최대", "%d장 (%s)" % (최대, "·".join(_기기_글(m) for m in 기계들)) if 최대 else "—"),
-         ("사람 기다림 합", _시간_글(int(sum((min(x["끝"], 끝) - max(x["시작"], 시작)).total_seconds() for x in 기다림들))) if "기다림" in data else "—"),
+         ("카드별 기다림 합", _시간_글(int(sum((min(x["끝"], 끝) - max(x["시작"], 시작)).total_seconds() for x in 기다림들))) if "기다림" in data else "—"),
          ("이어받기", "%d번" % sum(1 for t, p in data["이어받기 때"] if 시작 <= t < 끝 and ok(p)) if "이어받기 때" in data else "—")]
-    설명 = {"이어받기": "이어받아 다시 시작한 실행(카드·실행 단위)"}
+    설명 = {"이어받기": "이어받아 다시 시작한 실행(카드·실행 단위)", "카드별 기다림 합": "카드마다 기다린 시간의 합 — 겹친 시간도 카드마다 센다"}
     parts.append('<section class="tiles tl-sum" aria-label="요약">%s</section>' % "".join(
         '<div class="tile"><span class="lb">%s</span><span class="v">%s</span>%s</div>' % (
             esc(a), esc(v), '<span class="tl-nt">%s</span>' % esc(설명[a]) if a in 설명 else "") for a, v in 칸))
@@ -6579,8 +6671,10 @@ def render_timeline(data, 시작, 끝, now, 까닭, 고른="", 카드="", 프로
                     esc("%s · %s%s" % (프, x["제목"], " [" + "] [".join(notes) + "]" if notes else ""), quote=True), segs, marks))
             for x in c["기다림"]:
                 s, e = max(x["시작"], 시작), min(x["끝"], 끝)
-                bars += '<span class="tl-seg tl-ph-기다림" style="left:%.2f%%;width:%.2f%%" title="%s"></span>' % (
-                    pct(s), max(pct(e) - pct(s), 0.3), esc("사람 기다림 · %s" % _시간_글(int((e - s).total_seconds())), quote=True))
+                종류 = x.get("종류")                              # 종류 키가 없는 옛 자료는 한 가지 모양
+                bars += '<span class="tl-seg tl-ph-기다림%s" style="left:%.2f%%;width:%.2f%%" title="%s"></span>' % (
+                    " tl-wt-" + 종류 if 종류 else "", pct(s), max(pct(e) - pct(s), 0.3),
+                    esc("%s · %s" % (_기다림_이름.get(종류, "기다림"), _시간_글(int((e - s).total_seconds()))), quote=True))
             전체 = "%s · %s" % (프, c["제목"])
             lines.append('<div class="tl-line"><a class="tl-label" href="%s" title="%s">%s</a><div class="tl-track">%s</div></div>'
                          % (esc(주소, quote=True), esc(전체, quote=True), esc(전체), bars))
@@ -6595,8 +6689,9 @@ def render_timeline(data, 시작, 끝, now, 까닭, 고른="", 카드="", 프로
     lanes = '<section class="tl-lanes" aria-label="기기별 레인"><div class="tl-in">%s</div></section>' % "".join(inner)
 
     legend = '<div class="tl-lgd">%s<span class="tl-hint">줄을 누르면 그 카드의 선행 화살표만 그린다 · 기기 레인은 접을 수 있다</span></div>' % "".join(
-        '<span class="tl-lg"><i class="tl-ph-%s"></i>%s</span>' % kv for kv in (
-            ("분석", "분석"), ("설계", "설계"), ("구현", "구현"), ("검증", "검증·인계"), ("기다림", "사람 기다림·오류"), ("멈춤", "멈춤(세션 끝남)")))
+        '<span class="tl-lg"><i class="%s"></i>%s</span>' % kv for kv in (
+            [("tl-ph-분석", "분석"), ("tl-ph-설계", "설계"), ("tl-ph-구현", "구현"), ("tl-ph-검증", "검증·인계")]
+            + [("tl-ph-기다림 tl-wt-" + k, _기다림_이름[k]) for k in _기다림_이름] + [("tl-ph-멈춤", "멈춤(세션 끝남)")]))
     graph = [lanes, legend]
     if 선행:
         graph.append('<p class="tl-legend">실선 결과물 선행 · 점선 겹침 선행</p>')
@@ -7464,10 +7559,11 @@ def _올린_뒤_그림(project, r):
             pass
 
 
-def 카드_올리기(project, 파일이름, 글="", 승격=False, 잇기=None):
+def 카드_올리기(project, 파일이름, 글="", 승격=False, 잇기=None, 요청=None):
     """새 카드 파일 하나만 원격 기준 가지 끝 위에 커밋해 올린다. {"결과": 올림 | 올리지 못함 | 원격 없음, "까닭", "커밋"}.
     `승격=True` 면 새 파일이 아니라 원격 끝의 그 카드(아이디어일 때만)에서 `상태:` 줄만 대기로 바꿔 올린다. `잇기` 가 줄 목록이면 원격 끝의 그 카드 「## 배경」 끝에 그 줄들을 더해 올린다
-    (카드가 없으면 「원격에 없음」, 배경 절이 없으면 「올리지 못함」). 결과에 「이미 아이디어 아님」(까닭=원격 끝의 상태)·
+    (카드가 없으면 「원격에 없음」, 배경 절이 없으면 「올리지 못함」). `요청` 이 `(종류, 글)` 이면 카드가 아니라 요청 파일
+    `docs/backlog/_요청/<카드>.json` 하나를 그 글로 새로 쓰거나 덮어쓴다(원격 끝의 다른 파일은 그대로). 결과에 「이미 아이디어 아님」(까닭=원격 끝의 상태)·
     「원격에 없음」 이 더 있다. 예외를 내지 않고, 이 기계의 카드 파일은 건드리지 않는다. 밀리면 다시 받아 최대 3번(원격 이력은 다시 쓰지 않는다)."""
     def 끝(결과, 까닭="", 커밋=""):
         return {"결과": 결과, "까닭": 까닭, "커밋": 커밋}
@@ -7486,9 +7582,9 @@ def 카드_올리기(project, 파일이름, 글="", 승격=False, 잇기=None):
             if not token:
                 return 끝("올리지 못함", "GitHub 계정 %s 의 토큰을 얻지 못함" % account.strip())
             env["GH_TOKEN"] = token
-        rel = "docs/backlog/" + 파일이름
         카드 = 파일이름.removesuffix(".md")
-        제목 = ("작업목록: %s 출처 이음 — 보드의 이 카드에 잇기" if 잇기 is not None else
+        rel = "docs/backlog/_요청/%s.json" % 카드 if 요청 is not None else "docs/backlog/" + 파일이름
+        제목 = ("작업목록: %s 요청 — 보드의 " + 요청[0] if 요청 is not None else "작업목록: %s 출처 이음 — 보드의 이 카드에 잇기" if 잇기 is not None else
               "작업목록: %s 대기로 올림 — 보드의 대기로 올리기" if 승격 else "작업목록: %s 새 카드 — 보드의 카드로 만들기")
         msg = (제목 + "\n\nLoop-Card: %s\nLoop-Card-Host: %s") % (카드, 카드, os.uname().nodename)
         까닭 = "원격이 계속 움직여 올리지 못함"
@@ -7512,7 +7608,9 @@ def 카드_올리기(project, 파일이름, 글="", 승격=False, 잇기=None):
             if r.returncode:
                 return 끝("올리지 못함", _끝줄(r))
             내용 = None
-            if 잇기 is not None:
+            if 요청 is not None:
+                내용 = 요청[1]
+            elif 잇기 is not None:
                 if not r.stdout.strip():
                     return 끝("원격에 없음", "원격 끝에 그 카드가 없다")
                 r = _원격_git(project, "show", "%s:%s" % (tip, rel))
@@ -7704,13 +7802,72 @@ def _승격_처리(서버, item, items, form):
         서버.send_error(500, "Internal Error", "대기로 올리다 실패 — %s" % (str(e) or type(e).__name__))
 
 
+def _요청_처리(서버, item, items, form):
+    """`POST /p/<이름>/card-request` — 확인 값·카드 이름·원격 거울의 그 카드 상태와 단추 종류·(답이면) 정할 것 일치와 고른 안을 검사 →
+    원격 끝 위에 요청 파일 하나만 올리기 → 결과 줄. 이 기기 파일은 쓰지 않는다. 어긋나면 400 과 까닭 줄이고 아무것도 올리지 않는다."""
+    def g(k):
+        return (form.get(k) or [""])[0]
+
+    def 보이기(줄, 상태=200):
+        본문 = '<p>%s</p><p><a href="/">← %s</a></p>' % (html.escape(줄), html.escape(화면이름["home"]))
+        서버._그리기(FILE_TEMPLATE % {"name": "카드 요청", "body": 본문}, 상태)
+    try:
+        파일, 종류 = g("card"), g("kind")
+        if g("confirm") != "1" or not re.fullmatch(r"[^/\\\0]+\.md", 파일) or 파일.startswith(".") or 종류 not in ("답", "이어받기", "보류로 두기"):
+            보이기("확인한 요청이 아니거나 카드 이름·종류가 이상하다 — 올리지 않았다", 400)
+            return
+        그림 = REMOTE.get(os.path.abspath(item["path"])) or {}
+        rem = (그림.get("카드") or {}).get(파일)
+        if not rem or rem.get("머리말") is None:
+            보이기("원격 거울에 그 카드가 없다 — 화면을 다시 열라", 400)
+            return
+        c = _카드_만들기(파일, rem["title"], rem["머리말"])
+        단추 = 단추_종류(c)
+        허락 = {"답": ("답하기",), "이어받기": ("이어받기",), "보류로 두기": ("답하기", "이어받기", "보류로 두기")}[종류]
+        if 단추 not in 허락:
+            보이기("이 카드에는 그 단추가 없다 — 지금 단추: %s — 화면을 다시 열라" % (단추 or "없음"), 400)
+            return
+        답 = None
+        if 종류 == "답":
+            정할 = c["정할것"]
+            if g("n") != str(len(정할)):
+                보이기("정할 것이 바뀌었다 — 화면을 다시 열라", 400)
+                return
+            답 = []
+            for i, x in enumerate(정할):
+                문장 = x.get("정할 것", "")
+                if " ".join(g("q%d" % i).split()) != 문장:
+                    보이기("정할 것이 바뀌었다 — 화면을 다시 열라", 400)
+                    return
+                pick = g("pick%d" % i)
+                고른 = pick if pick in (x.get("안") or []) else (" ".join(g("own%d" % i).split()) if pick == "직접 쓰기" else "")
+                if not 고른:
+                    보이기("고른 안이나 직접 쓴 글이 없다 — %s" % 문장, 400)
+                    return
+                답.append({"정할 것": 문장, "고른 것": 고른, "덧붙인 말": " ".join(g("note%d" % i).split())})
+        번호 = "%s-%s" % (dt.datetime.now().strftime("%Y%m%dT%H%M%S"), os.urandom(3).hex())
+        body = {"카드": 파일, "종류": 종류, "번호": 번호, "때": dt.datetime.now().isoformat(timespec="seconds"), "보낸곳": os.uname().nodename}
+        if 답 is not None:
+            body["답"] = 답
+        r = 카드_올리기(item["path"], 파일, 요청=(종류, json.dumps(body, ensure_ascii=False, indent=1) + "\n"))
+        _올린_뒤_그림(item["path"], r)
+        if r["결과"] == "올림":
+            보이기("올림(커밋 %s) · %s 배차가 다음 바퀴에 받는다 — %s %s" % (r["커밋"][:7], c["돈기계"], 파일, 종류))
+        elif r["결과"] == "원격 없음":
+            보이기("원격 없음 — 요청을 올리지 않았다")
+        else:
+            보이기("올리지 못함 — %s" % r["까닭"])
+    except Exception as e:                              # noqa: BLE001
+        서버.send_error(500, "Internal Error", "요청을 올리다 실패 — %s" % (str(e) or type(e).__name__))
+
+
 _쓰기_잠금 = threading.Lock()
-쓰기_길 = {"make-card": _카드만들기_처리, "promote": _승격_처리, "link-card": _잇기_처리}      # 보드가 파일을 바꾸는 길의 유일한 목록
+쓰기_길 = {"make-card": _카드만들기_처리, "promote": _승격_처리, "link-card": _잇기_처리, "card-request": _요청_처리}      # 보드가 파일을 바꾸는 길의 유일한 목록
 
 
 class 보드서버(작업파일서버):
     """`/` 첫 화면, `/p/<이름>/…` 그 프로젝트 보드와 카드 화면. 요청마다 그 자리에서 그린다. 파일을 쓰는 길은 「카드로 만들기」
-    (`POST /p/<이름>/make-card`)·「대기로 올리기」(`POST /p/<이름>/promote`)·「이 카드에 잇기」(`POST /p/<이름>/link-card`) 셋이고, 이 기계(127.0.0.1)의 보드 화면이 보낸 요청만 받는다."""
+    (`POST /p/<이름>/make-card`)·「대기로 올리기」(`POST /p/<이름>/promote`)·「이 카드에 잇기」(`POST /p/<이름>/link-card`)·내 할 일의 「답 보내고 이어받기」·「이어받기」·「보류로 두기」(`POST /p/<이름>/card-request`) 넷이고, 이 기계(127.0.0.1)의 보드 화면이 보낸 요청만 받는다."""
     extra = None
 
     def end_headers(self):

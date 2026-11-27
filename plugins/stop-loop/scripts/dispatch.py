@@ -19,6 +19,7 @@ import json
 import os
 import plistlib
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -83,6 +84,43 @@ def this_machine():
     except (OSError, ValueError, AttributeError):
         return ""
     return v.strip() if isinstance(v, str) else ""
+
+
+def is_my_card(run):
+    """카드 `돈기계` 가 이 기기의 카드인가 — 이 기기 이름(`"이 기계"`)이거나 이 기기 호스트 이름과 같을 때. 빈 값은 아니다(받을 기기를 모른다)."""
+    run = (run or "").strip()
+    return bool(run) and (run == this_machine() or run == socket.gethostname())
+
+
+HUMAN_ANSWERS = "사람의 답"
+
+
+def append_human_answers(wd, number, answers):
+    """실행 폴더 `07-answers.md` 「## 사람의 답」 절 끝에 정할 것마다 답 한 줄을 덧붙인다 — 절이나 파일이 없으면 파일 끝에 절을 만든다.
+    「## 답」 표와 「## 사람 결정」 절은 건드리지 않는다. 같은 요청 번호·정할 것의 줄이 이미 있으면 덧붙이지 않는다. 못 쓰면 OSError."""
+    path = os.path.join(wd, "07-answers.md")
+    try:
+        with open(path, encoding="utf-8", newline="") as f:
+            text = f.read()
+    except FileNotFoundError:
+        text = ""
+    sec = re.search(r"^## %s[ \t]*$(.*?)(?=^#{1,2} |\Z)" % HUMAN_ANSWERS, text, re.S | re.M)
+    lines = []
+    for a in answers:
+        head = "- [사람 답 %s] %s — " % (number, a["정할 것"])
+        if sec and head in sec.group(1):
+            continue
+        lines.append("%s고른 것: %s — 덧붙인 말: %s\n" % (head, a["고른 것"], a.get("덧붙인 말") or "없음"))
+    if not lines:
+        return
+    if sec:
+        end = sec.end(1)
+        body = text[:end].rstrip("\n") + "\n" + "".join(lines) + ("\n" if text[end:] else "")
+        text = body + text[end:].lstrip("\n") if text[end:].strip() else body
+    else:
+        text = (text.rstrip("\n") + "\n\n" if text.strip() else "") + "## %s\n\n" % HUMAN_ANSWERS + "".join(lines)
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
 
 
 def max_parallel():
@@ -717,6 +755,7 @@ class _Resident:
         why = sync_remote(path)
         if why:
             self.skipped[name] = why
+        self.requests(name, path)
         backlog.tidy(path, 실행=True)
         for line in promote(path, name):
             self.cur_shown.add(line)
@@ -724,6 +763,81 @@ class _Resident:
                 print(line)
         while len(self.running) < self.cap and self.take(name, path, device):
             pass
+
+    def requests(self, name, path):
+        """원격에서 받은 `docs/backlog/_요청/*.json`(보드가 올린 답·이어받기·보류로 두기)를 이 기기가 돌던 카드에 대해서만 처리한다.
+        처리했는가는 카드 머리말 `요청결과` 의 번호로 가른다. 띄우기 전에 그 값을 쓰고 못 쓰면 띄우지 않는다. 동시 상한이 찼거나
+        그 카드가 이미 돌고 있으면 아무것도 쓰지 않고 다음 바퀴로 미룬다."""
+        folder = os.path.join(path, "docs", "backlog", "_요청")
+        if not os.path.isdir(folder):
+            return
+        for fname in sorted(os.listdir(folder)):
+            if not fname.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(folder, fname), encoding="utf-8") as f:
+                    req = json.load(f)
+                card_file, kind, number = req["카드"], req["종류"], req["번호"]
+                if not (isinstance(card_file, str) and re.fullmatch(r"[^/\\\0]+\.md", card_file) and kind in ("답", "이어받기", "보류로 두기")
+                        and isinstance(number, str) and number):
+                    raise ValueError("모양이 맞지 않음")
+            except (OSError, ValueError, KeyError, TypeError) as e:
+                self.skipped[name] = "요청 파일을 읽지 못함: %s (%s)" % (fname, e)
+                continue
+            card_path = os.path.join(path, "docs", "backlog", card_file)
+            if not os.path.isfile(card_path):
+                self.skipped[name] = "요청 카드가 없다: %s" % card_file
+                continue
+            head = board.front_matter(card_path)
+            try:
+                done = json.loads(head.get("요청결과") or "{}")
+            except ValueError:
+                done = {}
+            if isinstance(done, dict) and done.get("번호") == number:
+                continue
+            if not is_my_card(head.get("돈기계")):
+                continue
+            if card_path in self.running or len(self.running) >= self.cap:
+                continue
+
+            def result(결과, 까닭="", **more):
+                row = {"번호": number, "종류": kind, "결과": 결과, "까닭": 까닭, "때": dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")}
+                return _set_head(card_path, 요청결과=json.dumps(row, ensure_ascii=False), **more)
+            why = None
+            if head.get("상태") != "보류":
+                why = "카드가 보류가 아님(지금 %s)" % (head.get("상태") or "모름")
+            elif kind == "이어받기" and head.get("멈춘종류") != "일시적 실패":
+                why = "멈춘종류가 일시적 실패가 아님(%s)" % (head.get("멈춘종류") or "없음")
+            if why:
+                result("못 받음", why)
+                continue
+            if kind == "보류로 두기":
+                if result("보류로 둠", 단계=""):
+                    print("보류로 둠 — %s/%s" % (name, card_file))
+                continue
+            if kind == "답":
+                stem = os.path.splitext(card_file)[0]
+                wd, _ = runner.pick_run_dir("%s.%s" % (path.rstrip("/"), stem), stem)
+                if not wd:
+                    result("못 받음", "이어받을 실행 폴더가 없다")
+                    continue
+                try:
+                    append_human_answers(wd, number, req.get("답") or [])
+                except (OSError, KeyError, TypeError) as e:
+                    result("못 받음", "답을 쓰지 못함: %s" % e)
+                    continue
+            if not check_account(path, card_path):
+                self.dead.add(name)
+                self.skipped[name] = "계정 토큰 없음"
+                return
+            if not result("이어받음"):
+                print("요청 안 받음 — %s/%s: 요청 결과를 쓰지 못함" % (name, card_file))
+                continue
+            print("요청 받음 — %s/%s: %s" % (name, card_file, kind))
+            self.handed.add(card_path)
+            env = dict(os.environ, STOP_LOOP_DEVICE=this_machine())
+            self.running[card_path] = (name, subprocess.Popen([sys.executable, RUNNER, path, card_path, "--resume"], env=env),
+                                       {"file": card_file, "path": card_path})
 
     def take(self, name, path, device):
         """카드 하나를 집어 러너를 띄웠으면 True."""
