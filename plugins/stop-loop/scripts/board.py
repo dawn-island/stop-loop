@@ -198,10 +198,13 @@ def _양의정수(v):
 def stage_limit_table(project):
     """{단계 번호: (침묵 초, 시간 초)} — 러너 `load_models` 와 같은 두 파일·차례·거르기. 나중 파일의 유효한 표가 앞 표를 통째로 대신한다."""
     table = {}
-    for path in (MODELS_FILE, os.path.join(project, "stop-loop.config.json")):
+    for src in (MODELS_FILE, None):
         try:
-            with open(path, encoding="utf-8") as f:
-                lim = json.load(f).get("stageLimits")
+            if src is None:
+                lim = _유효_설정(project).get("stageLimits")          # 원격 끝에서 읽은 설정이 있으면 그것, 없으면 사본
+            else:
+                with open(src, encoding="utf-8") as f:
+                    lim = json.load(f).get("stageLimits")
         except (OSError, ValueError, AttributeError):
             continue
         if isinstance(lim, dict):
@@ -2050,6 +2053,12 @@ def _프로젝트_설정(project):
         return {}
 
 
+def _유효_설정(project):
+    """보드가 쓰는 프로젝트 설정 — 그 프로젝트 그림에 원격 끝에서 읽은 설정(dict, 깨졌으면 `{}`)이 있으면 그것, 없으면 작업 사본의 것. git 을 부르지 않는다."""
+    설정 = (REMOTE.get(os.path.abspath(project)) or {}).get("설정")
+    return 설정 if isinstance(설정, dict) else _프로젝트_설정(project)
+
+
 def _그림_없음():
     return {"없음": True, "때": None, "카드": {}, "오류": ""}
 
@@ -2095,13 +2104,11 @@ def read_remote(project):
     try:
         if not os.path.exists(os.path.join(project, ".git")):
             return _그림_없음()
-        cfg = _프로젝트_설정(project)
-        if cfg.get("handoff") == "local":
-            return _그림_없음()
         got = _원격_git(project, "remote", "get-url", "origin")
         url = got.stdout.strip() if got.returncode == 0 else ""
         if not url:
             return _그림_없음()
+        cfg = _유효_설정(project)                    # 앞 바퀴에 원격 끝에서 읽은 설정이 있으면 그것 — 처음에는 사본
         env = dict(os.environ)
         account = cfg.get("githubAccount")
         if isinstance(account, str) and account.strip():
@@ -2125,9 +2132,9 @@ def read_remote(project):
         tip = heads[base]
         mirror = _거울_경로(project)
         old = REMOTE.get(os.path.abspath(project))
-        if (old and not old.get("없음") and old.get("끝") == tip and old.get("가지") == base
-                and _거울_끝(mirror, base) == tip):
-            return {**{k: v for k, v in old.items() if k != "시도"}, "때": dt.datetime.now(), "오류": ""}        # 끝이 같다 — 받기·카드 읽기·커밋 때 읽기를 하지 않는다
+        if (old and "설정" in old and (old.get("설정끝") if old.get("없음") else old.get("끝")) == tip and old.get("가지") == base
+                and _거울_끝(mirror, base) == tip and (cfg.get("handoff") == "local") == bool(old.get("없음"))):
+            return {**{k: v for k, v in old.items() if k != "시도"}, "때": old["때"] if old.get("없음") else dt.datetime.now(), "오류": ""}   # 끝이 같다 — 받기·설정·카드 읽기·커밋 때 읽기를 하지 않는다
         if not os.path.isdir(mirror):
             why = _거울_만들기(project, url, base, env)
             if why:
@@ -2136,6 +2143,18 @@ def read_remote(project):
                      env=env, timeout=REMOTE_FETCH_TIMEOUT)
         if r.returncode != 0:
             return _그림_실패(_끝줄(r))
+        설정 = None                                   # 원격 끝의 설정 — 파일이 없으면 None, 깨졌으면 `{}`. 거울에서 로컬로 읽는다
+        r = _원격_git(mirror, "cat-file", "blob", "%s:stop-loop.config.json" % tip)
+        if r.returncode == 0:
+            try:
+                설정 = json.loads(r.stdout)
+            except ValueError:
+                설정 = {}
+            if not isinstance(설정, dict):
+                설정 = {}
+        if (설정 if isinstance(설정, dict) else _프로젝트_설정(project)).get("handoff") == "local":
+            # 「없음」 그림은 `끝` 을 담지 않는다 — `끝` 이 있으면 이력·열쇠·묶음 읽기가 출처를 거울로 바꾼다. 읽은 끝은 `설정끝` 에 둔다
+            return {**_그림_없음(), "설정끝": tip, "가지": base, "설정": 설정}
         r = _원격_git(mirror, "ls-tree", "-z", "--name-only", tip, "--", "docs/backlog/")
         if r.returncode != 0:
             return _그림_실패(_끝줄(r))
@@ -2151,7 +2170,7 @@ def read_remote(project):
             fm = remote_front_matter(text)
             cards[name] = {"머리말": fm, "title": head, "사람분": _사람분_줄들(text.splitlines()),
                            "커밋때": _커밋때(mirror, tip, name) if fm and fm.get("상태") == "진행" else None}
-        return {"없음": False, "때": dt.datetime.now(), "카드": cards, "오류": "", "끝": tip, "가지": base,
+        return {"없음": False, "때": dt.datetime.now(), "카드": cards, "오류": "", "끝": tip, "가지": base, "설정": 설정,
                 "끝때": _커밋때(mirror, tip, None), "저장소": _폴더이름(project)}
     except Exception as e:                           # 읽기가 무엇으로 실패하든 화면은 이 기계 것을 보인다
         return _그림_실패(str(e) or type(e).__name__)
@@ -2198,12 +2217,26 @@ def _그림_파일(project):
 
 def _그림_저장(project, pic):
     """그림을 `CACHE_DIR/<이름>.json` 에 남긴다 — 끝을 한 번이라도 읽은 프로젝트만. 쓰기 실패는 화면에 영향이 없고 다음 바퀴에 다시 쓴다."""
-    if pic.get("없음") or not pic.get("끝"):
+    if not (pic.get("설정끝") if pic.get("없음") else pic.get("끝")):
         return
+    if pic.get("없음"):
+        data = {"없음": True, "설정끝": pic["설정끝"], "가지": pic.get("가지", ""), "설정": pic.get("설정")}
+    else:
+        data = _그림_글(pic)
+    _그림_쓰기(project, data)
+
+
+def _그림_글(pic):
     data = {"끝": pic["끝"], "가지": pic.get("가지", ""), "끝때": _시각_글(pic.get("끝때")), "때": _시각_글(pic.get("때")),
             "시도": _시각_글(pic.get("시도") or pic.get("때")), "오류": pic.get("오류", ""), "앞카드수": pic.get("앞카드수", 0),
             "카드": {n: {"머리말": c.get("머리말"), "title": c.get("title", n), "사람분": c.get("사람분"), "커밋때": _시각_글(c.get("커밋때"))}
                    for n, c in (pic.get("카드") or {}).items()}}
+    if "설정" in pic:
+        data["설정"] = pic["설정"]
+    return data
+
+
+def _그림_쓰기(project, data):
     try:
         os.makedirs(CACHE_DIR, exist_ok=True)
         path = _그림_파일(project)
@@ -2215,6 +2248,13 @@ def _그림_저장(project, pic):
 
 
 def _그림_풀기(data, 저장소=""):
+    if data.get("없음") is True:                      # 「없음」 그림 — `끝` 없이 푼다(출처가 사본이다)
+        if not isinstance(data["설정끝"], str) or not data["설정끝"]:
+            raise ValueError("설정끝")
+        설정 = data["설정"]
+        if 설정 is not None and not isinstance(설정, dict):
+            raise ValueError("설정")
+        return {**_그림_없음(), "설정끝": data["설정끝"], "가지": str(data.get("가지", "")), "설정": 설정}
     cards = {}
     for n, c in data["카드"].items():
         fm = c.get("머리말")
@@ -2228,6 +2268,8 @@ def _그림_풀기(data, 저장소=""):
     시도 = _시각_풀기(data.get("시도"))
     if 시도:
         pic["시도"] = 시도
+    if isinstance(data.get("설정"), dict) or ("설정" in data and data["설정"] is None):
+        pic["설정"] = data["설정"]
     return pic
 
 
@@ -7336,7 +7378,7 @@ def 카드_올리기(project, 파일이름, 글="", 승격=False, 잇기=None):
     def 끝(결과, 까닭="", 커밋=""):
         return {"결과": 결과, "까닭": 까닭, "커밋": 커밋}
     try:
-        cfg = _프로젝트_설정(project)
+        cfg = _유효_설정(project)
         if cfg.get("handoff") == "local":
             return 끝("원격 없음")
         got = _원격_git(project, "remote", "get-url", "origin")
