@@ -1921,6 +1921,64 @@ def watched_projects():
     return list(out.values()), ""
 
 
+def 목록_올리기(경로, 기기="", 배차=False):
+    """보는 목록 파일에 프로젝트 하나를 올린다(기본 `"보기"`, 배차면 `"projects"`). (바꿨나, 알림 한 줄).
+    같은 경로가 어느 열쇠에든 있으면·같은 이름이 다른 경로로 있으면·목록 파일이 깨졌으면 파일을 쓰지 않는다. 쓸 때는 임시 파일에 쓰고 바꿔 끼운다."""
+    경로 = os.path.abspath(os.path.expanduser(경로))
+    이름 = os.path.basename(경로.rstrip(os.sep)) or 경로
+    깨짐 = lambda why: (False, "목록 파일을 읽지 못했다 — %s: %s — 쓰지 않았다" % (LIST_FILE, why))  # noqa: E731
+    try:
+        with open(LIST_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return 깨짐("가장 바깥이 객체가 아니다")
+    except FileNotFoundError:
+        data = {}
+    except (OSError, ValueError) as e:
+        return 깨짐(e)
+    for k in ("projects", "보기"):
+        if not isinstance(data.get(k) or [], list):
+            return 깨짐("%s 가 목록이 아니다" % k)
+        for x in data.get(k) or []:
+            if not isinstance(x, dict) or not x.get("name") or not x.get("path"):
+                continue
+            if os.path.abspath(os.path.expanduser(str(x["path"]))) == 경로:
+                return False, "이미 보는 목록에 있다 — %s · %s — 바꾸지 않았다" % (k, x["name"])
+            if str(x["name"]) == 이름:
+                return False, "같은 이름 %s 이 다른 경로로 보는 목록에 있다(%s) — 쓰지 않았다" % (이름, x["path"])
+    열쇠 = "projects" if 배차 else "보기"
+    항목 = {"name": 이름, "path": 경로}
+    if 기기:
+        항목["기기"] = 기기
+    data[열쇠] = list(data.get(열쇠) or []) + [항목]
+    tmp = LIST_FILE + ".쓰는중"
+    try:
+        os.makedirs(os.path.dirname(LIST_FILE), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(tmp, LIST_FILE)
+    except OSError as e:
+        return False, "목록 파일을 쓰지 못했다 — %s: %s" % (LIST_FILE, e)
+    return True, "보는 목록에 올렸다 — %s · %s · %s" % (열쇠, 이름, 경로)
+
+
+def 연결(경로, 기기="", 배차=False):
+    """`--연결` — 그 프로젝트의 원격을 한 번 읽어 연결 확인을 찍고, 보는 목록에 올린다. 프로젝트 파일은 쓰지 않는다. 종료 값을 돌려준다."""
+    경로 = os.path.abspath(os.path.expanduser(경로))
+    if not os.path.isdir(경로):
+        print("폴더가 아니다: %s" % 경로)
+        return 1
+    확인 = read_remote(경로).get("확인") or []
+    for x in 확인:
+        print("연결 확인 — %s — 고칠 값: %s" % (x["까닭"], x["고칠"]))
+    if not 확인:
+        print("연결 확인 — 문제 없음")
+    바뀜, 말 = 목록_올리기(경로, 기기, 배차)
+    print(말)
+    return 0 if 바뀜 or 말.startswith("이미") else 1
+
+
 def _이름(project):
     """프로젝트 경로의 보는 목록 이름. 목록에 없으면 폴더 이름."""
     for p in watched_projects()[0]:
@@ -2067,6 +2125,36 @@ def _그림_실패(why):
     return {"없음": False, "때": None, "카드": {}, "오류": why, "시도": dt.datetime.now()}
 
 
+# 오프라인·서버 장애처럼 설정 문제가 아닌 `ls-remote` 실패의 오류 글 조각 — git 은 이때도 인증 실패와 같은 종료 128 을 낸다
+_네트워크_실패_조각 = ("Could not resolve host", "Couldn't connect to server", "Connection refused", "The requested URL returned error: 5")
+
+
+def 연결_확인(주소, 설정, 막힘="", 계정="", 종료=0, 글=""):
+    """프로젝트 연결 확인 — `[{"까닭", "고칠"}]`, 문제없으면 `[]`. 계산만 한다(git·gh 를 부르지 않고 예외도 내지 않는다).
+    막힘은 원격 읽기가 어디서 막혔는지: `""`·`"토큰"`·`"gh 없음"`·`"ls-remote"`. 종료·글은 막힘이 `"ls-remote"` 일 때 그 종료 값과 오류 글 전체."""
+    if not 주소:
+        return [{"까닭": "원격(origin)이 없어 다른 기기에서 상태가 안 보임", "고칠": "git remote add origin <주소>"}]
+    설정 = 설정 if isinstance(설정, dict) else {}
+    out = []
+    if 설정.get("handoff") == "local":
+        out.append({"까닭": "handoff local 이라 원격에 상태가 안 올라옴", "고칠": '"handoff": "pr" 넣기'})
+    if not 계정:
+        a = 설정.get("githubAccount")
+        계정 = a.strip() if isinstance(a, str) else ""
+    github = bool(re.match(r"(?:git@github\.com:|https://github\.com/)", 주소))
+    if 막힘 == "토큰":
+        out.append({"까닭": "GitHub 계정 %s 의 토큰을 얻지 못함" % 계정,
+                    "고칠": 'gh auth login 으로 %s 로그인 또는 "githubAccount": "<계정>" 넣기' % 계정})
+    elif 막힘 == "ls-remote" and 종료 not in (124, 127) and not any(x in (글 or "") for x in _네트워크_실패_조각):
+        if not github:
+            out.append({"까닭": "원격을 못 읽음", "고칠": "origin 주소와 읽기 권한 확인 — git ls-remote origin"})
+        elif 계정:
+            out.append({"까닭": "GitHub 계정 %s 의 토큰으로 원격을 못 읽음" % 계정, "고칠": '"githubAccount": "<원격을 읽을 수 있는 계정>" 넣기'})
+        else:
+            out.append({"까닭": "GitHub 계정이 없어 원격을 못 읽음", "고칠": '"githubAccount": "<계정>" 넣기'})
+    return out
+
+
 def _거울_만들기(project, url, base, env):
     """거울(`MIRROR_DIR/<이름>.git`)이 없을 때 만든다 — 사본 객체를 참조해 복사하고(`--reference` + `--dissociate`) 모자란 것만 원격에서 받는다.
     끝나면 거울이 사본을 가리키는 연결(alternates)은 남지 않는다. 실패하면 반쯤 만든 폴더를 지우고 까닭을 돌려준다(성공이면 빈 글)."""
@@ -2101,26 +2189,28 @@ def read_remote(project):
     원격 끝(`ls-remote` 한 번)이 앞서 읽은 그림·거울 이름표의 끝과 같으면 아무것도 받지도 읽지도 않고 때만 새로 한다.
     다르면 보드 전용 거울로 받는다(`fetch <주소> +refs/heads/<가지>:refs/remotes/origin/<가지>`). 작업 사본은 거울을 처음 만들 때
     객체를 참조해 복사할 뿐 파일·색인·참조·객체를 바꾸지 않는다."""
+    url = ""
     try:
         if not os.path.exists(os.path.join(project, ".git")):
-            return _그림_없음()
+            return {**_그림_없음(), "확인": 연결_확인("", _유효_설정(project))}
         got = _원격_git(project, "remote", "get-url", "origin")
         url = got.stdout.strip() if got.returncode == 0 else ""
         if not url:
-            return _그림_없음()
+            return {**_그림_없음(), "확인": 연결_확인("", _유효_설정(project))}
         cfg = _유효_설정(project)                    # 앞 바퀴에 원격 끝에서 읽은 설정이 있으면 그것 — 처음에는 사본
+        싣기 = lambda pic, **막힘: {**pic, "확인": 연결_확인(url, cfg, **막힘)}  # noqa: E731
         env = dict(os.environ)
         account = cfg.get("githubAccount")
         if isinstance(account, str) and account.strip():
             token = _토큰(account.strip())
             if not token:
                 if shutil.which("gh") is None:
-                    return _그림_실패("gh 를 찾지 못함 — `--상주-켜기` 를 다시 하라")
-                return _그림_실패("GitHub 계정 %s 의 토큰을 얻지 못함" % account.strip())
+                    return 싣기(_그림_실패("gh 를 찾지 못함 — `--상주-켜기` 를 다시 하라"), 막힘="gh 없음", 계정=account.strip())
+                return 싣기(_그림_실패("GitHub 계정 %s 의 토큰을 얻지 못함" % account.strip()), 막힘="토큰", 계정=account.strip())
             env["GH_TOKEN"] = token
         r = _원격_git(project, "ls-remote", "--heads", url, env=env)
         if r.returncode != 0:
-            return _그림_실패(_끝줄(r))
+            return 싣기(_그림_실패(_끝줄(r)), 막힘="ls-remote", 종료=r.returncode, 글=(r.stderr or "") + (r.stdout or ""))
         heads = {}
         for line in r.stdout.splitlines():
             sha, _, ref = line.partition("\t")
@@ -2128,21 +2218,21 @@ def read_remote(project):
                 heads[ref[len("refs/heads/"):]] = sha.strip()
         base = next((x for x in ("develop", "main", "master") if x in heads), None)
         if base is None:
-            return _그림_실패("원격에 기준 가지가 없다")
+            return 싣기(_그림_실패("원격에 기준 가지가 없다"))
         tip = heads[base]
         mirror = _거울_경로(project)
         old = REMOTE.get(os.path.abspath(project))
         if (old and "설정" in old and (old.get("설정끝") if old.get("없음") else old.get("끝")) == tip and old.get("가지") == base
                 and _거울_끝(mirror, base) == tip and (cfg.get("handoff") == "local") == bool(old.get("없음"))):
-            return {**{k: v for k, v in old.items() if k != "시도"}, "때": old["때"] if old.get("없음") else dt.datetime.now(), "오류": ""}   # 끝이 같다 — 받기·설정·카드 읽기·커밋 때 읽기를 하지 않는다
+            return 싣기({**{k: v for k, v in old.items() if k != "시도"}, "때": old["때"] if old.get("없음") else dt.datetime.now(), "오류": ""})   # 끝이 같다 — 받기·설정·카드 읽기·커밋 때 읽기를 하지 않는다
         if not os.path.isdir(mirror):
             why = _거울_만들기(project, url, base, env)
             if why:
-                return _그림_실패(why)
+                return 싣기(_그림_실패(why))
         r = _원격_git(mirror, "fetch", "-q", "--no-write-fetch-head", url, "+refs/heads/%s:refs/remotes/origin/%s" % (base, base),
                      env=env, timeout=REMOTE_FETCH_TIMEOUT)
         if r.returncode != 0:
-            return _그림_실패(_끝줄(r))
+            return 싣기(_그림_실패(_끝줄(r)))
         설정 = None                                   # 원격 끝의 설정 — 파일이 없으면 None, 깨졌으면 `{}`. 거울에서 로컬로 읽는다
         r = _원격_git(mirror, "cat-file", "blob", "%s:stop-loop.config.json" % tip)
         if r.returncode == 0:
@@ -2152,12 +2242,13 @@ def read_remote(project):
                 설정 = {}
             if not isinstance(설정, dict):
                 설정 = {}
-        if (설정 if isinstance(설정, dict) else _프로젝트_설정(project)).get("handoff") == "local":
+        cfg = 설정 if isinstance(설정, dict) else _프로젝트_설정(project)
+        if cfg.get("handoff") == "local":
             # 「없음」 그림은 `끝` 을 담지 않는다 — `끝` 이 있으면 이력·열쇠·묶음 읽기가 출처를 거울로 바꾼다. 읽은 끝은 `설정끝` 에 둔다
-            return {**_그림_없음(), "설정끝": tip, "가지": base, "설정": 설정}
+            return 싣기({**_그림_없음(), "설정끝": tip, "가지": base, "설정": 설정})
         r = _원격_git(mirror, "ls-tree", "-z", "--name-only", tip, "--", "docs/backlog/")
         if r.returncode != 0:
-            return _그림_실패(_끝줄(r))
+            return 싣기(_그림_실패(_끝줄(r)))
         names = [n for n in sorted(os.path.basename(x) for x in r.stdout.split("\0") if x) if n.endswith(".md") and not n.startswith("_")]
         글들 = _묶음_읽기(mirror, ["%s:docs/backlog/%s" % (tip, n) for n in names])
         cards = {}
@@ -2171,9 +2262,9 @@ def read_remote(project):
             cards[name] = {"머리말": fm, "title": head, "사람분": _사람분_줄들(text.splitlines()),
                            "커밋때": _커밋때(mirror, tip, name) if fm and fm.get("상태") == "진행" else None}
         return {"없음": False, "때": dt.datetime.now(), "카드": cards, "오류": "", "끝": tip, "가지": base, "설정": 설정,
-                "끝때": _커밋때(mirror, tip, None), "저장소": _폴더이름(project)}
+                "끝때": _커밋때(mirror, tip, None), "저장소": _폴더이름(project), "확인": 연결_확인(url, cfg)}
     except Exception as e:                           # 읽기가 무엇으로 실패하든 화면은 이 기계 것을 보인다
-        return _그림_실패(str(e) or type(e).__name__)
+        return {**_그림_실패(str(e) or type(e).__name__), "확인": []}
 
 
 def _커밋때(project, tip, name):
@@ -2195,7 +2286,7 @@ def refresh_remote(items):
             pic = _그림_실패(str(e) or type(e).__name__)
         old = REMOTE.get(key)
         if pic["오류"] and old and not old["없음"]:
-            pic = {**old, "오류": pic["오류"], "시도": pic.get("시도")}       # `앞카드수` 도 old 에서 이어진다
+            pic = {**old, "오류": pic["오류"], "시도": pic.get("시도"), "확인": pic.get("확인") or []}       # `앞카드수` 도 old 에서 이어진다
         elif not pic["오류"] and not pic["없음"] and not pic["카드"]:
             # 오류 없이 0장이면 앞서 읽은 카드 수를 남겨 「원격 카드를 읽지 못함」 경고의 근거로 쓴다. 카드가 읽히면 새 그림에 이 키가 없어 경고가 풀린다
             pic = {**pic, "앞카드수": len((old or {}).get("카드") or {}) or (old or {}).get("앞카드수", 0)}
@@ -2431,6 +2522,8 @@ def _원격_문구(item, cards):
             out.append("원격 기준 %d분 전" % max(0, int(초 // 60)) + (" — 5분 넘게 못 받음" if 초 > REMOTE_STALE_SEC else ""))
         if not pic["오류"] and not pic["카드"] and (any(c.get("출처") != "원격" for c in cards) or pic.get("앞카드수", 0) > 0):
             out.append("원격 카드를 읽지 못함 — 원격 카드 0장" if pic.get("끝") else "원격 카드를 읽지 못함 — 이 기기 사본 기준으로 보임")
+    for x in (pic or {}).get("확인") or []:
+        out.append("연결 확인 — %s — %s" % (x["까닭"], x["고칠"]))
     밀림, 거부 = _올리기_결과(item, cards)
     if 밀림:
         out.append("올리지 못한 고침 있음 (%d장)" % 밀림)
@@ -2441,7 +2534,7 @@ def _원격_문구(item, cards):
 
 def _원격_경고줄(x):
     """사이드바 원격 줄 가운데 경고색으로 그릴 것 — 받기 실패·5분 초과·원격 0장."""
-    return x.startswith(("원격 저장소를 아직 못 읽음", "읽은 적 없음")) or "5분 넘게 못 받음" in x or x.startswith("원격 카드를 읽지 못함")
+    return x.startswith(("원격 저장소를 아직 못 읽음", "읽은 적 없음", "연결 확인")) or "5분 넘게 못 받음" in x or x.startswith("원격 카드를 읽지 못함")
 
 
 def _읽기(item, 합치기=False):
@@ -2548,11 +2641,12 @@ def home_numbers(rows, today, 병합=None):
         수 = 병합["자동"] + 병합["사람"]
         설명 = "자동 병합 %d · 사람 병합 %d" % (병합["자동"], 병합["사람"]) + (" · 원격 모름 %d곳" % 병합["모름"] if 병합["모름"] else "")
     고리 = lambda 보기: "/cards?보기=" + urllib.parse.quote(보기)  # noqa: E731
+    연결 = sum(any(x.startswith("연결 확인") for x in r.get("원격") or []) for r in rows)
     return [
         {"이름": "진행 중", "수": len(run), "설명": "이 중 %d장 다른 기기" % remote, "카드": run, "위험": False, "고리": 고리("진행")},
         {"이름": "대기", "수": len(wait), "설명": "프로젝트 %d곳" % len({x[0] for x in wait}), "카드": wait, "위험": False, "고리": 고리("대기")},
         {"이름": "이번 주 완료", "수": 수, "설명": 설명, "카드": [], "위험": False, "고리": 고리("병합")},
-        {"이름": "손볼 것", "수": len(stop), "설명": "멈춘 실행 %d · 예상 초과 %d" % (hold + alarm, over),
+        {"이름": "손볼 것", "수": len(stop), "설명": "멈춘 실행 %d · 예상 초과 %d" % (hold + alarm, over) + (" · 연결 확인 %d곳" % 연결 if 연결 else ""),
          "카드": stop, "위험": len(stop) >= 1, "고리": 고리("멈춤")}]
 
 
@@ -8011,6 +8105,20 @@ def write_once(backlog, project, every=0, turns_out=None):
 
 def main(argv):
     argv = list(argv)
+    if "--연결" in argv:
+        rest = [x for x in argv if x != "--연결"]
+        배차 = "--배차" in rest
+        rest = [x for x in rest if x != "--배차"]
+        기기 = ""
+        if "--기기" in rest:
+            i = rest.index("--기기")
+            if i + 1 >= len(rest):
+                print("--기기 뒤에 기기 이름이 없다")
+                return 2
+            기기 = rest[i + 1]
+            del rest[i:i + 2]
+        rest = [x for x in rest if not x.startswith("--")]
+        return 연결(rest[0] if rest else ".", 기기, 배차)
     for flag, run in (("--상주-켜기", 상주_켜기), ("--상주-끄기", 상주_끄기), ("--상주", 상주)):
         if flag in argv:
             return run()
